@@ -38,6 +38,7 @@ export function randomField(): Hex {
 }
 
 export const pubkey = (sk: string): Hex => run(["pubkey", sk]).pk;
+export const commitment = (amount: string, pk: string, blinding: string): Hex => run(["commitment", amount, pk, blinding]).commitment;
 export const adminKey = (dPriv: string): { x: Hex; y: Hex } => run(["admin-key", dPriv]);
 export const treeRoot = (levels: number, leaves: string[]): Hex => withFile({ levels, leaves }, (p) => run(["tree-root", p])).root;
 export const bridgeMessage = (m: object): { bridge_message: Hex; claim_nullifier: Hex } =>

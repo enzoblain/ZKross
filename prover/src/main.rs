@@ -11,6 +11,7 @@
 //!   build-bridge-in  <req.json>   inputs for bridge_in (SPEC.md B8)
 //!   prove <inputs.json> --pk <file> --graph <file> --r1cs <file>
 //!   pubkey <sk>                   SPP note public key
+//!   commitment <amount> <pk> <blinding>   SPP note commitment
 //!   bridge-message <req.json>     C and its claim nullifier (SPEC.md B3, B4)
 //!   admin-key <d_priv>            the admin's Global View Key D
 //!   decrypt <req.json>            admin decryption of GVK ciphertexts
@@ -449,6 +450,10 @@ fn main() -> Result<()> {
         "build-bridge-in" => build_bridge_in(&first()?)?,
         "prove" => prove(&first()?, &arg_after(&args, "--pk")?, &arg_after(&args, "--graph")?, &arg_after(&args, "--r1cs")?)?,
         "pubkey" => json!({ "pk": hex(&pubkey(fe(&first()?)?)) }),
+        "commitment" => {
+            let get = |i: usize| args.get(i).context("usage: commitment <amount> <pk> <blinding>");
+            json!({ "commitment": hex(&commitment(fe(get(2)?)?, fe(get(3)?)?, fe(get(4)?)?)) })
+        }
         "bridge-message" => {
             #[derive(Deserialize)]
             struct M {
