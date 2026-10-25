@@ -2,13 +2,12 @@
 // leaves from events, and the external-data hashes from the pool's own views.
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { type Address, type PublicClient, getAbiItem, parseAbi } from "viem";
 import { type Hex, type Proved, ciphertext } from "./prover.ts";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-/** The repo checkout (the e2e scripts may run from a WSL-native mirror). */
-export const REPO = process.env.ZKROSS_REPO ?? path.join(here, "../../..");
+import { REPO } from "./config.ts";
+
+export { REPO };
 const OUT = path.join(REPO, "contracts/ethereum/out");
 
 export const poolAbi = JSON.parse(fs.readFileSync(path.join(OUT, "ShieldedPool.sol/ShieldedPool.json"), "utf8")).abi;

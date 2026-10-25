@@ -19,8 +19,8 @@ import {
 } from "viem";
 import { privateKeyToAccount, sign } from "viem/accounts";
 import { foundry } from "viem/chains";
-import { REPO, bridgeInProof, bridgeOutProof, erc20Abi, noteLeaves, poolAbi, transactProof } from "./lib/eth.ts";
-import * as zk from "./lib/prover.ts";
+import { REPO, bridgeInProof, bridgeOutProof, erc20Abi, noteLeaves, poolAbi, transactProof } from "../../services/bridge/src/lib/eth.ts";
+import * as zk from "../../services/bridge/src/lib/prover.ts";
 
 const RPC = "http://127.0.0.1:8545";
 const KEYS = [
