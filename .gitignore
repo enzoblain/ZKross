@@ -18,3 +18,6 @@ cache/
 /contracts/ethereum/deploy-out/
 /contracts/ethereum/broadcast/**/31337/
 /deploy-out/
+
+# Browser prover and circuit files, staged by scripts/build/sync-frontend.sh
+/apps/frontend/public/zk/

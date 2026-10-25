@@ -8,7 +8,8 @@
     "dev": "npm run dev --workspace=apps/frontend",
     "build:frontend": "npm run build --workspace=apps/frontend",
     "test:ethereum": "forge test --root contracts/ethereum",
-    "test:stellar": "cargo test --manifest-path contracts/stellar/Cargo.toml"
+    "test:stellar": "cargo test --manifest-path spp/Cargo.toml -p pool-gvk",
+    "test:frontend": "npm run test --workspace=apps/frontend"
   },
   "repository": {
     "type": "git",
@@ -23,7 +24,8 @@
   "private": true,
   "workspaces": [
     "apps/*",
-    "services/*",
-    "packages/*"
+    "packages/*",
+    "services/prover",
+    "services/relayer"
   ]
 }
