@@ -19,8 +19,8 @@ const protocolSteps = [
   {
     index: '01',
     visibility: 'Public on Ethereum',
-    title: 'Deposit into the source vault',
-    description: 'The sender address, USDC amount, vault, and time remain visible on-chain.',
+    title: 'Deposit into the source pool',
+    description: 'The sender address, USDC amount, pool, and time remain visible on-chain.',
     icon: Eye,
     tone: 'public',
   },
@@ -36,31 +36,31 @@ const protocolSteps = [
     index: '03',
     visibility: 'Verified, not disclosed',
     title: 'Prove note ownership',
-    description: 'The planned Noir circuit proves the note is valid and unspent without exposing it.',
+    description: 'Circom circuits produce Groth16 proofs that a note is valid and unspent without exposing it.',
     icon: FileKey2,
     tone: 'private',
   },
   {
     index: '04',
     visibility: 'Public on Stellar',
-    title: 'Release from the destination vault',
-    description: 'The recipient, USDC amount, vault, nullifier, and time remain visible on-chain.',
+    title: 'Claim privately, withdraw publicly',
+    description: 'The claim creates a private destination note. Its later withdrawal address, amount, pool, and time are public.',
     icon: Eye,
     tone: 'public',
   },
 ] as const
 
 const protectedItems = [
-  'The secret note contents used to authorize a release.',
-  'The direct protocol-level link between one deposit and one withdrawal.',
-  'Business and compliance context encrypted for an authorized reviewer.',
-  'Source-chain knowledge of the destination before the payout is submitted.',
+  'Private note amounts, owners, blindings, and spending keys inside each pool.',
+  'The direct public link from one bridge message to its destination claim nullifier.',
+  'The destination note public key and claim secret contained in the bridge message.',
+  'The cross-chain path from public deposit to public withdrawal, except for the Global View Key holder.',
 ]
 
 const publicItems = [
   'USDC deposits and sender addresses on the source chain.',
   'USDC withdrawals and recipient addresses on the destination chain.',
-  'Vault balances, commitments, nullifiers, timestamps, and contract events.',
+  'Pool balances, commitments, nullifiers, posted roots, timestamps, and contract events.',
   'Patterns an observer may infer from matching amounts or timing.',
 ]
 
@@ -70,7 +70,7 @@ const laterLayers = [
   ['Standard amounts and batches', 'Less distinctive value patterns across transfers.'],
   ['Temporary destinations', 'Fresh recipient addresses for individual payouts.'],
   ['Fee-paying relayers', 'A relayer submits the payout instead of the recipient.'],
-  ['Minimal public events', 'No destination or recognizable transfer identifier in events.'],
+  ['Encrypted note delivery', 'Recover notes from chain events without keeping secrets only in one browser.'],
 ]
 
 function PrivacyPage() {
@@ -86,8 +86,8 @@ function PrivacyPage() {
             Public actions.<br />Private connection.
           </h1>
           <p className="mt-6 max-w-2xl text-sm leading-6 text-muted sm:text-base sm:leading-7">
-            Zkross is designed to protect the link between public on-chain actions and encrypt
-            their confidential context. Vault deposits and withdrawals remain public.
+            Zkross protects the link between public on-chain actions and encrypts note data for
+            traceable administrative review. Pool deposits and withdrawals remain public.
           </p>
         </div>
 
@@ -107,7 +107,7 @@ function PrivacyPage() {
             <h2 id="privacy-flow-title" className="mt-2 text-xl font-semibold tracking-[-0.03em]">What the protocol changes — and what it does not</h2>
           </div>
           <span className="w-fit rounded-full border border-warning/25 bg-warning/[0.055] px-3 py-1.5 text-[9px] font-semibold uppercase tracking-[0.12em] text-warning">
-            Target architecture · not connected
+            Circuits active · Sepolia deployment pending
           </span>
         </div>
 
@@ -167,7 +167,7 @@ function PrivacyPage() {
               <EyeOff aria-hidden="true" className="size-4" />
             </span>
             <div>
-              <p className="text-[9px] font-semibold uppercase tracking-[0.15em] text-accent">Protected by the target protocol</p>
+              <p className="text-[9px] font-semibold uppercase tracking-[0.15em] text-accent">Protected by the implemented circuits</p>
               <h2 id="protected-title" className="mt-1 text-lg font-semibold">The confidential relationship layer</h2>
             </div>
           </div>
@@ -185,18 +185,18 @@ function PrivacyPage() {
       <section className="mt-16 rounded-[2rem] border border-border bg-surface" aria-labelledby="building-blocks-title">
         <div className="grid gap-8 p-6 sm:p-8 lg:grid-cols-[0.72fr_1.28fr] lg:p-10">
           <div>
-            <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-accent">MVP building blocks</p>
-            <h2 id="building-blocks-title" className="mt-3 text-2xl font-medium tracking-[-0.04em]">What the team is building now.</h2>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-accent">Testnet building blocks</p>
+            <h2 id="building-blocks-title" className="mt-3 text-2xl font-medium tracking-[-0.04em]">What the protocol verifies now.</h2>
             <p className="mt-4 text-xs leading-5 text-muted">
-              Every item remains a target until its circuit, contract integration, tests, and review are complete.
+              The circuits and verifiers are implemented for testnet. They remain unaudited and are not approved for mainnet funds.
             </p>
           </div>
           <div className="grid gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-2">
             {[
               [Fingerprint, 'Poseidon2 commitment', 'Binds the note fields without publishing their secret values.'],
-              [FileKey2, 'Noir ownership proof', 'Shows that the claimant owns a valid note under the circuit rules.'],
+              [FileKey2, 'Circom + Groth16 proof', 'Shows that the claimant owns a valid note under the SPP-derived circuit rules.'],
               [Braces, 'Nullifier', 'Marks a note as spent without revealing the note itself.'],
-              [KeyRound, 'Encrypted audit payload', 'Makes approved context readable only to a scoped authorized party.'],
+              [KeyRound, 'Traceable Global View Key', 'Encrypts every note to one configured administrator key so the admin can reconstruct flows.'],
             ].map(([Icon, title, description]) => {
               const ItemIcon = Icon as typeof Fingerprint
               return (
@@ -239,8 +239,8 @@ function PrivacyPage() {
         <div className="flex items-start gap-3">
           <LockKeyhole aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
           <div>
-            <p className="text-xs font-semibold">Nothing on this page is a live privacy guarantee.</p>
-            <p className="mt-1 text-[11px] leading-5 text-muted">The current frontend uses local fixtures. No proof is generated, verified, or settled on-chain.</p>
+            <p className="text-xs font-semibold">Testnet privacy, with explicit limits.</p>
+            <p className="mt-1 text-[11px] leading-5 text-muted">Browser proof generation and on-chain verification are wired. A complete transfer still awaits the Sepolia pool deployment; the protocol is unaudited.</p>
           </div>
         </div>
         <div className="flex items-center gap-2 text-[10px] text-subtle">

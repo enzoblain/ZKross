@@ -25,22 +25,22 @@ const steps = [
   {
     number: '01',
     label: 'Authorize',
-    title: 'Connect the wallet that sends.',
-    description: 'Only the source-chain wallet is required. The destination remains a public address.',
+    title: 'Connect both wallets you control.',
+    description: 'The source wallet deposits and bridges out; the destination wallet derives the claim note and withdraws.',
     icon: WalletMinimal,
   },
   {
     number: '02',
     label: 'Route',
     title: 'Compose the transfer.',
-    description: 'Choose the direction, public USDC amount, recipient, and destination capacity.',
+    description: 'Choose the direction and exact USDC amount, then confirm the destination pool has enough backing.',
     icon: MoveRight,
   },
   {
     number: '03',
     label: 'Settle',
     title: 'Verify before release.',
-    description: 'The target flow proves note ownership before a public destination reserve payout.',
+    description: 'Circom and Groth16 prove note ownership, bridge inclusion, and the final withdrawal.',
     icon: BadgeCheck,
   },
 ]
@@ -51,21 +51,21 @@ const useCases = [
     eyebrow: 'Treasury',
     title: 'Institutional settlement',
     description:
-      'Route working capital between ecosystems while encrypting business context for explicitly authorized review.',
+      'Route working capital between ecosystems while a traceable Global View Key preserves administrative oversight.',
   },
   {
     icon: ScanLine,
     eyebrow: 'Tokenized assets',
     title: 'Real-world asset movement',
     description:
-      'Keep sensitive investor and asset context outside public contract events while settlement remains visible.',
+      'Keep pool-note ownership and the cross-chain link private while public deposits and withdrawals remain visible.',
   },
   {
     icon: BriefcaseBusiness,
     eyebrow: 'Operations',
     title: 'Cross-border business payments',
     description:
-      'Separate public payment execution from confidential commercial context while retaining scoped oversight.',
+      'Move treasury USDC across networks without publishing the direct bridge-out to bridge-in relationship.',
   },
 ]
 
@@ -85,8 +85,8 @@ const principles = [
   {
     icon: KeyRound,
     index: 'P-03',
-    title: 'Scoped disclosure',
-    description: 'Encrypted context can be released by field, case, reviewer, and expiry.',
+    title: 'Traceable oversight',
+    description: 'One configured Global View Key can decrypt every note and reconstruct the bridge path.',
   },
 ]
 
@@ -95,7 +95,7 @@ function BridgeVisual() {
     <div
       className="relative mx-auto aspect-square w-full max-w-[540px]"
       role="img"
-      aria-label="Ethereum and Stellar connected through the planned Zkross privacy layer"
+      aria-label="Ethereum and Stellar connected through the Zkross testnet privacy layer"
     >
       <div className="absolute inset-[8%] rounded-full border border-border" />
       <div className="absolute inset-[20%] rounded-full border border-border/70" />
@@ -131,7 +131,7 @@ function BridgeVisual() {
           <LockKeyhole aria-hidden="true" className="size-6 sm:size-7" />
         </div>
         <span className="absolute -bottom-8 min-w-max text-[9px] font-medium uppercase tracking-[0.18em] text-accent">
-          Private link · planned
+          Groth16 link protection
         </span>
       </div>
     </div>
@@ -147,7 +147,7 @@ function LandingPage({ onNavigate }: LandingPageProps) {
           <div>
             <div className="mb-7 inline-flex items-center gap-2 rounded-full border border-warning/25 bg-warning/[0.06] px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-warning">
               <span className="size-1.5 rounded-full bg-warning" />
-              Testnet prototype · no asset movement
+              Testnet only · unaudited
             </div>
             <h1 className="text-balance max-w-3xl text-[3.2rem] font-medium leading-[0.98] tracking-[-0.065em] text-foreground sm:text-6xl lg:text-[4.6rem]">
               Public settlement. Private connection.
@@ -157,7 +157,7 @@ function LandingPage({ onNavigate }: LandingPageProps) {
               with a protocol designed to protect the transfer link and confidential context.
             </p>
             <p className="mt-3 max-w-xl text-xs leading-5 text-subtle">
-              Product prototype. Signing, settlement, proofs, and disclosure controls are not connected.
+              Browser proving and Stellar testnet contracts are connected. The Sepolia pool deployment is still required for an end-to-end transfer.
             </p>
             <div className="mt-9 flex flex-wrap gap-3">
               <Button variant="accent" size="lg" onClick={() => onNavigate('bridge')}>
@@ -186,7 +186,7 @@ function LandingPage({ onNavigate }: LandingPageProps) {
             </div>
             <p className="max-w-2xl text-sm leading-6 text-muted lg:justify-self-end">
               Zkross keeps the boundary legible: the chains record deposits and payouts, while
-              the target proof system authorizes release without publishing the secret note.
+              Groth16 proofs authorize each private-pool transition without publishing the secret note.
             </p>
           </div>
 
@@ -288,8 +288,8 @@ function LandingPage({ onNavigate }: LandingPageProps) {
       <section className="px-4 py-24 sm:px-6 sm:py-28">
         <div className="mx-auto flex max-w-[1180px] flex-col gap-8 border-y border-border py-10 sm:flex-row sm:items-center sm:justify-between sm:py-12">
           <div className="max-w-2xl">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">Interactive prototype</p>
-            <h2 className="mt-4 text-3xl font-medium tracking-[-0.045em]">See the route before it becomes a transaction.</h2>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">Testnet application</p>
+            <h2 className="mt-4 text-3xl font-medium tracking-[-0.045em]">Inspect every boundary before you sign.</h2>
           </div>
           <Button variant="accent" size="lg" onClick={() => onNavigate('bridge')}>
             Open Bridge
