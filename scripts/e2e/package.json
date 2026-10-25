@@ -1,0 +1,17 @@
+{
+  "name": "zkross-e2e",
+  "private": true,
+  "type": "module",
+  "description": "ZKross end-to-end flows and services helpers (run inside WSL)",
+  "scripts": {
+    "eth-local": "tsx eth-local.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.3.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

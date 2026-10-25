@@ -7,6 +7,6 @@ solc_version = "0.8.37"
 optimizer = true
 optimizer_runs = 200
 # Proof and hash fixtures exported from SPP.
-fs_permissions = [{ access = "read", path = "./test/fixtures" }]
+fs_permissions = [{ access = "read", path = "./test/fixtures" }, { access = "read-write", path = "./deploy-out" }]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
