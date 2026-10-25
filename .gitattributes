@@ -1,2 +1,4 @@
-# Shell scripts run inside WSL and must keep LF line endings.
+# Keep LF line endings in the working tree everywhere: SPP and our scripts run
+# inside WSL, and SPP hashes some of its source files.
+* text=auto eol=lf
 *.sh text eol=lf
