@@ -45,7 +45,7 @@ ext_data_hash = keccak256( XDR( ScVal::Map {
 Soroban serializes a struct as an XDR map **sorted alphabetically by field name**, which is the order above. SPP's off-chain copy builds the same map by hand ([`sdk/native/src/chain/ext_data_hash.rs`](https://github.com/NethermindEth/stellar-private-payments/blob/9bc3a78b90c84b144e86af04c9c331a684f528dd/sdk/native/src/chain/ext_data_hash.rs)). The pool recomputes it and rejects a mismatch with `WrongExtHash` before verifying.
 
 - The circuit treats `extDataHash` as an opaque field element. Each chain can therefore hash its own `ExtData` its own way, as long as the contract and the client agree.
-- **For Ethereum we need our own definition.** Reproducing Soroban XDR in Solidity would be pointless. Proposal (to confirm in `SPEC.md`): `uint256(keccak256(abi.encode(pool, token, recipient, extAmount, keccak256(encOut0), keccak256(encOut1)))) % r`, where `pool` and `token` come from contract state.
+- **For Ethereum we need our own definition.** Reproducing Soroban XDR in Solidity would be pointless. `ShieldedPool.hashExtData` currently uses `uint256(keccak256(abi.encode(pool, token, recipient, extAmount, encryptedOutput0, encryptedOutput1))) % r`, with `pool` and `token` taken from contract state. This is marked `TODO(SPEC)` until `SPEC.md` confirms it, including whether to bind `block.chainid`.
 - SPP's `ExtData` has **no relayer or fee field**. The circuit comment says `publicAmount = extAmount - fee`, but no fee exists anywhere. A relayer that gets paid needs a format change on both chains.
 
 ## 3. Public amount
