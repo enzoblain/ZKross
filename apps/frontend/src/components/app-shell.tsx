@@ -1,7 +1,7 @@
 import {
   Activity,
   ArrowLeftRight,
-  Droplets,
+  CircleDollarSign,
   Moon,
   ScanEye,
   ShieldCheck,
@@ -27,7 +27,7 @@ type AppShellProps = {
 
 const appNavigation = [
   { id: 'bridge', label: 'Bridge', icon: ArrowLeftRight },
-  { id: 'liquidity', label: 'Liquidity', icon: Droplets },
+  { id: 'private-balance', label: 'Private balance', icon: CircleDollarSign },
   { id: 'activity', label: 'Activity', icon: Activity },
   { id: 'privacy', label: 'Privacy', icon: ScanEye },
   { id: 'compliance', label: 'Compliance', icon: ShieldCheck },

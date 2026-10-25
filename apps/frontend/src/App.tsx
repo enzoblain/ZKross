@@ -6,13 +6,13 @@ import { ActivityPage } from './pages/activity-page'
 import { BridgePage } from './pages/bridge-page'
 import { CompliancePage } from './pages/compliance-page'
 import { LandingPage } from './pages/landing-page'
-import { LiquidityPage } from './pages/liquidity-page'
+import { PrivateBalancePage } from './pages/private-balance-page'
 import { PrivacyPage } from './pages/privacy-page'
 
 export type PageId =
   | 'landing'
   | 'bridge'
-  | 'liquidity'
+  | 'private-balance'
   | 'activity'
   | 'privacy'
   | 'compliance'
@@ -20,7 +20,7 @@ export type Theme = 'dark' | 'light'
 
 const pages: Record<Exclude<PageId, 'landing'>, () => JSX.Element> = {
   bridge: BridgePage,
-  liquidity: LiquidityPage,
+  'private-balance': PrivateBalancePage,
   activity: ActivityPage,
   privacy: PrivacyPage,
   compliance: CompliancePage,

@@ -38,10 +38,10 @@ function WalletConnectDialog({
   const wallet = wallets[network]
   const isConnecting = connecting === network
   const purposeCopy = {
-    required: 'This source wallet deposits USDC and authorizes the bridge-out transaction.',
-    destination: 'This wallet derives the destination note key, submits the claim, and withdraws to your public address.',
-    optional: 'Optional: connect it to use its public address as the recipient.',
-    liquidity: 'Only the configured pool administrator can add testnet liquidity.',
+    required: 'This source wallet authorizes the private intake and the CCTP transfer in live testnet mode.',
+    destination: 'Optional: connect this wallet only when you want to withdraw a private destination note publicly.',
+    optional: 'Optional: use this public address for a later withdrawal. A second wallet is not required to bridge.',
+    liquidity: 'Legacy option. Public liquidity provisioning is not part of the CCTP architecture.',
   }[purpose]
 
   return (
