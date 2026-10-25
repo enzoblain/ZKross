@@ -12,7 +12,8 @@ use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use num_bigint::BigUint;
 use serde_json::{Value, json};
-use soroban_sdk::{Bytes, Env, U256};
+use pool_core::merkle_with_history::MerkleTreeWithHistory;
+use soroban_sdk::{Bytes, Env, U256, contract, contractimpl};
 use soroban_utils::{
     constants::{get_round_constants_t2, get_round_constants_t3},
     poseidon2::{get_zeroes, poseidon2_compress, poseidon2_hash2},
@@ -60,6 +61,39 @@ fn sample(seed: u64, r: &BigUint) -> BigUint {
         v = (v << 64u32) + BigUint::from(next());
     }
     v % r
+}
+
+/// Contract frame for running SPP's Merkle tree, which needs contract storage.
+#[contract]
+struct TreeHost;
+
+#[contractimpl]
+impl TreeHost {
+    pub fn noop() {}
+}
+
+/// Inserts `pairs` leaf pairs into a fresh SPP tree of `levels` and returns
+/// the leaves and the root after each insertion.
+fn merkle_case(env: &Env, levels: u32, pairs: u64, seed: u64, r: &BigUint) -> Value {
+    let id = env.register(TreeHost, ());
+    env.as_contract(&id, || {
+        MerkleTreeWithHistory::init(env, levels).unwrap();
+        let empty = u256_to_big(&MerkleTreeWithHistory::get_last_root(env).unwrap());
+        let mut leaves = Vec::new();
+        let mut roots = Vec::new();
+        for i in 0..pairs {
+            let a = sample(seed + 2 * i, r);
+            let b = sample(seed + 2 * i + 1, r);
+            let (ia, ib) =
+                MerkleTreeWithHistory::insert_two_leaves(env, big_to_u256(env, &a), big_to_u256(env, &b))
+                    .unwrap();
+            assert_eq!((u64::from(ia), u64::from(ib)), (2 * i, 2 * i + 1));
+            leaves.push(hex(&a));
+            leaves.push(hex(&b));
+            roots.push(hex(&u256_to_big(&MerkleTreeWithHistory::get_last_root(env).unwrap())));
+        }
+        json!({ "levels": levels, "empty_root": hex(&empty), "leaves": leaves, "roots": roots })
+    })
 }
 
 fn main() {
@@ -144,6 +178,11 @@ fn main() {
         "hash2": hash2,
         "hash3_offchain_t4": hash3,
         "zero_hashes": zeroes,
+        // SPP's pool-core Merkle tree, run in the Soroban host.
+        "merkle": [
+            merkle_case(&env, 3, 4, 1000, &r),
+            merkle_case(&env, 20, 6, 2000, &r),
+        ],
     });
     std::fs::write(&out, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
     println!("ok: {} compress, {} hash2, {} hash3, {} zero hashes -> {out}",
