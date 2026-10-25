@@ -191,7 +191,12 @@ digest  = keccak256(message)
 - **`refund(C, sig)`** with status `0x01` marks it refunded and inserts the refund note.
 - Both require the grace period from B5. A `C` can be settled only once.
 
-### B13. Liquidity
+### B13. Configuration
+
+- **Ethereum:** the bridge configuration is a constructor argument (immutable).
+- **Stellar:** SPP's constructor already takes 13 arguments, the most a Soroban constructor call carries. The configuration is therefore set by `init_bridge`, which only the admin can call, and only once. Bridge functions refuse with `NotInitialized` until then, and nothing can change the configuration afterwards.
+
+### B14. Liquidity
 
 - `addLiquidity(amount)` / `add_liquidity(amount)`: the admin transfers tokens into the pool as unowned balance and an event is emitted.
 - The pool keeps no per-chain ledger. Solvency is the token balance; the admin view compares decrypted totals.

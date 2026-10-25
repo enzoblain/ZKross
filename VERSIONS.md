@@ -22,4 +22,15 @@ All builds run inside WSL2 (Ubuntu 26.04.1 LTS).
 | snarkjs | 0.7.6 | `npm install -g snarkjs` |
 | Foundry (forge, anvil) | 1.8.6 (`6bad0a66`) | Installed with `foundryup` |
 | solc | 0.8.37 | Pinned in `contracts/ethereum/foundry.toml` |
-| Circom | not installed | SPP compiles circuits with its own `tools/circuit-compiler`, which links Circom as a library |
+| Circom | 2.2.3 (`ad44e915`) | `cargo install --git https://github.com/iden3/circom --tag v2.2.3`; SPP's `circom.lock` pins it. Needed for witness graphs (`--graphs`) and the constraint-removal check |
+
+## Local changes to SPP (vendored under `spp/`)
+
+| Where | Change |
+| --- | --- |
+| `contracts/pool-gvk/src/pool_gvk/bridge.rs`, error codes 22–30 | The ZKross bridge (SPEC.md Part B) |
+| `contracts/circom-groth16-verifier/src/lib.rs` | One `g1_msm` instead of a `g1_mul` per public input: same result, about a third of the cost; keeps `bridge_out` under Soroban's 100M-instruction limit |
+| `circuits/src/bridge_*.circom`, `circuits/src/zkross/` | The bridge circuits |
+| `tools/circuit-compiler/src/{lib,witness}.rs` | `bridge_out`/`bridge_in` added to the key and witness-graph lists |
+| `deployments/zkross/circuit_keys/` | Our circuits' Groth16 keys and witness graphs (single-party testnet setup) |
+| tests | `circuits/src/test/prove_bridge.rs`, `contracts/pool-gvk/src/test_bridge.rs`; some `pool-gvk` test helpers made `pub(crate)`; `k256` dev-dependency |

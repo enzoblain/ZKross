@@ -13,6 +13,12 @@
 //! for cross-pool-variant SDK/indexer compatibility. `pool-core` declares no
 //! `#[contract]`/`#[contractimpl]`, so it carries no exports to collide.
 #![allow(clippy::too_many_arguments)]
+
+// ZKross: the private bridge (SPEC.md Part B), a child module so it can use
+// this contract's private helpers.
+mod bridge;
+pub use bridge::*;
+
 use crate::gvk::{self, BabyJubJubPoint, GvkCiphertext};
 use contract_types::Groth16Proof;
 use pool_core::{
@@ -84,6 +90,25 @@ pub enum Error {
     NoPendingAdmin = 20,
     /// An association set does not run the code fixed at construction
     TreeCodeMismatch = 21,
+    // ZKross bridge errors (SPEC.md Part B).
+    /// The bridge configuration is unusable
+    InvalidBridgeConfig = 22,
+    /// The remote outbox root was never posted
+    UnknownRemoteRoot = 23,
+    /// The claim nullifier is already spent
+    AlreadyClaimed = 24,
+    /// This bridge message was already sent
+    BridgeMessageExists = 25,
+    /// The deadline bucket is outside the allowed window
+    InvalidDeadline = 26,
+    /// The bridge message's deadline has passed
+    DeadlinePassed = 27,
+    /// No pending bridge message with this value
+    NotPending = 28,
+    /// The refund grace period has not ended
+    TooEarly = 29,
+    /// The attestation is not the attester's for this message and status
+    InvalidAttestation = 30,
 }
 
 impl From<MerkleError> for Error {

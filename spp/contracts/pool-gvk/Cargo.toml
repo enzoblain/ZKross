@@ -35,6 +35,8 @@ ark-groth16 = { workspace = true }
 ark-relations = { workspace = true }
 ark-std = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# ZKross bridge tests: signs refund attestations with a throwaway key.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 
 [lints]
 workspace = true

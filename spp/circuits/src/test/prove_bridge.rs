@@ -15,9 +15,9 @@ mod tests {
         circom_tester::{CircuitKeys, Inputs, build_circuit, load_keys, prove_and_verify_with_keys, r1cs_satisfied},
         general::{load_artifacts, poseidon2_hash2, poseidon2_hash3, scalar_to_bigint},
         global_view_key::{Note, admin_public_key, decrypt_note, encrypt_note, Ciphertext},
-        keypair::derive_public_key,
+        keypair::{derive_public_key, sign},
         merkle_tree::PrefixTree,
-        transaction::{commitment, prepopulated_prefix},
+        transaction::{commitment, nullifier, prepopulated_prefix},
         transaction_case::{InputNote, OutputNote, TxCase, prepare_transaction_witness},
     };
     use anyhow::{Context, Result};
@@ -289,6 +289,45 @@ mod tests {
         accepted("bridge_out", &c.inputs()?)
     }
 
+    /// The public signals the circuit computes, without proving.
+    fn computed_publics(stem: &str, inputs: &Inputs) -> Result<Vec<Scalar>> {
+        let (wasm, r1cs) = artifacts(stem)?;
+        let circuit = build_circuit(&wasm, &r1cs, inputs)?;
+        circuit.get_public_inputs().context("no public inputs")
+    }
+
+    /// The circuit outputs exactly the expected ciphertexts and public values
+    /// (no keys involved, so this also runs against modified circuits).
+    #[test]
+    fn bridge_out_computes_the_expected_public_signals() -> Result<()> {
+        let c = out_case();
+        assert_eq!(computed_publics("bridge_out", &c.inputs()?)?, c.expected_publics()?);
+        Ok(())
+    }
+
+    /// Minting through C: a message carrying one more unit than is spent.
+    #[test]
+    fn bridge_out_c_carries_exactly_the_bridged_amount() -> Result<()> {
+        let mut c = out_case();
+        c.bridge_message_override =
+            Some(bridge_message(c.amount + s(1), c.asset, c.src, c.dst, c.recipient_pk, c.claim_secret, c.deadline));
+        assert!(!out_accepted(&c)?);
+        Ok(())
+    }
+
+    /// A nullifier that isn't the spent note's (the double-spend guard).
+    #[test]
+    fn bridge_out_rejects_a_wrong_nullifier() -> Result<()> {
+        let c = out_case();
+        let mut inputs = c.inputs()?;
+        let case = TxCase::new(c.in_notes.clone(), c.change.clone());
+        let exclude: Vec<usize> = c.in_notes.iter().map(|n| n.leaf_index).collect();
+        let w = prepare_transaction_witness(&case, prepopulated_prefix(0xABCD, &exclude, 64), LEVELS)?;
+        inputs.set("inputNullifier", vec![w.nullifiers[0] + s(1), w.nullifiers[1]]);
+        assert!(!accepted("bridge_out", &inputs)?);
+        Ok(())
+    }
+
     #[test]
     fn bridge_out_valid_case_proves_with_committed_keys_in_spec_order() -> Result<()> {
         let c = out_case();
@@ -351,11 +390,23 @@ mod tests {
         Ok(())
     }
 
+    /// Spending someone else's note: a different key, with the nullifier
+    /// computed consistently from that key, so only the commitment (which then
+    /// is not in the tree) gives it away.
     #[test]
     fn bridge_out_rejects_a_wrong_spending_key() -> Result<()> {
         let mut c = out_case();
         c.private_key_tamper = true;
-        assert!(!out_accepted(&c)?);
+        let mut inputs = c.inputs()?;
+        let case = TxCase::new(c.in_notes.clone(), c.change.clone());
+        let exclude: Vec<usize> = c.in_notes.iter().map(|n| n.leaf_index).collect();
+        let w = prepare_transaction_witness(&case, prepopulated_prefix(0xABCD, &exclude, 64), LEVELS)?;
+        let n = &c.in_notes[0];
+        let wrong = n.priv_key + s(1);
+        let cm = commitment(n.amount, derive_public_key(wrong), n.blinding);
+        let forged = nullifier(cm, w.path_indices[0], sign(wrong, cm, w.path_indices[0]));
+        inputs.set("inputNullifier", vec![forged, w.nullifiers[1]]);
+        assert!(!accepted("bridge_out", &inputs)?);
         Ok(())
     }
 
@@ -615,6 +666,39 @@ mod tests {
 
     fn in_accepted(c: &InCase) -> Result<bool> {
         accepted("bridge_in", &c.inputs())
+    }
+
+    /// Claiming more than C carries: amount + 1 privately, C in the tree built
+    /// with amount.
+    #[test]
+    fn bridge_in_c_carries_exactly_the_claimed_amount() -> Result<()> {
+        let mut c = in_case();
+        c.leaf_fields = Some((c.amount, c.asset, c.src, c.dst, c.deadline));
+        c.amount += s(1);
+        c.out_amounts[1] += s(1);
+        assert!(!in_accepted(&c)?);
+        Ok(())
+    }
+
+    /// New notes for a key other than C's recipient.
+    #[test]
+    fn bridge_in_new_notes_belong_to_the_recipient() -> Result<()> {
+        let c = in_case();
+        let mut inputs = c.inputs();
+        let other = c.recipient_pk + s(1);
+        inputs.set(
+            "outputCommitment",
+            (0..2).map(|k| commitment(c.out_amounts[k], other, c.out_blindings[k])).collect::<Vec<_>>(),
+        );
+        assert!(!accepted("bridge_in", &inputs)?);
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_in_computes_the_expected_public_signals() -> Result<()> {
+        let c = in_case();
+        assert_eq!(computed_publics("bridge_in", &c.inputs())?, c.expected_publics());
+        Ok(())
     }
 
     #[test]

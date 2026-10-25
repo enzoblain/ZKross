@@ -41,7 +41,7 @@ use soroban_utils::{
 /// Number of levels for the ASP Membership Merkle tree in tests
 const ASP_MEMBERSHIP_LEVELS: u32 = 8;
 
-fn test_env() -> Env {
+pub(crate) fn test_env() -> Env {
     #[cfg(miri)]
     {
         use soroban_sdk::testutils::EnvTestConfig;
@@ -55,7 +55,7 @@ fn test_env() -> Env {
     }
 }
 
-fn mk_point(env: &Env, x: u32, y: u32) -> BabyJubJubPoint {
+pub(crate) fn mk_point(env: &Env, x: u32, y: u32) -> BabyJubJubPoint {
     BabyJubJubPoint {
         x: U256::from_u32(env, x),
         y: U256::from_u32(env, y),
@@ -63,20 +63,20 @@ fn mk_point(env: &Env, x: u32, y: u32) -> BabyJubJubPoint {
 }
 
 /// Helper struct to hold all test setup
-struct TestSetup {
-    admin: Address,
-    token: Address,
-    verifier: Address,
-    asp_membership_address: Address,
-    asp_non_membership_address: Address,
-    asp_membership_client: ASPMembershipClient<'static>,
-    asp_non_membership_client: ASPNonMembershipClient<'static>,
+pub(crate) struct TestSetup {
+    pub(crate) admin: Address,
+    pub(crate) token: Address,
+    pub(crate) verifier: Address,
+    pub(crate) asp_membership_address: Address,
+    pub(crate) asp_non_membership_address: Address,
+    pub(crate) asp_membership_client: ASPMembershipClient<'static>,
+    pub(crate) asp_non_membership_client: ASPNonMembershipClient<'static>,
 }
 
 /// Creates and deploys all contracts needed for testing, including a real
 /// `CircomGroth16Verifier` and mock token so the transaction-flow tests below
 /// can exercise `transact` end to end (mirrors `pool`'s test setup).
-fn setup_test_contracts(env: &Env) -> TestSetup {
+pub(crate) fn setup_test_contracts(env: &Env) -> TestSetup {
     let admin = Address::generate(env);
 
     let asp_membership_address =
@@ -99,10 +99,10 @@ fn setup_test_contracts(env: &Env) -> TestSetup {
     }
 }
 
-const KDF_DOMAIN: &str = "tests";
+pub(crate) const KDF_DOMAIN: &str = "tests";
 
 /// Returns the hash of the Wasm `contract` runs.
-fn wasm_hash(contract: &Address) -> BytesN<32> {
+pub(crate) fn wasm_hash(contract: &Address) -> BytesN<32> {
     match contract.executable() {
         Some(Executable::Wasm(hash)) => hash,
         other => panic!("expected a Wasm contract, found {other:?}"),
@@ -1006,7 +1006,7 @@ fn compute_ext_hash(env: &Env, pool: &Address, token: &Address, ext: &ExtData) -
 /// a real `CircomGroth16Verifier` always rejects a proof this shallow — the
 /// tests below all exercise checks that run before or independently of that
 /// rejection.
-fn mk_mock_groth16_proof(env: &Env) -> Groth16Proof {
+pub(crate) fn mk_mock_groth16_proof(env: &Env) -> Groth16Proof {
     let g1_bytes = {
         let mut bytes = [0u8; 64];
         bytes[31] = 1;
@@ -2206,7 +2206,7 @@ impl ReservedPoolAddress {
 /// Test-only scaffolding: the pairing-check logic is a duplicate of
 /// `circom_groth16_verifier::verify_with_vk`, which is private to its crate.
 #[contract]
-struct TestVerifier;
+pub(crate) struct TestVerifier;
 
 #[contractimpl]
 impl TestVerifier {
@@ -2242,16 +2242,10 @@ impl TestVerifier {
             return Err(Groth16Error::MalformedPublicInputs);
         }
         let mut vk_x = ic.get(0).ok_or(Groth16Error::MalformedPublicInputs)?;
-        for i in 0..public_inputs.len() {
-            let s = public_inputs
-                .get(i)
-                .ok_or(Groth16Error::MalformedPublicInputs)?;
-            let ic_idx = i
-                .checked_add(1)
-                .ok_or(Groth16Error::MalformedPublicInputs)?;
-            let v = ic.get(ic_idx).ok_or(Groth16Error::MalformedPublicInputs)?;
-            let prod = bn.g1_mul(&v, &s);
-            vk_x = bn.g1_add(&vk_x, &prod);
+        // Kept in sync with circom_groth16_verifier::verify_with_vk (MSM).
+        if !public_inputs.is_empty() {
+            let msm = bn.g1_msm(ic.slice(1..), public_inputs);
+            vk_x = bn.g1_add(&vk_x, &msm);
         }
 
         #[allow(clippy::arithmetic_side_effects)]
@@ -2314,7 +2308,7 @@ fn groth16_proof_from_ark(env: &Env, proof: &ArkProof<Bn254>) -> Groth16Proof {
 /// Generate a real Groth16 (VK, proof) pair proving `NInputCircuit(values)`,
 /// i.e. one that verifies if and only if the public inputs equal `values` in
 /// this exact order.
-fn groth16_fixture_for(env: &Env, values: &[ArkFr]) -> (VerificationKeyBytes, Groth16Proof) {
+pub(crate) fn groth16_fixture_for(env: &Env, values: &[ArkFr]) -> (VerificationKeyBytes, Groth16Proof) {
     let mut rng = seeded_rng();
     let circuit = NInputCircuit {
         inputs: values.to_vec(),

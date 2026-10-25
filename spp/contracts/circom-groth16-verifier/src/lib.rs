@@ -104,19 +104,14 @@ impl CircomGroth16Verifier {
 
         let mut vk_x = vk.ic.get(0).ok_or(Groth16Error::MalformedPublicInputs)?;
 
-        for i in 0..pub_inputs.len() {
-            let s = pub_inputs
-                .get(i)
-                .ok_or(Groth16Error::MalformedPublicInputs)?;
-            let ic_idx = i
-                .checked_add(1)
-                .ok_or(Groth16Error::MalformedPublicInputs)?;
-            let v = vk
-                .ic
-                .get(ic_idx)
-                .ok_or(Groth16Error::MalformedPublicInputs)?;
-            let prod = bn.g1_mul(&v, &s);
-            vk_x = bn.g1_add(&vk_x, &prod);
+        // ZKross: one multi-scalar multiplication for sum(ic[i+1] * input[i])
+        // instead of one g1_mul per input. Same value, about half the CPU
+        // cost; needed to keep bridge_out (46 inputs) under Soroban's
+        // per-transaction instruction limit.
+        if !pub_inputs.is_empty() {
+            let points = vk.ic.slice(1..);
+            let msm = bn.g1_msm(points, pub_inputs);
+            vk_x = bn.g1_add(&vk_x, &msm);
         }
 
         // Compute the pairing check:

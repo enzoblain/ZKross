@@ -77,10 +77,13 @@ Contract tests use a strict mock verifier until real keys exist: it accepts only
 ## Repository layout
 
 ```
-spp/                  SPP at the pinned commit, with our bridge additions to pool-gvk
+spp/                  SPP at the pinned commit (git subtree); our changes are listed in VERSIONS.md
+  circuits/src/bridge_*.circom, circuits/src/zkross/   the bridge circuits
+  contracts/pool-gvk/src/pool_gvk/bridge.rs            the Stellar bridge functions
+  deployments/zkross/circuit_keys/                     bridge Groth16 keys and witness graphs
 contracts/ethereum/   Foundry project (ShieldedPool, verifiers, Poseidon2, Merkle tree)
 contracts/stellar/    placeholder from the initial scaffold (Stellar work lives in spp/)
-circuits/             bridge_out and bridge_in, built with SPP's circuit compiler
+prover/               zkross-prover: circuit inputs and proofs (Rust, on SPP's SDK)
 services/             root poster, refund attester (relayer and prover scaffolds exist)
 scripts/              Phase 0 helpers, Poseidon2 generators, deployment and end-to-end scripts
 apps/frontend/        web app (frontend developer)
