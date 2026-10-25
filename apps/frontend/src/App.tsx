@@ -3,9 +3,8 @@ import { useEffect, useState, type JSX } from 'react'
 import { AppShell } from './components/app-shell'
 import { WalletProvider } from './components/wallet-provider'
 import { ActivityPage } from './pages/activity-page'
-import { AdminPage } from './pages/admin-page'
 import { BridgePage } from './pages/bridge-page'
-import { InstitutionalPage } from './pages/institutional-page'
+import { CompliancePage } from './pages/compliance-page'
 import { LandingPage } from './pages/landing-page'
 import { LiquidityPage } from './pages/liquidity-page'
 
@@ -14,16 +13,14 @@ export type PageId =
   | 'bridge'
   | 'liquidity'
   | 'activity'
-  | 'institutional'
-  | 'admin'
+  | 'compliance'
 export type Theme = 'dark' | 'light'
 
 const pages: Record<Exclude<PageId, 'landing'>, () => JSX.Element> = {
   bridge: BridgePage,
   liquidity: LiquidityPage,
   activity: ActivityPage,
-  institutional: InstitutionalPage,
-  admin: AdminPage,
+  compliance: CompliancePage,
 }
 
 function App() {

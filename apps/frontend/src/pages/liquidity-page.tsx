@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
+import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
 import {
   Dialog,
@@ -49,7 +50,8 @@ function LiquidityPage() {
     <div className="page-enter">
       <div className="flex flex-col justify-between gap-6 sm:flex-row sm:items-end">
         <div className="max-w-2xl">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
+          <p className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
+            <NetworkRouteMark />
             Liquidity providing
           </p>
           <h1 className="mt-4 text-balance text-4xl font-medium tracking-[-0.055em] sm:text-5xl">
@@ -116,14 +118,7 @@ function LiquidityPage() {
                         }
                         className="focus-ring flex min-h-17 items-center gap-3 rounded-2xl border border-border bg-background/50 px-3.5 text-left hover:border-border-strong disabled:opacity-70"
                       >
-                        <span className={cn(
-                          'grid size-10 place-items-center rounded-2xl border text-sm font-semibold',
-                          network === 'ethereum'
-                            ? 'border-accent/30 bg-accent/10 text-accent'
-                            : 'border-foreground/15 bg-foreground text-background',
-                        )}>
-                          {networkMeta[network].mark}
-                        </span>
+                        <NetworkMark network={network} />
                         <span className="min-w-0 flex-1">
                           <span className="block text-[10px] text-subtle">
                             {networkMeta[network].wallet} · {networkMeta[network].name}
@@ -160,7 +155,7 @@ function LiquidityPage() {
                 <div className="rounded-3xl border border-accent/35 bg-accent/[0.045] p-5">
                   <div className="flex items-center justify-between gap-4">
                     <div className="flex items-center gap-3">
-                      <span className="grid size-10 place-items-center rounded-2xl bg-accent/10 text-accent">Ξ</span>
+                      <NetworkMark network="ethereum" />
                       <div>
                         <p className="text-sm font-medium">Ethereum Sepolia</p>
                         <p className="mt-1 text-[10px] text-subtle">USDC source reserve</p>
@@ -172,7 +167,7 @@ function LiquidityPage() {
                         <p className="text-sm font-medium">Stellar Testnet</p>
                         <p className="mt-1 text-[10px] text-subtle">USDC release reserve</p>
                       </div>
-                      <span className="grid size-10 place-items-center rounded-2xl bg-foreground text-background">S</span>
+                      <NetworkMark network="stellar" />
                     </div>
                   </div>
                 </div>

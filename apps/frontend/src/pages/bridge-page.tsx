@@ -18,6 +18,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 
 import { Spotlight } from '../components/aceternity/spotlight'
+import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
 import { useWallets } from '../components/wallet-context'
 import {
@@ -43,22 +44,6 @@ const compactNumber = new Intl.NumberFormat('en-US', {
 })
 
 type RunStatus = 'idle' | 'running' | 'complete'
-
-function NetworkMark({ network }: { network: NetworkId }) {
-  return (
-    <span
-      aria-hidden="true"
-      className={cn(
-        'grid size-10 shrink-0 place-items-center rounded-2xl border text-sm font-semibold',
-        network === 'stellar'
-          ? 'border-foreground/15 bg-foreground text-background'
-          : 'border-accent/30 bg-accent/10 text-accent',
-      )}
-    >
-      {networkMeta[network].mark}
-    </span>
-  )
-}
 
 function BridgePage() {
   const from: NetworkId = 'ethereum'
@@ -134,6 +119,7 @@ function BridgePage() {
       <div className="mx-auto mb-10 max-w-2xl text-center">
         <div className="mx-auto mb-4 flex w-fit items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
           <span className="h-px w-6 bg-accent/60" />
+          <NetworkRouteMark />
           Ethereum → Stellar
           <span className="h-px w-6 bg-accent/60" />
         </div>

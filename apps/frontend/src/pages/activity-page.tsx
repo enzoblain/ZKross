@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
+import { NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
 import {
   Dialog,
@@ -86,7 +87,8 @@ function ActivityPage() {
     <div className="page-enter">
       <div className="flex flex-col justify-between gap-6 sm:flex-row sm:items-end">
         <div className="max-w-2xl">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
+          <p className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
+            <NetworkRouteMark />
             Private activity
           </p>
           <h1 className="mt-4 text-4xl font-medium tracking-[-0.055em] sm:text-5xl">
@@ -180,7 +182,7 @@ function ActivityPage() {
                     <tr key={item.id} className="border-b border-border last:border-b-0">
                       <td className="px-7 py-5 font-mono text-[11px]">{item.id}</td>
                       <td className="px-5 py-5 text-xs text-muted">{item.date}</td>
-                      <td className="px-5 py-5 text-xs">{item.route}</td>
+                      <td className="px-5 py-5"><span className="flex items-center gap-2 text-xs"><NetworkRouteMark />{item.route}</span></td>
                       <td className="px-5 py-5 text-xs text-muted">{item.asset}</td>
                       <td className="px-5 py-5 font-mono text-xs">{item.amount}</td>
                       <td className="px-5 py-5">
@@ -215,7 +217,7 @@ function ActivityPage() {
                 >
                   <span>
                     <span className="font-mono text-[10px] text-subtle">{item.id}</span>
-                    <span className="mt-2 block text-sm font-medium">{item.route}</span>
+                    <span className="mt-2 flex items-center gap-2 text-sm font-medium"><NetworkRouteMark />{item.route}</span>
                     <span className="mt-1 block text-[11px] text-muted">{item.date} · {item.asset} · {item.amount}</span>
                   </span>
                   <ArrowRight aria-hidden="true" className="mt-1 size-4 shrink-0 text-subtle" />

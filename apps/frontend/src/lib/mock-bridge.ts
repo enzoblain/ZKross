@@ -28,20 +28,18 @@ export type TransferProgressStep = {
 
 export const networkMeta: Record<
   NetworkId,
-  { name: string; shortName: string; token: string; mark: string; wallet: string }
+  { name: string; shortName: string; token: string; wallet: string }
 > = {
   stellar: {
     name: 'Stellar Testnet',
     shortName: 'Stellar',
     token: 'USDC',
-    mark: 'S',
     wallet: 'Freighter',
   },
   ethereum: {
     name: 'Ethereum Sepolia',
     shortName: 'Ethereum',
     token: 'USDC',
-    mark: 'Ξ',
     wallet: 'MetaMask',
   },
 }

@@ -1,7 +1,6 @@
 import {
   Activity,
   ArrowLeftRight,
-  Building2,
   Droplets,
   Moon,
   ShieldCheck,
@@ -13,6 +12,7 @@ import type { ReactNode } from 'react'
 import type { PageId, Theme } from '../App'
 import { cn } from '../lib/utils'
 import { BrandMark } from './brand-mark'
+import { NetworkRouteMark } from './network-logo'
 import { Button } from './ui/button'
 import { useWallets } from './wallet-context'
 
@@ -28,8 +28,7 @@ const appNavigation = [
   { id: 'bridge', label: 'Bridge', icon: ArrowLeftRight },
   { id: 'liquidity', label: 'Liquidity', icon: Droplets },
   { id: 'activity', label: 'Activity', icon: Activity },
-  { id: 'institutional', label: 'Institutions', icon: Building2 },
-  { id: 'admin', label: 'Admin', icon: ShieldCheck },
+  { id: 'compliance', label: 'Compliance', icon: ShieldCheck },
 ] satisfies Array<{
   id: Exclude<PageId, 'landing'>
   label: string
@@ -128,6 +127,7 @@ function AppShell({
           )}
 
           <div className="flex items-center gap-2">
+            <NetworkRouteMark className="mr-1 hidden sm:inline-flex" />
             <ThemeButton theme={theme} onThemeChange={onThemeChange} />
             {isLanding ? (
               <Button variant="accent" size="sm" onClick={() => onNavigate('bridge')}>

@@ -10,8 +10,8 @@ Ethereum Sepolia → Stellar Testnet bridge.
 - Liquidity-providing workspace with a balanced allocation intent and local positions draft
 - Review dialog and explicitly simulated proof/bridge progress
 - Privacy-first activity screen with loading, empty, table, mobile list, search, and detail states
-- Separate institutional interface demo for registry, disclosure, and audit-log concepts
-- Regulated admin prototype with role separation and transaction-scoped decryption grants
+- Unified compliance workspace for transactions, disclosure requests, role separation, and audit-log concepts
+- Transaction-scoped field grants with separate compliance, custodian, auditor, and platform roles
 - Dark and light themes, keyboard focus states, responsive layouts, and reduced-motion support
 
 ## Stack and UI sources
@@ -67,7 +67,7 @@ Not connected or implemented:
 - Institutional authentication, MFA, server-side permissions, disclosure, or immutable audit logging
 
 Wallet addresses are read from the user's approved browser extensions. Activity
-rows, institutional records, liquidity data, fees, progress states, permissions,
+rows, compliance records, liquidity data, fees, progress states, permissions,
 and decrypted-field examples are local fixtures and are labeled as prototype or
 demo data. No private key, seed phrase, secret, signature, transaction, proof,
 decryption key, or asset is requested or created.

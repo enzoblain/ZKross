@@ -13,6 +13,7 @@ import {
 import type { PageId } from '../App'
 import { Spotlight } from '../components/aceternity/spotlight'
 import { BrandMark } from '../components/brand-mark'
+import { NetworkLogo } from '../components/network-logo'
 import { Button } from '../components/ui/button'
 
 type LandingPageProps = {
@@ -114,7 +115,7 @@ function BridgeVisual() {
 
       <div className="absolute left-[9%] top-1/2 -translate-y-1/2">
         <div className="hairline-card grid size-20 place-items-center rounded-[24px] border border-border bg-surface text-2xl font-semibold sm:size-24">
-          Ξ
+          <NetworkLogo network="ethereum" className="size-10 text-accent sm:size-12" />
         </div>
         <p className="mt-3 text-center text-[10px] font-semibold uppercase tracking-[0.15em] text-subtle">
           Ethereum
@@ -123,7 +124,7 @@ function BridgeVisual() {
 
       <div className="absolute right-[9%] top-1/2 -translate-y-1/2">
         <div className="hairline-card grid size-20 place-items-center rounded-[24px] border border-border bg-surface text-2xl font-semibold sm:size-24">
-          S
+          <NetworkLogo network="stellar" className="size-10 sm:size-12" />
         </div>
         <p className="mt-3 text-center text-[10px] font-semibold uppercase tracking-[0.15em] text-subtle">
           Stellar
@@ -341,8 +342,8 @@ function LandingPage({ onNavigate }: LandingPageProps) {
             <button type="button" onClick={() => onNavigate('bridge')} className="focus-ring rounded-md hover:text-foreground">
               App
             </button>
-            <button type="button" onClick={() => onNavigate('institutional')} className="focus-ring rounded-md hover:text-foreground">
-              Institutional portal
+            <button type="button" onClick={() => onNavigate('compliance')} className="focus-ring rounded-md hover:text-foreground">
+              Compliance workspace
             </button>
           </div>
         </div>
