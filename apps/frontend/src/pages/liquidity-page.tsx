@@ -21,6 +21,7 @@ import {
   DialogTitle,
 } from '../components/ui/dialog'
 import { useWallets } from '../components/wallet-context'
+import { WalletConnectDialog } from '../components/wallet-connect-dialog'
 import { networkMeta, type NetworkId } from '../lib/mock-bridge'
 import { cn } from '../lib/utils'
 import { truncateAddress } from '../lib/wallet-adapters'
@@ -28,8 +29,9 @@ import { truncateAddress } from '../lib/wallet-adapters'
 type LiquidityView = 'provide' | 'positions'
 
 function LiquidityPage() {
-  const { wallets, connecting, errors, connectWallet, disconnectWallet } = useWallets()
+  const { wallets, connecting } = useWallets()
   const [view, setView] = useState<LiquidityView>('provide')
+  const [walletDialogNetwork, setWalletDialogNetwork] = useState<NetworkId | null>(null)
   const [amount, setAmount] = useState('1000')
   const [allocation, setAllocation] = useState(50)
   const [reviewOpen, setReviewOpen] = useState(false)
@@ -45,6 +47,11 @@ function LiquidityPage() {
   )
   const walletsReady = Boolean(wallets.ethereum && wallets.stellar)
   const canReview = walletsReady && numericAmount > 0
+  const missingWallet: NetworkId | null = !wallets.ethereum
+    ? 'ethereum'
+    : !wallets.stellar
+      ? 'stellar'
+      : null
 
   return (
     <div className="page-enter">
@@ -101,7 +108,10 @@ function LiquidityPage() {
           {view === 'provide' ? (
             <div className="space-y-6 p-5 sm:p-7">
               <div>
-                <p className="mb-3 text-xs font-medium text-muted">Wallets used for this route</p>
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <p className="text-xs font-medium text-muted">Wallets used for this route</p>
+                  <span className="text-[9px] text-subtle">Both required only for liquidity</span>
+                </div>
                 <div className="grid gap-2 sm:grid-cols-2">
                   {(['ethereum', 'stellar'] as NetworkId[]).map((network) => {
                     const wallet = wallets[network]
@@ -110,13 +120,8 @@ function LiquidityPage() {
                       <button
                         key={network}
                         type="button"
-                        disabled={Boolean(connecting)}
-                        onClick={() =>
-                          wallet
-                            ? disconnectWallet(network)
-                            : void connectWallet(network)
-                        }
-                        className="focus-ring flex min-h-17 items-center gap-3 rounded-2xl border border-border bg-background/50 px-3.5 text-left hover:border-border-strong disabled:opacity-70"
+                        onClick={() => setWalletDialogNetwork(network)}
+                        className="focus-ring flex min-h-17 items-center gap-3 rounded-2xl border border-border bg-background/50 px-3.5 text-left hover:border-border-strong"
                       >
                         <NetworkMark network={network} />
                         <span className="min-w-0 flex-1">
@@ -142,12 +147,6 @@ function LiquidityPage() {
                     )
                   })}
                 </div>
-                {(errors.ethereum || errors.stellar) && (
-                  <div role="alert" className="mt-3 space-y-1 text-xs text-danger">
-                    {errors.ethereum && <p>MetaMask: {errors.ethereum}</p>}
-                    {errors.stellar && <p>Freighter: {errors.stellar}</p>}
-                  </div>
-                )}
               </div>
 
               <div>
@@ -225,9 +224,17 @@ function LiquidityPage() {
                 </div>
               </div>
 
-              <Button variant="accent" size="lg" className="w-full" disabled={!canReview} onClick={() => setReviewOpen(true)}>
+              <Button
+                variant="accent"
+                size="lg"
+                className="w-full"
+                disabled={walletsReady && !canReview}
+                onClick={() => missingWallet ? setWalletDialogNetwork(missingWallet) : setReviewOpen(true)}
+              >
                 <Droplets aria-hidden="true" />
-                {walletsReady ? 'Review liquidity intent' : 'Connect both wallets'}
+                {walletsReady
+                  ? 'Review liquidity intent'
+                  : `Connect ${networkMeta[missingWallet ?? 'ethereum'].wallet} for liquidity`}
               </Button>
               <p className="text-center text-[10px] leading-4 text-subtle">
                 This cannot deposit, approve, mint LP shares, or calculate yield.
@@ -347,6 +354,13 @@ function LiquidityPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      <WalletConnectDialog
+        network={walletDialogNetwork}
+        open={Boolean(walletDialogNetwork)}
+        onOpenChange={(open) => !open && setWalletDialogNetwork(null)}
+        purpose="liquidity"
+      />
     </div>
   )
 }

@@ -13,13 +13,13 @@ import {
   LockKeyhole,
   RotateCcw,
   ShieldCheck,
-  WalletCards,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { Spotlight } from '../components/aceternity/spotlight'
 import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
+import { WalletConnectDialog } from '../components/wallet-connect-dialog'
 import { useWallets } from '../components/wallet-context'
 import {
   Dialog,
@@ -46,9 +46,10 @@ const compactNumber = new Intl.NumberFormat('en-US', {
 type RunStatus = 'idle' | 'running' | 'complete'
 
 function BridgePage() {
-  const from: NetworkId = 'ethereum'
-  const to: NetworkId = 'stellar'
-  const { wallets, connecting, errors, connectWallet, disconnectWallet } = useWallets()
+  const { wallets, connecting } = useWallets()
+  const [from, setFrom] = useState<NetworkId>('ethereum')
+  const to: NetworkId = from === 'ethereum' ? 'stellar' : 'ethereum'
+  const [walletDialogNetwork, setWalletDialogNetwork] = useState<NetworkId | null>(null)
   const [amount, setAmount] = useState('250')
   const [recipient, setRecipient] = useState('')
   const [reviewOpen, setReviewOpen] = useState(false)
@@ -62,9 +63,12 @@ function BridgePage() {
     () => mockBridgeAdapter.getQuote(numericAmount),
     [numericAmount],
   )
-  const recipientIsValid = recipient.trim().startsWith('G') && recipient.trim().length >= 16
+  const recipientIsValid =
+    to === 'stellar'
+      ? recipient.trim().startsWith('G') && recipient.trim().length >= 16
+      : /^0x[a-fA-F0-9]{40}$/.test(recipient.trim())
   const canReview =
-    Boolean(wallets.stellar && wallets.ethereum) &&
+    Boolean(wallets[from]) &&
     numericAmount > 0 &&
     recipientIsValid &&
     runStatus !== 'running'
@@ -114,21 +118,27 @@ function BridgePage() {
     setRunStatus('idle')
   }
 
+  const reverseRoute = () => {
+    setFrom(to)
+    setRecipient('')
+    resetSimulation()
+  }
+
   return (
     <div className="page-enter">
       <div className="mx-auto mb-10 max-w-2xl text-center">
         <div className="mx-auto mb-4 flex w-fit items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
           <span className="h-px w-6 bg-accent/60" />
-          <NetworkRouteMark />
-          Ethereum → Stellar
+          <NetworkRouteMark from={from} to={to} />
+          {networkMeta[from].shortName} → {networkMeta[to].shortName}
           <span className="h-px w-6 bg-accent/60" />
         </div>
         <h1 className="text-balance text-4xl font-medium tracking-[-0.055em] sm:text-5xl">
           One transfer. Clear boundaries.
         </h1>
         <p className="mx-auto mt-5 max-w-xl text-sm leading-6 text-muted">
-          Connect MetaMask and Freighter on test networks, then explore the intended
-          bridge workflow. Proof generation and asset movement are not connected.
+          Connect only the sending wallet. Enter the destination address manually or
+          optionally connect the receiving wallet to fill it automatically.
         </p>
       </div>
 
@@ -153,37 +163,36 @@ function BridgePage() {
           <div className="relative space-y-6 p-5 sm:p-7">
             <div>
               <div className="mb-3 flex items-center justify-between">
-                <span className="text-xs font-medium text-muted">Wallet connections</span>
-                <span className="text-[10px] text-subtle">Injected extensions · public addresses only</span>
+                <span className="text-xs font-medium text-muted">Wallet for this transfer</span>
+                <span className="text-[10px] text-subtle">One required · one optional</span>
               </div>
               <div className="grid gap-2 sm:grid-cols-2">
-                {(['ethereum', 'stellar'] as NetworkId[]).map((network) => {
+                {([from, to] as NetworkId[]).map((network) => {
                   const connection = wallets[network]
                   const isConnecting = connecting === network
+                  const isSource = network === from
 
                   return (
                     <button
                       key={network}
                       type="button"
-                      onClick={() =>
-                        connection
-                          ? disconnectWallet(network)
-                          : void connectWallet(network)
-                      }
-                      disabled={Boolean(connecting)}
-                      className="focus-ring flex min-h-17 items-center gap-3 rounded-2xl border border-border bg-background/55 px-3.5 text-left transition-colors hover:border-border-strong disabled:cursor-default disabled:opacity-100"
+                      onClick={() => setWalletDialogNetwork(network)}
+                      className={cn(
+                        'focus-ring flex min-h-18 items-center gap-3 rounded-2xl border bg-background/55 px-3.5 text-left transition-colors hover:border-border-strong',
+                        isSource ? 'border-accent/30' : 'border-border',
+                      )}
                     >
                       <NetworkMark network={network} />
                       <span className="min-w-0 flex-1">
-                        <span className="block text-[10px] text-subtle">
-                          {networkMeta[network].wallet} · {networkMeta[network].name}
+                        <span className={cn('block text-[9px] font-semibold uppercase tracking-[0.1em]', isSource ? 'text-accent' : 'text-subtle')}>
+                          {isSource ? 'Sender · required' : 'Recipient · optional'}
                         </span>
                         <span className="mt-1 block truncate text-xs font-medium text-foreground">
                           {connection
                             ? truncateAddress(connection.address)
                             : isConnecting
                               ? 'Waiting for wallet…'
-                              : 'Connect wallet'}
+                              : `Connect ${networkMeta[network].wallet}`}
                         </span>
                       </span>
                       {isConnecting ? (
@@ -191,18 +200,16 @@ function BridgePage() {
                       ) : connection ? (
                         <CheckCircle2 aria-hidden="true" className="size-4 text-success" />
                       ) : (
-                        <WalletCards aria-hidden="true" className="size-4 text-subtle" />
+                        <ArrowRight aria-hidden="true" className="size-4 text-subtle" />
                       )}
                     </button>
                   )
                 })}
               </div>
-              {(errors.ethereum || errors.stellar) && (
-                <div role="alert" className="mt-3 space-y-1 text-xs text-danger">
-                  {errors.ethereum && <p>MetaMask: {errors.ethereum}</p>}
-                  {errors.stellar && <p>Freighter: {errors.stellar}</p>}
-                </div>
-              )}
+              <p className="mt-3 text-[10px] leading-4 text-subtle">
+                The source wallet would authorize the send. The recipient only needs a public
+                destination address; connecting its wallet is a convenience, not a requirement.
+              </p>
             </div>
 
             <div className="relative space-y-2">
@@ -240,10 +247,10 @@ function BridgePage() {
 
               <button
                 type="button"
-                disabled
-                aria-label="Reverse route unavailable in this prototype"
-                title="Reverse route is not supported"
-                className="absolute left-1/2 top-1/2 z-10 grid size-10 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-2xl border border-border-strong bg-surface-raised text-subtle opacity-80"
+                aria-label="Reverse transfer direction"
+                title="Reverse transfer direction"
+                onClick={reverseRoute}
+                className="focus-ring absolute left-1/2 top-1/2 z-10 grid size-10 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-2xl border border-border-strong bg-surface-raised text-subtle transition-colors hover:border-accent/40 hover:text-accent"
               >
                 <ArrowDown aria-hidden="true" className="size-4" />
               </button>
@@ -261,7 +268,7 @@ function BridgePage() {
                 </div>
                 <div className="mt-5 border-t border-border pt-4">
                   <label htmlFor="recipient" className="mb-2 block text-[10px] font-medium text-subtle">
-                    Receiving Stellar address
+                    Receiving {networkMeta[to].shortName} address
                   </label>
                   <div className="flex items-center">
                     <input
@@ -270,20 +277,43 @@ function BridgePage() {
                       onChange={(event) => setRecipient(event.target.value)}
                       aria-invalid={recipient.length > 0 && !recipientIsValid}
                       className="min-w-0 flex-1 bg-transparent font-mono text-xs outline-none placeholder:text-subtle"
-                      placeholder="G…"
+                      placeholder={to === 'stellar' ? 'G…' : '0x…'}
                     />
                     <button
                       type="button"
-                      aria-label="Use a demo Stellar recipient"
+                      aria-label={`Use a demo ${networkMeta[to].shortName} recipient`}
                       title="Use demo recipient"
                       className="focus-ring rounded-lg p-2 text-subtle hover:bg-surface-raised hover:text-foreground"
-                      onClick={() => setRecipient('GCFX4N6W4FZDB3A7XUVKQ5BIRXW3S2E5HUEXAMPLEADDR')}
+                      onClick={() => setRecipient(
+                        to === 'stellar'
+                          ? 'GCFX4N6W4FZDB3A7XUVKQ5BIRXW3S2E5HUEXAMPLEADDR'
+                          : '0x1111111111111111111111111111111111111111',
+                      )}
                     >
                       <Copy aria-hidden="true" className="size-4" />
                     </button>
                   </div>
                   {recipient.length > 0 && !recipientIsValid && (
-                    <p className="mt-2 text-[10px] text-danger">Enter a Stellar public address beginning with G.</p>
+                    <p className="mt-2 text-[10px] text-danger">
+                      {to === 'stellar'
+                        ? 'Enter a Stellar public address beginning with G.'
+                        : 'Enter a 42-character Ethereum address beginning with 0x.'}
+                    </p>
+                  )}
+                  {wallets[to] && recipient !== wallets[to]?.address && (
+                    <button
+                      type="button"
+                      className="focus-ring mt-2 rounded-md text-[10px] font-medium text-accent hover:text-accent-strong"
+                      onClick={() => setRecipient(wallets[to]?.address ?? '')}
+                    >
+                      Use connected {networkMeta[to].wallet} address
+                    </button>
+                  )}
+                  {wallets[to] && recipient === wallets[to]?.address && (
+                    <p className="mt-2 flex items-center gap-1.5 text-[10px] text-success">
+                      <CheckCircle2 aria-hidden="true" className="size-3" />
+                      Filled from connected {networkMeta[to].wallet}
+                    </p>
                   )}
                 </div>
               </div>
@@ -346,9 +376,19 @@ function BridgePage() {
               </dl>
             </details>
 
-            <Button variant="accent" size="lg" className="w-full" disabled={!canReview} onClick={() => setReviewOpen(true)}>
+            <Button
+              variant="accent"
+              size="lg"
+              className="w-full"
+              disabled={Boolean(wallets[from]) && !canReview}
+              onClick={() => wallets[from] ? setReviewOpen(true) : setWalletDialogNetwork(from)}
+            >
               <ShieldCheck aria-hidden="true" />
-              {wallets.stellar && wallets.ethereum ? 'Start test transfer' : 'Connect both wallets'}
+              {wallets[from]
+                ? recipientIsValid
+                  ? 'Review test transfer'
+                  : `Enter ${networkMeta[to].shortName} recipient`
+                : `Connect ${networkMeta[from].wallet} to send`}
             </Button>
             <p className="text-center text-[10px] leading-4 text-subtle">
               Never enter a private key or seed phrase. This prototype never requests one.
@@ -496,6 +536,13 @@ function BridgePage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      <WalletConnectDialog
+        network={walletDialogNetwork}
+        open={Boolean(walletDialogNetwork)}
+        onOpenChange={(open) => !open && setWalletDialogNetwork(null)}
+        purpose={walletDialogNetwork === from ? 'required' : 'optional'}
+      />
     </div>
   )
 }

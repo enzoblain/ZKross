@@ -22,6 +22,7 @@ Ethereum Sepolia → Stellar Testnet bridge.
 - Lucide icons
 - Motion and one restrained Aceternity-inspired spotlight treatment
 - MetaMask EIP-1193 provider and the pinned official Freighter API browser bundle
+- Local SVG brand files sourced from the official Ethereum asset page and Stellar developer site
 
 No paid template or runtime UI package was added. The layout and visual identity
 are original to Zkross.
@@ -53,7 +54,12 @@ Implemented wallet boundary:
 - MetaMask account request through the injected EIP-1193 provider
 - Automatic request to switch or add Ethereum Sepolia
 - Freighter extension detection, account authorization, and Stellar Testnet validation
+- Bidirectional bridge UI requiring only the source-chain wallet
+- Optional destination wallet connection to prefill the public recipient address
 - Shared wallet state across Bridge and Liquidity pages
+
+The two-sided Liquidity intent still requires both wallet connections because it models
+allocations on both networks. Bridge transfers do not.
 
 Wallet signing and blockchain actions are not implemented.
 
@@ -75,3 +81,8 @@ decryption key, or asset is requested or created.
 Privacy claims must remain aligned with implemented and independently audited
 circuit behavior when production adapters are introduced. Zero-knowledge proofs
 must not be represented as hiding data that is already public on either chain.
+
+Brand asset sources: https://ethereum.org/assets/ and
+https://developers.stellar.org/icon.svg. This is independent software and is not
+affiliated with, sponsored, or endorsed by the Stellar Development Foundation.
+“Stellar” is a trademark of the Stellar Development Foundation. All rights reserved.

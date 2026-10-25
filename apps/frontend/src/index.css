@@ -133,6 +133,12 @@ a { color: inherit; }
 
 .text-balance { text-wrap: balance; }
 
+.stellar-theme-dark { display: block; }
+.stellar-theme-light { display: none; }
+
+:root[data-theme='light'] .stellar-theme-dark { display: none; }
+:root[data-theme='light'] .stellar-theme-light { display: block; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     scroll-behavior: auto !important;

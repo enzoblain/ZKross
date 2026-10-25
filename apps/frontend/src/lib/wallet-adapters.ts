@@ -67,10 +67,6 @@ const providerErrorCode = (error: unknown) => {
   return undefined
 }
 
-const openInstallPage = (url: string) => {
-  window.open(url, '_blank', 'noopener,noreferrer')
-}
-
 async function ensureSepolia(provider: EthereumProvider) {
   const currentChain = await provider.request<string>({ method: 'eth_chainId' })
   if (currentChain.toLowerCase() === SEPOLIA_CHAIN_ID) return
@@ -107,10 +103,9 @@ async function connectEthereum(): Promise<WalletConnection> {
   const provider = window.ethereum
   if (!provider) {
     const installUrl = 'https://metamask.io/download/'
-    openInstallPage(installUrl)
     throw new WalletConnectionError(
       'INSTALL_REQUIRED',
-      'MetaMask is not installed. The official download page was opened.',
+      'MetaMask is unavailable in this browser. Install it or open Zkross in a browser where the extension is enabled.',
       installUrl,
     )
   }
@@ -153,20 +148,18 @@ async function connectStellar(): Promise<WalletConnection> {
   const installUrl = 'https://www.freighter.app/'
 
   if (!api) {
-    openInstallPage(installUrl)
     throw new WalletConnectionError(
       'INSTALL_REQUIRED',
-      'Freighter could not be loaded. The official wallet page was opened.',
+      'Freighter is unavailable in this browser. Install it or open Zkross in a browser where the extension is enabled.',
       installUrl,
     )
   }
 
   const connection = await withTimeout(api.isConnected())
   if (connection.error || !connection.isConnected) {
-    openInstallPage(installUrl)
     throw new WalletConnectionError(
       'INSTALL_REQUIRED',
-      'Freighter is not installed. The official wallet page was opened.',
+      'Freighter is not installed or cannot be reached from this browser.',
       installUrl,
     )
   }

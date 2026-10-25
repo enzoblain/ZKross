@@ -24,7 +24,7 @@ const steps = [
   {
     number: '01',
     title: 'Connect',
-    description: 'Connect Ethereum and Stellar wallets securely.',
+    description: 'Connect the source-chain wallet for the selected route.',
     icon: WalletCards,
   },
   {
@@ -163,7 +163,7 @@ function LandingPage({ onNavigate }: LandingPageProps) {
             </p>
             <p className="mt-3 max-w-xl text-xs leading-5 text-subtle">
               This is the target protocol experience. The current build is a UI prototype:
-              wallets, bridge settlement, proofs, and disclosure controls are not connected.
+              wallet signing, bridge settlement, proofs, and disclosure controls are not connected.
             </p>
             <div className="mt-9 flex flex-wrap gap-3">
               <Button variant="accent" size="lg" onClick={() => onNavigate('bridge')}>
@@ -335,6 +335,10 @@ function LandingPage({ onNavigate }: LandingPageProps) {
               <p className="text-sm font-semibold">Zkross</p>
               <p className="mt-0.5 text-[11px] text-subtle">
                 Private by design. Verifiable by principle. Auditable by authorization.
+              </p>
+              <p className="mt-1 max-w-xl text-[9px] leading-4 text-subtle">
+                Independent software; not affiliated with, sponsored, or endorsed by the
+                Stellar Development Foundation. “Stellar” is an SDF trademark.
               </p>
             </div>
           </div>
