@@ -1,314 +1,157 @@
 import {
+  AlertTriangle,
   ArrowRight,
-  Check,
-  Circle,
-  Eye,
-  FileKey2,
-  KeyRound,
+  CheckCircle2,
+  Download,
+  ExternalLink,
+  FileClock,
   LoaderCircle,
-  LockKeyhole,
-  Search,
-  ShieldAlert,
+  Play,
+  ShieldCheck,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
-import type { NetworkId } from '../lib/networks'
+import { useWallets } from '../components/wallet-context'
+import { formatMessage } from '../lib/amounts'
+import { runTransfer } from '../lib/bridge-flow'
+import { explorer, isDeployed } from '../lib/config'
+import { networkMeta } from '../lib/networks'
+import * as store from '../lib/store'
+import type { Transfer, TransferStatus } from '../lib/store'
 import { cn } from '../lib/utils'
+import { truncateAddress } from '../lib/wallet-adapters'
 
-type DemoActivity = {
-  id: string
-  date: string
-  time: string
-  from: NetworkId
-  to: NetworkId
-  asset: string
-  amount: string
-  status: 'UI complete' | 'UI stopped'
-  statusDetail: string
-  verification: string
+const statusCopy: Record<TransferStatus, { label: string; tone: string }> = {
+  created: { label: 'Created', tone: 'text-muted' },
+  deposited: { label: 'Deposited', tone: 'text-accent' },
+  sent: { label: 'Bridge out sent', tone: 'text-accent' },
+  rootPosted: { label: 'Remote root posted', tone: 'text-accent' },
+  claimed: { label: 'Claimed', tone: 'text-success' },
+  withdrawn: { label: 'Withdrawn', tone: 'text-success' },
+  refunded: { label: 'Refunded', tone: 'text-warning' },
 }
 
-const demoActivity: DemoActivity[] = [
-  {
-    id: 'DEMO-2F9A',
-    date: 'Oct 24, 2026',
-    time: '14:08',
-    from: 'ethereum',
-    to: 'stellar',
-    asset: 'USDC',
-    amount: '24,800.00',
-    status: 'UI complete',
-    statusDetail: 'Local sequence reached its final UI state',
-    verification: 'Not performed',
-  },
-  {
-    id: 'DEMO-1C42',
-    date: 'Oct 22, 2026',
-    time: '09:31',
-    from: 'stellar',
-    to: 'ethereum',
-    asset: 'USDC',
-    amount: '8,000.00',
-    status: 'UI complete',
-    statusDetail: 'Local sequence reached its final UI state',
-    verification: 'Not performed',
-  },
-  {
-    id: 'DEMO-8B73',
-    date: 'Oct 20, 2026',
-    time: '18:44',
-    from: 'ethereum',
-    to: 'stellar',
-    asset: 'USDC',
-    amount: '12,500.00',
-    status: 'UI stopped',
-    statusDetail: 'Prototype sequence stopped before its final state',
-    verification: 'Unavailable',
-  },
-]
+const txNetwork = (transfer: Transfer, key: keyof Transfer['txs']) =>
+  key === 'approve' || key === 'deposit' || key === 'bridgeOut' ? transfer.from : transfer.to
+
+const txLabel: Record<keyof Transfer['txs'], string> = {
+  approve: 'Approval',
+  deposit: 'Deposit',
+  bridgeOut: 'Bridge out',
+  bridgeIn: 'Claim',
+  trustline: 'Trustline',
+  withdraw: 'Withdrawal',
+}
 
 function ActivityPage() {
-  const [workspace, setWorkspace] = useState<'locked' | 'loading' | 'demo'>('locked')
-  const [query, setQuery] = useState('')
-  const [selectedId, setSelectedId] = useState(demoActivity[0].id)
+  const { wallets } = useWallets()
+  const [transfers, setTransfers] = useState(() => store.transfers())
+  const [runningId, setRunningId] = useState<string | null>(null)
+  const [progressText, setProgressText] = useState('')
+  const [resumeError, setResumeError] = useState('')
+  const [exported, setExported] = useState(false)
 
-  const filteredActivity = useMemo(
-    () => demoActivity.filter((item) =>
-      [item.id, item.from, item.to, item.asset, item.status]
-        .join(' ')
-        .toLowerCase()
-        .includes(query.toLowerCase()),
-    ),
-    [query],
-  )
-  const selected = demoActivity.find((item) => item.id === selectedId) ?? demoActivity[0]
+  useEffect(() => store.subscribe(() => setTransfers(store.transfers())), [])
 
-  const loadDemo = () => {
-    setWorkspace('loading')
-    window.setTimeout(() => {
-      setSelectedId(demoActivity[0].id)
-      setWorkspace('demo')
-    }, 700)
+  const exportBackup = () => {
+    const blob = new Blob([store.exportRecords()], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `zkross-notes-${new Date().toISOString().slice(0, 10)}.json`
+    link.click()
+    URL.revokeObjectURL(url)
+    setExported(true)
+  }
+
+  const canResume = (transfer: Transfer) =>
+    transfer.status !== 'withdrawn' &&
+    transfer.status !== 'refunded' &&
+    wallets[transfer.from]?.address === transfer.sender &&
+    wallets[transfer.to]?.address === transfer.claimer &&
+    isDeployed(transfer.from) &&
+    isDeployed(transfer.to)
+
+  const resume = async (transfer: Transfer) => {
+    setRunningId(transfer.id)
+    setResumeError('')
+    setProgressText('Unlocking transfer…')
+    try {
+      await runTransfer(transfer, (_step, _status, description) => {
+        if (description) setProgressText(description)
+      })
+      setProgressText('Transfer complete')
+    } catch (error) {
+      setResumeError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setRunningId(null)
+      setTransfers(store.transfers())
+    }
   }
 
   return (
     <div className="page-enter">
-      <div className="flex flex-col justify-between gap-6 sm:flex-row sm:items-end">
-        <div className="max-w-2xl">
-          <p className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
-            <NetworkRouteMark />
-            Transfer activity
-          </p>
-          <h1 className="mt-4 text-4xl font-medium tracking-[-0.055em] sm:text-5xl">Public rails. Private context.</h1>
-          <p className="mt-5 max-w-xl text-sm leading-6 text-muted">
-            The owner view can join public deposit and payout records with private note status and
-            authorized context. Real history still requires authentication and server authorization.
-          </p>
+      <div className="grid gap-8 lg:grid-cols-[1fr_auto] lg:items-end">
+        <div className="max-w-3xl">
+          <p className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent"><NetworkRouteMark />Local transfer records</p>
+          <h1 className="mt-4 text-balance text-4xl font-medium tracking-[-0.055em] sm:text-5xl">A trace you control.</h1>
+          <p className="mt-5 max-w-2xl text-sm leading-6 text-muted">Every transfer below comes from this browser’s local note store. On-chain actions link to the relevant explorer; unfinished flows can resume after a reload.</p>
         </div>
-        <span className="flex w-fit items-center gap-2 rounded-full border border-warning/25 bg-warning/[0.055] px-3 py-1.5 text-[10px] font-medium text-warning">
-          <LockKeyhole aria-hidden="true" className="size-3.5" />
-          Owner access unavailable
-        </span>
+        <Button variant="secondary" onClick={exportBackup}><Download aria-hidden="true" />Export notes backup</Button>
       </div>
 
-      <section className="mt-10 overflow-hidden rounded-[2rem] border border-border bg-surface" aria-labelledby="activity-title">
-        {workspace === 'locked' && (
-          <div className="grid min-h-[500px] place-items-center p-6 text-center">
-            <div className="max-w-md">
-              <span className="mx-auto grid size-14 place-items-center rounded-full border border-border bg-background text-accent">
-                <KeyRound aria-hidden="true" className="size-5" />
-              </span>
-              <h2 id="activity-title" className="mt-6 text-xl font-semibold tracking-[-0.03em]">No authenticated owner session</h2>
-              <p className="mt-3 text-sm leading-6 text-muted">
-                Real transaction history stays closed until identity, authorization, and encrypted storage exist.
-              </p>
-              <Button variant="secondary" className="mt-7" onClick={loadDemo}>
-                <Eye aria-hidden="true" />
-                Explore the ledger demo
-              </Button>
-              <p className="mt-3 text-[10px] text-subtle">Local fixtures only · no wallet or identity lookup</p>
-            </div>
-          </div>
-        )}
+      <div className="mt-8 flex items-start gap-3 rounded-2xl border border-warning/20 bg-warning/[0.045] p-4 text-[11px] leading-5 text-muted">
+        <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
+        <p><strong className="text-foreground">Keep a backup.</strong> Until encrypted note delivery and recovery are implemented, clearing this site’s data can remove the blindings and claim secrets required to use unspent notes. The backup contains sensitive records but no wallet spending key.</p>
+      </div>
+      {exported && <p role="status" className="mt-3 flex items-center gap-2 text-[10px] text-success"><CheckCircle2 aria-hidden="true" className="size-3.5" />Backup downloaded</p>}
 
-        {workspace === 'loading' && (
-          <div className="grid min-h-[500px] place-items-center p-6 text-center" aria-live="polite">
-            <div>
-              <LoaderCircle aria-hidden="true" className="mx-auto size-6 animate-spin text-accent" />
-              <p className="mt-4 text-sm font-medium">Opening local ledger…</p>
-              <p className="mt-1 text-xs text-subtle">No network request is made.</p>
-            </div>
-          </div>
-        )}
+      {resumeError && <div role="alert" className="mt-5 rounded-2xl border border-danger/25 bg-danger/[0.055] p-4 text-[11px] leading-5 text-danger">{resumeError}</div>}
 
-        {workspace === 'demo' && (
-          <div className="grid min-h-[590px] lg:grid-cols-[0.82fr_1.18fr]">
-            <div className="border-b border-border lg:border-b-0 lg:border-r">
-              <div className="border-b border-border px-5 py-5 sm:px-6">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <h2 id="activity-title" className="text-sm font-semibold">Transfer index</h2>
-                      <span className="rounded-md border border-warning/25 px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wider text-warning">Demo</span>
+      <section className="mt-8 overflow-hidden rounded-[2rem] border border-border bg-surface" aria-labelledby="history-title">
+        <div className="flex items-center justify-between gap-4 border-b border-border px-5 py-5 sm:px-7">
+          <div><h2 id="history-title" className="text-base font-semibold tracking-[-0.02em]">Transfers</h2><p className="mt-1 text-xs text-subtle">{transfers.length} record{transfers.length === 1 ? '' : 's'} in this browser</p></div>
+          {runningId && <span className="flex items-center gap-2 text-[10px] text-accent"><LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />{progressText}</span>}
+        </div>
+
+        {transfers.length === 0 ? (
+          <div className="grid min-h-80 place-items-center p-8 text-center">
+            <div className="max-w-sm"><span className="mx-auto grid size-14 place-items-center rounded-full border border-border bg-background text-subtle"><FileClock aria-hidden="true" className="size-5" /></span><h3 className="mt-6 text-lg font-semibold">No transfers yet</h3><p className="mt-3 text-sm leading-6 text-muted">Start a testnet bridge flow and its locally stored notes, status, and transaction links will appear here.</p></div>
+          </div>
+        ) : (
+          <div className="divide-y divide-border">
+            {transfers.map((transfer) => {
+              const status = statusCopy[transfer.status]
+              const resumable = canResume(transfer)
+              const isRunning = runningId === transfer.id
+              return (
+                <article key={transfer.id} className="p-5 sm:p-7">
+                  <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="flex min-w-0 items-start gap-4">
+                      <div className="flex items-center gap-2"><NetworkMark network={transfer.from} className="size-9 rounded-xl" /><ArrowRight aria-hidden="true" className="size-3.5 text-subtle" /><NetworkMark network={transfer.to} className="size-9 rounded-xl" /></div>
+                      <div className="min-w-0"><p className="text-sm font-semibold">{formatMessage(BigInt(transfer.amount))} USDC</p><p className="mt-1 text-[10px] text-subtle">{networkMeta[transfer.from].shortName} → {networkMeta[transfer.to].shortName} · {new Date(transfer.createdAt).toLocaleString()}</p><p className="mt-2 truncate font-mono text-[10px] text-muted">To {truncateAddress(transfer.recipient)}</p></div>
                     </div>
-                    <p className="mt-1 text-[10px] text-subtle">{filteredActivity.length} local records</p>
+                    <div className="flex items-center gap-3 sm:flex-col sm:items-end"><span className={cn('rounded-full border border-border bg-background px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.1em]', status.tone)}>{status.label}</span>{transfer.error && <span className="max-w-xs text-[10px] text-danger sm:text-right">{transfer.error}</span>}</div>
                   </div>
-                </div>
-                <label className="mt-4 flex h-10 items-center gap-2 border-b border-border focus-within:border-accent/60">
-                  <Search aria-hidden="true" className="size-3.5 text-subtle" />
-                  <span className="sr-only">Search demo activity</span>
-                  <input
-                    value={query}
-                    onChange={(event) => setQuery(event.target.value)}
-                    placeholder="Search reference, route, status"
-                    className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-subtle"
-                  />
-                </label>
-              </div>
 
-              <div className="divide-y divide-border">
-                {filteredActivity.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    aria-current={selected.id === item.id ? 'true' : undefined}
-                    onClick={() => setSelectedId(item.id)}
-                    className={cn(
-                      'focus-ring group flex w-full items-start gap-4 px-5 py-5 text-left transition-colors sm:px-6',
-                      selected.id === item.id ? 'bg-accent/[0.055]' : 'hover:bg-background/40',
+                  <div className="mt-5 flex flex-wrap items-center gap-2 border-t border-border pt-4">
+                    {(Object.entries(transfer.txs) as [keyof Transfer['txs'], string][]).map(([key, hash]) => (
+                      <a key={`${key}:${hash}`} href={explorer.tx(txNetwork(transfer, key), hash)} target="_blank" rel="noreferrer" className="focus-ring inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/45 px-2.5 py-1.5 text-[10px] font-medium text-accent hover:border-accent/30">{txLabel[key]} · {truncateAddress(hash)}<ExternalLink aria-hidden="true" className="size-3" /></a>
+                    ))}
+                    {transfer.status !== 'withdrawn' && transfer.status !== 'refunded' && (
+                      <Button variant="secondary" size="sm" className="ml-auto" disabled={!resumable || Boolean(runningId)} onClick={() => void resume(transfer)}>{isRunning ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Play aria-hidden="true" />}{!isDeployed(transfer.from) || !isDeployed(transfer.to) ? 'Awaiting Sepolia pool' : !resumable ? 'Connect both wallets' : 'Resume'}</Button>
                     )}
-                  >
-                    <span className={cn('mt-1 size-1.5 shrink-0 rounded-full', item.status === 'UI complete' ? 'bg-success' : 'bg-warning')} />
-                    <span className="min-w-0 flex-1">
-                      <span className="flex items-center justify-between gap-3">
-                        <span className="font-mono text-[10px]">{item.id}</span>
-                        <span className="text-[9px] text-subtle">{item.date}</span>
-                      </span>
-                      <span className="mt-3 flex items-center justify-between gap-3">
-                        <span className="flex items-center gap-2 text-xs font-medium">
-                          <NetworkRouteMark from={item.from} to={item.to} />
-                          {item.asset}
-                        </span>
-                        <ArrowRight aria-hidden="true" className="size-3.5 text-subtle transition-transform group-hover:translate-x-0.5" />
-                      </span>
-                      <span className="mt-3 flex items-center justify-between gap-3 text-[10px]">
-                        <span className="text-muted">{item.status}</span>
-                        <span className="font-mono text-subtle">{item.amount}</span>
-                      </span>
-                    </span>
-                  </button>
-                ))}
-              </div>
-
-              {filteredActivity.length === 0 && (
-                <div className="grid min-h-48 place-items-center p-6 text-center">
-                  <div>
-                    <p className="text-sm font-medium">No matching local records</p>
-                    <button type="button" onClick={() => setQuery('')} className="focus-ring mt-2 rounded-md text-xs text-accent">Clear search</button>
                   </div>
-                </div>
-              )}
-            </div>
-
-            <article className="p-5 sm:p-7 lg:p-8" aria-label={`Details for ${selected.id}`}>
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <p className="font-mono text-[10px] text-subtle">{selected.id}</p>
-                  <h3 className="mt-2 text-xl font-semibold tracking-[-0.03em]">Transfer trace</h3>
-                </div>
-                <span className={cn(
-                  'rounded-full border px-2.5 py-1 text-[9px]',
-                  selected.status === 'UI complete' ? 'border-success/25 text-success' : 'border-warning/25 text-warning',
-                )}>
-                  {selected.status}
-                </span>
-              </div>
-
-              <div className="mt-8 grid grid-cols-[1fr_auto_1fr] items-center border-y border-border py-7">
-                <div className="flex flex-col items-center text-center">
-                  <NetworkMark network={selected.from} className="size-12 rounded-[18px]" />
-                  <p className="mt-3 text-[9px] uppercase tracking-[0.13em] text-subtle">Source</p>
-                  <p className="mt-1 text-xs font-medium capitalize">{selected.from}</p>
-                </div>
-                <div className="mx-4 flex items-center sm:mx-8">
-                  <span className="h-px w-5 bg-border sm:w-10" />
-                  <ArrowRight aria-hidden="true" className="mx-2 size-4 text-accent" />
-                  <span className="h-px w-5 bg-border sm:w-10" />
-                </div>
-                <div className="flex flex-col items-center text-center">
-                  <NetworkMark network={selected.to} className="size-12 rounded-[18px]" />
-                  <p className="mt-3 text-[9px] uppercase tracking-[0.13em] text-subtle">Destination</p>
-                  <p className="mt-1 text-xs font-medium capitalize">{selected.to}</p>
-                </div>
-              </div>
-
-              <dl className="grid grid-cols-2 gap-px border-b border-border bg-border text-[10px]">
-                {[
-                  ['Recorded', `${selected.date} · ${selected.time}`],
-                  ['Asset', selected.asset],
-                  ['Amount', `${selected.amount} USDC · public fixture`],
-                  ['Verification', selected.verification],
-                ].map(([label, value]) => (
-                  <div key={label} className="bg-surface px-4 py-4">
-                    <dt className="text-subtle">{label}</dt>
-                    <dd className="mt-1.5 text-muted">{value}</dd>
-                  </div>
-                ))}
-              </dl>
-
-              <div className="mt-8">
-                <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">Interface sequence</p>
-                <ol className="mt-5">
-                  {[
-                    ['Intent prepared', true],
-                    ['Privacy proof generated', false],
-                    ['Destination settlement verified', false],
-                  ].map(([label, complete], index) => (
-                    <li key={label as string} className="relative flex gap-3 pb-6 last:pb-0">
-                      {index < 2 && <span aria-hidden="true" className="absolute left-[9px] top-5 h-[calc(100%-8px)] w-px bg-border" />}
-                      <span className="relative z-10 grid size-5 shrink-0 place-items-center rounded-full bg-surface">
-                        {complete ? (
-                          <span className="grid size-5 place-items-center rounded-full bg-success text-background"><Check aria-hidden="true" className="size-3" /></span>
-                        ) : (
-                          <Circle aria-hidden="true" className="size-5 text-border-strong" />
-                        )}
-                      </span>
-                      <div>
-                        <p className={cn('text-xs font-medium', complete ? 'text-foreground' : 'text-muted')}>{label as string}</p>
-                        <p className="mt-1 text-[10px] text-subtle">{complete ? selected.statusDetail : 'No circuit or settlement adapter connected'}</p>
-                      </div>
-                    </li>
-                  ))}
-                </ol>
-              </div>
-
-              <div className="mt-8 flex items-start gap-3 border-t border-border pt-5 text-[10px] leading-5 text-muted">
-                <FileKey2 aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-accent" />
-                Static fixture only. No confidential data, explorer record, proof, or transaction was loaded or decrypted.
-              </div>
-            </article>
+                </article>
+              )
+            })}
           </div>
         )}
       </section>
 
-      <div className="mt-8 grid gap-6 border-y border-border py-7 lg:grid-cols-2">
-        <div className="flex items-start gap-3">
-          <ShieldAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
-          <div>
-            <p className="text-xs font-medium">Public ledgers remain public</p>
-            <p className="mt-1 text-[11px] leading-5 text-muted">USDC amounts, wallet addresses, vault actions, and timestamps remain visible on Ethereum or Stellar.</p>
-          </div>
-        </div>
-        <div className="flex items-start gap-3">
-          <FileKey2 aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-accent" />
-          <div>
-            <p className="text-xs font-medium">Private views require a policy layer</p>
-            <p className="mt-1 text-[11px] leading-5 text-muted">Every reveal should be scoped, authorized, expiring, and written to a tamper-evident access log.</p>
-          </div>
-        </div>
-      </div>
+      <div className="mt-5 flex items-start gap-3 rounded-2xl border border-border bg-background/35 p-4 text-[11px] leading-5 text-muted"><ShieldCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-accent" /><p>Explorer links show public transaction boundaries only. The local record also contains the private continuity needed to resume; it is not an independent on-chain audit log.</p></div>
     </div>
   )
 }
