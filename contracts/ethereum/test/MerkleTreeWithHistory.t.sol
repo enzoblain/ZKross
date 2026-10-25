@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {MerkleTreeWithHistory} from "../src/MerkleTreeWithHistory.sol";
+import {MerkleTreeLib} from "../src/MerkleTreeLib.sol";
 import {MerkleZeroHashes} from "../src/MerkleZeroHashes.sol";
 import {Poseidon2} from "../src/Poseidon2.sol";
 
@@ -76,9 +77,9 @@ contract MerkleTreeWithHistoryTest is Test {
     }
 
     function test_constructorRejectsWrongLevels() public {
-        vm.expectRevert(MerkleTreeWithHistory.WrongLevels.selector);
+        vm.expectRevert(MerkleTreeLib.WrongLevels.selector);
         new MerkleHarness(0);
-        vm.expectRevert(MerkleTreeWithHistory.WrongLevels.selector);
+        vm.expectRevert(MerkleTreeLib.WrongLevels.selector);
         new MerkleHarness(33);
     }
 
@@ -90,14 +91,14 @@ contract MerkleTreeWithHistoryTest is Test {
     function test_fullTreeRefusesTheNextInsertion() public {
         MerkleHarness t = new MerkleHarness(1);
         t.insert(1, 2);
-        vm.expectRevert(MerkleTreeWithHistory.MerkleTreeFull.selector);
+        vm.expectRevert(MerkleTreeLib.MerkleTreeFull.selector);
         t.insert(3, 4);
 
         MerkleHarness t3 = new MerkleHarness(3);
         for (uint256 i = 0; i < 4; i++) {
             t3.insert(i, i);
         }
-        vm.expectRevert(MerkleTreeWithHistory.MerkleTreeFull.selector);
+        vm.expectRevert(MerkleTreeLib.MerkleTreeFull.selector);
         t3.insert(9, 9);
     }
 

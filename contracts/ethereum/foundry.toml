@@ -3,7 +3,7 @@ src = "src"
 out = "out"
 libs = ["lib"]
 solc_version = "0.8.37"
-# Needed for ShieldedPool (unrolled Poseidon2) to stay under the EIP-170 size limit.
+# Keeps contract sizes down (Poseidon2 is also a linked library).
 optimizer = true
 optimizer_runs = 200
 # Proof and hash fixtures exported from SPP.

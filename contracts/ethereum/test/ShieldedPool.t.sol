@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, Vm} from "forge-std/Test.sol";
 import {ShieldedPool} from "../src/ShieldedPool.sol";
 import {MerkleTreeWithHistory} from "../src/MerkleTreeWithHistory.sol";
+import {MerkleTreeLib} from "../src/MerkleTreeLib.sol";
 import {MerkleZeroHashes} from "../src/MerkleZeroHashes.sol";
 import {MockUSDC} from "../src/MockUSDC.sol";
 import {StrictMockVerifier, RevertingVerifier} from "./mocks/StrictMockVerifier.sol";
@@ -246,9 +247,9 @@ contract ShieldedPoolTest is Test {
     }
 
     function test_constructorRejectsWrongLevels() public {
-        vm.expectRevert(MerkleTreeWithHistory.WrongLevels.selector);
+        vm.expectRevert(MerkleTreeLib.WrongLevels.selector);
         _deploy(100, 0, _pt(1, 2), VIEW_ONLY);
-        vm.expectRevert(MerkleTreeWithHistory.WrongLevels.selector);
+        vm.expectRevert(MerkleTreeLib.WrongLevels.selector);
         _deploy(100, 33, _pt(1, 2), VIEW_ONLY);
     }
 
@@ -861,7 +862,7 @@ contract ShieldedPoolTest is Test {
         (p, e) = _mkMovingProof(pool, 100, 2);
         _accept(p, _pt(1, 2));
         vm.prank(sender);
-        vm.expectRevert(MerkleTreeWithHistory.MerkleTreeFull.selector);
+        vm.expectRevert(MerkleTreeLib.MerkleTreeFull.selector);
         pool.transact(p, e);
         assertEq(token.balanceOf(sender), 9_900);
         assertEq(token.balanceOf(address(pool)), 100);

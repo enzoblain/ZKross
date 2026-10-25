@@ -7,7 +7,9 @@ pragma solidity ^0.8.24;
 /// VERSIONS.md): the Poseidon2 permutation with d = 5, 8 full rounds and 56
 /// partial rounds, and SPP's round constants for t = 2 and t = 3. Checked
 /// against vectors taken from SPP's Soroban code and its off-chain
-/// `taceo_poseidon2` (test/Poseidon2.t.sol).
+/// `taceo_poseidon2` (test/Poseidon2.t.sol). The hash functions are
+/// `external`: the library is deployed once and linked, which keeps the
+/// unrolled code out of every contract that hashes.
 library Poseidon2 {
     /// BN254 scalar field modulus.
     uint256 internal constant R = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
@@ -18,7 +20,7 @@ library Poseidon2 {
     /// SPP's `poseidon2_compress`: the t = 2 permutation of [left, right],
     /// with the first output plus `left` (feed-forward). Used for every
     /// internal node of SPP's Merkle trees.
-    function compress(uint256 left, uint256 right) internal pure returns (uint256 out) {
+    function compress(uint256 left, uint256 right) external pure returns (uint256 out) {
         if (left >= R || right >= R) revert Poseidon2InputNotInField();
         assembly ("memory-safe") {
             function sbox(x) -> y {
@@ -293,7 +295,7 @@ library Poseidon2 {
 
     /// SPP's `poseidon2_hash2`: the t = 3 permutation of [a, b, sep], first
     /// output. Note the domain separator `sep` is the last state element.
-    function hash2(uint256 a_, uint256 b_, uint256 sep) internal pure returns (uint256 out) {
+    function hash2(uint256 a_, uint256 b_, uint256 sep) external pure returns (uint256 out) {
         if (a_ >= R || b_ >= R || sep >= R) revert Poseidon2InputNotInField();
         assembly ("memory-safe") {
             function sbox(x) -> y {
