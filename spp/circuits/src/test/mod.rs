@@ -12,6 +12,7 @@ mod prove_sparse;
 mod prove_global_view_key;
 mod prove_key_ownership;
 mod prove_keypair;
+mod prove_bridge;
 mod prove_policy;
 mod prove_selective_disclosure;
 mod prove_transaction;

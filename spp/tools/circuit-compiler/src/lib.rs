@@ -55,6 +55,10 @@ const POLICY_GLOBAL_VIEW_KEY_CIRCUITS: &[&str] = &[
 /// Public key registry proof of note key ownership.
 const KEY_OWNERSHIP_CIRCUIT: &str = "keyOwnership";
 
+/// ZKross bridge circuits (circuits/src/bridge_*.circom, templates in
+/// circuits/src/zkross; SPEC.md B8).
+const ZKROSS_BRIDGE_CIRCUITS: &[&str] = &["bridge_out", "bridge_in"];
+
 fn circuit_needs_groth16_keys(name: &str, groth16_key_circuits: &[String]) -> bool {
     groth16_key_circuits.iter().any(|stem| stem == name)
 }
@@ -79,6 +83,7 @@ fn groth16_key_circuits() -> Vec<String> {
             .map(|stem| (*stem).to_owned()),
     );
     circuits.push(KEY_OWNERSHIP_CIRCUIT.to_owned());
+    circuits.extend(ZKROSS_BRIDGE_CIRCUITS.iter().map(|stem| (*stem).to_owned()));
     circuits
 }
 

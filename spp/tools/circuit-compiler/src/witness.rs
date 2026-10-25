@@ -28,6 +28,9 @@ const WITNESS_GRAPH_CIRCUITS: &[&str] = &[
     "selectiveDisclosure_3",
     "selectiveDisclosure_4",
     "keyOwnership",
+    // ZKross bridge circuits (circuits/src/bridge_*.circom).
+    "bridge_out",
+    "bridge_in",
 ];
 
 fn check_circom_version(circuits_dir: &Path) -> Result<()> {
