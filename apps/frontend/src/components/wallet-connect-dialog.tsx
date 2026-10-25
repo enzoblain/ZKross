@@ -1,6 +1,6 @@
 import { CheckCircle2, ExternalLink, LoaderCircle, ShieldCheck, Unplug } from 'lucide-react'
 
-import { networkMeta, type NetworkId } from '../lib/mock-bridge'
+import { networkMeta, type NetworkId } from '../lib/networks'
 import { truncateAddress } from '../lib/wallet-adapters'
 import { NetworkMark } from './network-logo'
 import { Button } from './ui/button'

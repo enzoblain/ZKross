@@ -14,7 +14,7 @@ import { useMemo, useState } from 'react'
 
 import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
-import type { NetworkId } from '../lib/mock-bridge'
+import type { NetworkId } from '../lib/networks'
 import { cn } from '../lib/utils'
 
 type DemoActivity = {

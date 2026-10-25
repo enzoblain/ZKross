@@ -1,6 +1,6 @@
 import { createContext, useContext } from 'react'
 
-import type { NetworkId, WalletConnection } from '../lib/mock-bridge'
+import type { NetworkId, WalletConnection } from '../lib/networks'
 
 type Wallets = Partial<Record<NetworkId, WalletConnection>>
 

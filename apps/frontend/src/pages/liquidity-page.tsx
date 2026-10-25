@@ -28,7 +28,7 @@ import {
 } from '../components/ui/dialog'
 import { useWallets } from '../components/wallet-context'
 import { WalletConnectDialog } from '../components/wallet-connect-dialog'
-import { networkMeta, type NetworkId } from '../lib/mock-bridge'
+import { networkMeta, type NetworkId } from '../lib/networks'
 import { cn } from '../lib/utils'
 import { truncateAddress } from '../lib/wallet-adapters'
 

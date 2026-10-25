@@ -1,4 +1,4 @@
-import type { NetworkId } from '../lib/mock-bridge'
+import type { NetworkId } from '../lib/networks'
 import { cn } from '../lib/utils'
 
 type NetworkLogoProps = {

@@ -34,7 +34,7 @@ import {
   networkMeta,
   type NetworkId,
   type TransferProgressStep,
-} from '../lib/mock-bridge'
+} from '../lib/networks'
 import { cn } from '../lib/utils'
 import { truncateAddress } from '../lib/wallet-adapters'
 

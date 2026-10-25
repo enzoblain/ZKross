@@ -1,7 +1,10 @@
-import type { NetworkId, WalletConnection } from './mock-bridge'
+import * as freighter from '@stellar/freighter-api'
 
-const SEPOLIA_CHAIN_ID = '0xaa36a7'
-const STELLAR_TESTNET_PASSPHRASE = 'Test SDF Network ; September 2015'
+import { sepoliaConfig, stellarConfig } from './config'
+import type { NetworkId, WalletConnection } from './networks'
+
+const SEPOLIA_CHAIN_ID = sepoliaConfig.chainIdHex
+const STELLAR_TESTNET_PASSPHRASE = stellarConfig.passphrase
 
 type ProviderRequest = {
   method: string
@@ -12,24 +15,9 @@ type EthereumProvider = {
   request<T = unknown>(request: ProviderRequest): Promise<T>
 }
 
-type FreighterError = {
-  message?: string
-}
-
-type FreighterApi = {
-  isConnected(): Promise<{ isConnected: boolean; error?: FreighterError }>
-  requestAccess(): Promise<{ address: string; error?: FreighterError }>
-  getNetworkDetails(): Promise<{
-    network?: string
-    networkPassphrase?: string
-    error?: FreighterError
-  }>
-}
-
 declare global {
   interface Window {
     ethereum?: EthereumProvider
-    freighterApi?: FreighterApi
   }
 }
 
@@ -91,7 +79,7 @@ async function ensureSepolia(provider: EthereumProvider) {
           chainId: SEPOLIA_CHAIN_ID,
           chainName: 'Ethereum Sepolia',
           nativeCurrency: { name: 'Sepolia ETH', symbol: 'ETH', decimals: 18 },
-          rpcUrls: ['https://rpc.sepolia.org'],
+          rpcUrls: [sepoliaConfig.rpcUrl],
           blockExplorerUrls: ['https://sepolia.etherscan.io'],
         },
       ],
@@ -144,16 +132,8 @@ async function connectEthereum(): Promise<WalletConnection> {
 }
 
 async function connectStellar(): Promise<WalletConnection> {
-  const api = window.freighterApi
+  const api = freighter
   const installUrl = 'https://www.freighter.app/'
-
-  if (!api) {
-    throw new WalletConnectionError(
-      'INSTALL_REQUIRED',
-      'Freighter is unavailable in this browser. Install it or open Zkross in a browser where the extension is enabled.',
-      installUrl,
-    )
-  }
 
   const connection = await withTimeout(api.isConnected())
   if (connection.error || !connection.isConnected) {

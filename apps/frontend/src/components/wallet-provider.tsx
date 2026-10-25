@@ -3,7 +3,7 @@ import {
   type ReactNode,
 } from 'react'
 
-import type { NetworkId } from '../lib/mock-bridge'
+import type { NetworkId } from '../lib/networks'
 import { connectInjectedWallet } from '../lib/wallet-adapters'
 import { WalletContext, type Wallets } from './wallet-context'
 
