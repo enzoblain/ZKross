@@ -1,0 +1,14 @@
+node_modules/
+dist/
+target/
+out/
+cache/
+.env
+.env.*
+!.env.example
+.DS_Store
+
+*.log
+*.local
+/contracts/ethereum/broadcast/**/dry-run/
+/contracts/ethereum/broadcast/**/cache/

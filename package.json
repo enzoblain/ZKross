@@ -1,0 +1,29 @@
+{
+  "name": "zkross",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "npm run dev --workspace=apps/frontend",
+    "build:frontend": "npm run build --workspace=apps/frontend",
+    "test:ethereum": "forge test --root contracts/ethereum",
+    "test:stellar": "cargo test --manifest-path contracts/stellar/Cargo.toml"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/enzoblain/ZKross.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/enzoblain/ZKross/issues"
+  },
+  "homepage": "https://github.com/enzoblain/ZKross#readme",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ]
+}
