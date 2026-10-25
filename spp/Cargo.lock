@@ -4480,6 +4480,7 @@ dependencies = [
  "asp-non-membership",
  "circom-groth16-verifier",
  "contract-types",
+ "k256",
  "pool-core",
  "soroban-sdk",
  "soroban-utils",
