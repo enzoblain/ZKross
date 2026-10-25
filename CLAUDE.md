@@ -1,80 +1,86 @@
 # ZKross: context for Claude Code
 
-This file gives Claude Code the context from our planning discussion. The full build plan is in `docs/PLAN.md`; read it before making design decisions.
+This file gives Claude Code the context from our planning discussion. The full build plan is in `PLAN.md` at the repo root; read it before making design decisions. A PDF and an online version of the same plan exist; `PLAN.md` is the source of truth in the repo.
 
 ## The project
 
-ZKross is a testnet demo of a **private bridge between Stellar and Ethereum (Sepolia)** using zero-knowledge proofs written in **Noir**, inspired by **ProofBridge**.
+ZKross is a testnet demo of a **private bridge between Stellar and Ethereum (Sepolia)**, inspired by **ProofBridge** and built on **Stellar Private Payments (SPP)**, Nethermind's open-source shielded pool for Stellar (https://github.com/NethermindEth/stellar-private-payments).
 
-- The public sees only commitments, nullifiers and ciphertexts. Amounts, owners and the link between a deposit on one chain and a withdrawal on the other stay hidden.
-- An **admin** can decrypt everything: every circuit *forces* a correct encryption of the note data to the admin's public key.
+- The public sees only commitments, nullifiers and ciphertexts. Amounts, owners and the link between a deposit on one chain and a withdrawal on the other stay hidden (except deposit and withdrawal amounts, which are public because tokens move in or out).
+- An **admin** can decrypt everything, using SPP's **Global View Key** in traceable mode: every circuit encrypts every note to the admin's Baby JubJub key, inside the circuit.
 - Everything runs on **testnet only** (Stellar testnet + Ethereum Sepolia), with our own test token **tUSDC**.
 
-What we take from ProofBridge: a Poseidon2 log of bridge messages on each chain, proofs verified on both chains, nothing minted (liquidity is pre-funded). What we add: a shielded pool on each chain, hidden amounts, enforced admin visibility. Note: ProofBridge itself is **not** private (amounts and recipients are public); it only uses ZK for succinct verification.
+**Noir is not used.** We switched from a Noir plan to SPP: its Circom circuits and Groth16 proofs already provide hidden amounts, enforced admin visibility, browser proving, an indexer and an admin page. If you see Noir, UltraHonk, `nargo` or `bb` anywhere in the repo or old notes, it's from the abandoned plan.
+
+## What we reuse and what we build
+
+| Part | Reused from SPP | We build |
+| --- | --- | --- |
+| Pool circuit | `policy_tx_2_2_gvk_T` (2-in-2-out, hidden amounts, traceable Global View Key) | — |
+| Bridge circuits | SPP's templates: transaction core, Merkle proof, Global View Key encryption, Poseidon2 | `bridge_out`, `bridge_in` (Circom) |
+| Stellar contracts | `pool-gvk`, `pool-core`, `circom-groth16-verifier`, `public-key-registry` | Bridge functions, outbox tree, liquidity accounting |
+| Ethereum contracts | — | Solidity port of `pool-gvk` + bridge functions, matching Poseidon2 and Merkle tree, snarkjs-exported verifiers |
+| SDK, prover, indexer | Rust and web SDKs, prover worker, indexer, bootnode | Ethereum support, bridge flows |
+| Admin view | Admin page, Global View tab | Ethereum notes, linking bridge-out to bridge-in |
 
 ## Team split
 
 | Person | Role | Owns |
 | --- | --- | --- |
-| Person 1 | ZK & cryptography | `SPEC.md`, Noir circuits, Groth16 keys, a small TypeScript crypto library (notes, encryption, proving) |
-| **Emin (Person 2)** | **Smart contracts & bridge** | Soroban contracts, Solidity contracts, vaults, bridge messages, root poster, relayer, indexer, refunds/deadlines |
-| Person 3 | Frontend, admin & integration | React app, wallets, Deposit/Bridge/Claim/Withdraw screens, admin dashboard, demo |
+| Person 1 | ZK & cryptography | `SPEC.md`, the `bridge_out` and `bridge_in` Circom circuits, their Groth16 keys, the Solidity Poseidon2 check |
+| **Emin (Person 2)** | **Smart contracts & bridge** | Bridge functions in SPP's Soroban pool, the Solidity port of the pool, verifiers, root poster, relayer, refund attester, Ethereum indexer |
+| Person 3 | Frontend, admin & integration | Web app on SPP's SDK, Ethereum wallet, bridge and claim screens, admin view for both chains, demo |
 
-Phase 0 (a hello-world proof verified on both chains) is a joint task for Person 1 and Emin, on day one.
+## Emin's scope
 
-## Emin's scope (this branch)
+1. **Stellar:** extend SPP's `pool-gvk` with `bridge_out`, `bridge_in`, `post_remote_root`, `finalize`, `refund`, `add_liquidity`; an outbox Merkle tree (reuse SPP's Merkle tree with root history), pending `C` records with deadline bucket and refund commitment, a claim-nullifier set, known remote roots. SPP's `transact` stays unchanged.
+2. **Ethereum:** `ShieldedPool.sol`, a function-for-function port of SPP's pool logic (root history, nullifiers, external-data hash, public amount, Global View Key and nonce checks, events with ciphertexts), plus the same bridge functions; `MockUSDC`; Groth16 verifiers exported with snarkjs from the same keys used on Stellar.
+3. **Services** (TypeScript): Ethereum indexer with outbox trees and a Merkle path API, root poster, relayer, refund attester. On Stellar, reuse SPP's indexer and bootnode.
+4. **Deliverable:** an end-to-end testnet transfer, Stellar → Ethereum and back, with liquidity seeded on both chains.
 
-1. **Soroban pool contract**: deposit, withdraw, bridge_out, bridge_in, post_remote_root, finalize, refund. Incremental Merkle tree (depth 20, last 30 roots kept), nullifier and claim-nullifier sets, outbox tree of bridge messages `C`.
-2. **Solidity pool contract** (`ShieldedPool.sol`) mirroring the Soroban one function for function, plus `MockUSDC` (tUSDC, 6 decimals).
-3. **Liquidity vault** on each chain (Mode A). In Mode B, liquidity sits inside the pool instead.
-4. **Groth16 verifier contracts** on both chains (one per circuit).
-5. **Off-chain services** in TypeScript: indexer (events → SQLite → Merkle paths API), root poster, relayer, refund attester.
-6. **Deliverable:** an end-to-end testnet transfer, Stellar → Ethereum and back, with pre-funded liquidity on both chains.
-
-Until Person 1's real verification keys exist, use a mock verifier that accepts everything, so contract work isn't blocked. Replace it before any integration test.
+Until Person 1's bridge circuits and keys exist, use a mock verifier. Make it strict enough that tests can check the contract passes the right public inputs (for example, a test registers the exact public inputs it should accept), so tests on tampered ciphertexts or changed recipients are meaningful.
 
 ## Key decisions (do not change without the team)
 
-- **Proof system: Noir circuits proved with Groth16, on both chains.** Use the Noir-Groth16 backend (github.com/jamesbachini/Noir-Groth16) to turn Noir circuits into Groth16 artifacts, `snarkjs` to prove, a Soroban Groth16 verifier built on the BN254 host functions, and a `snarkjs`-exported Solidity verifier on Sepolia. Same keys and same proof format on both chains.
-- **Hash: Poseidon2 everywhere**, with identical parameters in Noir, Soroban and Solidity. Every hash takes a domain tag as its first input.
-- **Tree:** fixed-depth incremental Merkle tree, depth 20.
-- **Amounts:** Mode A (fixed denominations 10 / 100 / 1,000 tUSDC) first, then Mode B (hidden amounts, 2-in-2-out join-split `transact` circuit). Contracts keep a `mode` setting.
-- **Trust assumptions accepted for testnet:** an admin-run root poster, a single admin key, one relayer, admin-signed refund attestations.
-- **Bridge messages:** `C = H(TAG_BRIDGE, amount, asset_id, src_chain, dst_chain, recipient_owner_pk, claim_secret, deadline)`. The claim nullifier is `H(TAG_CLAIM, claim_secret)`, never a hash of `C`, so claims can't be linked across chains. Every `C` has a deadline; unclaimed messages are refunded.
+- **Base:** SPP, pinned to one commit recorded in `VERSIONS.md`; never update it mid-project. Keep SPP's LICENSE and NOTICE files (Apache 2.0; its circuit compiler tool is GPLv3; compiled circuits are LGPLv3).
+- **Proofs:** Circom + Groth16 on BN254, the same circuits and keys on both chains.
+- **Pool policy:** open policy (no ASP lists) with a **traceable** Global View Key.
+- **Hash:** SPP's Poseidon2 everywhere. The Solidity Poseidon2 must match SPP's exactly (test vectors).
+- **Bridge message:** `C = Poseidon2(TAG_BRIDGE, amount, asset_id, src_chain, dst_chain, recipient_pk, claim_secret, deadline_bucket)`, new domain tags from `0x07` (SPP uses `0x01`–`0x06`). Claim nullifier = `Poseidon2(TAG_CLAIM, claim_secret)`, never a hash of `C`. Exact formats live in `SPEC.md`.
+- **Liquidity:** unowned balance inside each pool, seeded by us; the admin rebalances by hand on testnet.
+- **Accepted testnet trust:** an admin-run root poster, one relayer, admin-signed refund attestations, a single admin key.
 
-## Critical gotchas (corrections we found)
+## Critical gotchas
 
-- **Never use the UltraHonk verifiers on Stellar** (`NethermindEth/rs-soroban-ultrahonk`, `indextree/ultrahonk_soroban_contract`). As of October 2026 they accept only **non-zero-knowledge** proofs, which give no witness-hiding guarantee: private inputs (amounts, spent notes, spending keys) could leak from the proof. Stellar's own privacy guide says to use Groth16 for hidden inputs. Their Tornado demos are explicitly "demo only" for this reason.
-- **Do not use `bb` (Barretenberg) verifiers or `bb gates`.** They are for UltraHonk; we use Groth16.
-- **Stellar's Poseidon host functions are permutations, not full hashes.** Use `stellar/rs-soroban-poseidon` (enable `soroban-sdk` feature `hazmat-crypto`) so the Soroban hash matches Noir's Poseidon2. Check against the shared test vectors in `SPEC.md`.
-- **Soroban storage expires.** Extend the TTL of nullifiers and roots on every write, and test archival behaviour.
-- **Simulate every Soroban call** and check CPU, memory and size against network limits.
-- **Stellar recipients** need an existing account with a tUSDC trustline; for the demo, pre-create recipient accounts or have the relayer sponsor them.
-- **Soroban RPC keeps only recent events**: the indexer must run continuously, with a backfill script.
-- **Mode B range checks:** every amount must be below 2^64 and the two input nullifiers in one transaction must differ. A missing check lets someone create money from nothing.
-- **Encoding:** convert Stellar and Ethereum addresses, chain IDs and deadline buckets to field elements exactly as `SPEC.md` says, identically on both chains. Mismatches here are the most likely cross-chain bug.
-- The Noir-Groth16 backend is a young one-person project. Pin the Noir (`nargo`) version it supports, record everything in `VERSIONS.md`, and never upgrade mid-project.
+- **Every contract function must check that the Global View Key public input equals the pool's stored admin key, and that the nonce is unique.** SPP's docs warn the circuit can't enforce either; without these checks a user can produce notes the admin can't decrypt.
+- **Reject public inputs ≥ the BN254 scalar field size r** on both chains (snarkjs Solidity verifiers do this; check SPP's Soroban verifier and our own code). Accepting them allows double spends.
+- **Verification keys must not be replaceable by anyone**: set once at construction.
+- **Stellar storage expires**: use SPP's time-to-live helper (`extend_persistent`) on every new persistent entry.
+- **Stellar RPC keeps events for only about 7 days**: SPP's bootnode keeps history; the Ethereum indexer needs a backfill script.
+- **Simulate every Soroban call** and check CPU, memory and size limits.
+- **Stellar recipients** of a public withdrawal need an account with a tUSDC trustline.
+- **Field encodings** (addresses, chain IDs, deadline buckets, external-data hash) must be identical on both chains and written down in `SPEC.md`. Mismatches are the most likely cross-chain bug.
+- **SPP's tooling expects Linux or macOS.** This machine runs Windows with WSL2 (Ubuntu): run SPP's build, Circom, snarkjs and Rust builds inside WSL.
+- **Never use mainnet configuration or real-fund keys.** Keys go in `.env` files excluded by `.gitignore`.
 
-## Repository layout
+## Repository layout (as it actually exists)
 
 ```
-circuits/            Noir circuits (Person 1)
-contracts/stellar/   Soroban contracts (Emin)
-contracts/evm/       Foundry project (Emin)
-services/            indexer, root poster, relayer, refund attester (Emin)
-app/                 React app and admin dashboard (Person 3)
-scripts/             deployment and end-to-end scripts
-SPEC.md              shared crypto spec: tags, field order, encodings, test vectors
-VERSIONS.md          pinned tool versions
-deployments.json     deployed addresses, read by services and app
-docs/PLAN.md         full build plan
+contracts/stellar/    Soroban contracts (Emin)
+contracts/ethereum/   Foundry project, created by Enzo (Emin works here)
+services/             relayer (exists), prover (leave alone), plus indexer, root poster, refund attester
+apps/frontend/        web app (Person 3)
+PLAN.md               full build plan
+SPEC.md               shared formats and test vectors (Person 1)
+VERSIONS.md           pinned versions, including the SPP commit
+deployments.json      deployed addresses
 ```
 
-## Useful references
+Where SPP itself lives in the repo (a fork, or a git subtree such as `spp/`) is a team decision for Phase 0; ask before choosing.
 
+## References
+
+- SPP: https://github.com/NethermindEth/stellar-private-payments (see `docs/src/global_view_key.md`, `docs/src/operator/`, `DEPLOY.md`, `contracts/pool-gvk`, `contracts/pool-core`, `circuits/src`)
 - Stellar privacy and ZK guide: https://github.com/stellar/ecosystem-resources/tree/main/privacy-zk
-- Stellar Private Payments (Nethermind, Circom + Groth16 shielded pool on Soroban; reference for contract structure and its Groth16 verifier): https://github.com/NethermindEth/stellar-private-payments
-- rs-soroban-poseidon: https://github.com/stellar/rs-soroban-poseidon
-- Noir-Groth16 backend: https://github.com/jamesbachini/Noir-Groth16
 - ProofBridge docs: https://docs.pfbridge.xyz
-- Shared build plan doc: https://claude.ai/artifact/HbJsqp5BKsfY5ZDXPQtBMT
+- Shared build plan: https://claude.ai/artifact/HbJsqp5BKsfY5ZDXPQtBMT

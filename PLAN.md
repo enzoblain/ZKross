@@ -1,26 +1,25 @@
 # Private Stellar ↔ Ethereum ZK Bridge: Build Plan
 
-Exported from the shared build plan doc on 25 October 2026: https://claude.ai/artifact/HbJsqp5BKsfY5ZDXPQtBMT (the architecture diagram is only in the doc).
+Exported from the shared build plan doc on 25 October 2026: https://claude.ai/artifact/HbJsqp5BKsfY5ZDXPQtBMT (the architecture diagram is only in the doc and PDF).
 
 ## Overview
 
-We will build a testnet demo where test USDC moves privately between Stellar testnet and Ethereum Sepolia: the public sees only commitments and nullifiers, while an admin key decrypts every transaction. It reuses ProofBridge's core ideas (a Poseidon2 log of bridge messages, Noir proofs verified on both chains, nothing minted) and adds a shielded pool on each chain.
+We will build a testnet demo where test USDC moves privately between Stellar testnet and Ethereum Sepolia: the public sees only commitments, nullifiers and ciphertexts, while an admin key decrypts every transaction. We build on **Stellar Private Payments (SPP)**, Nethermind's open-source shielded pool for Stellar (Circom circuits, Groth16 proofs, Soroban contracts), and add what it doesn't have: an Ethereum pool and a private bridge between the two chains, inspired by ProofBridge.
 
-The design below already includes the fixes from our discussion:
+What SPP already gives us, and what we add:
 
-- **Shielded pool per chain.** Funds live as notes in a Merkle tree; spending reveals only a nullifier.
-- **Two amount modes.** Mode A uses fixed denominations (10, 100, 1,000 tUSDC); Mode B hides arbitrary amounts. Build Mode A first; Mode B extends it (see Amount modes below).
-- **Shared liquidity vault per chain** instead of per-trade Makers. Bridge-in pays from the destination vault, bridge-out adds to the source vault. No counterparty learns your amount or timing.
-- **Deadline and refund path.** Every bridge message carries a deadline. If it isn't claimed in time (for example, the destination vault was empty), the sender gets refunded, so funds are never lost.
-- **Enforced admin visibility.** Every circuit proves that a ciphertext of the note's contents was correctly encrypted to the admin's public key.
-- **Trusted root poster.** An admin-run service copies each chain's outbox root to the other chain. This is an accepted trust assumption for testnet.
-- **One relayer** submits transactions so fresh addresses don't need gas.
+- **Shielded pool with hidden amounts (from SPP).** Funds live as notes in a Merkle tree, and a 2-in-2-out transaction circuit hides amounts, senders and receivers. Deposits and withdrawals stay public.
+- **Enforced admin visibility (from SPP's Global View Key).** Every transaction proves inside the circuit that each note is encrypted to the admin's key. In traceable mode, spent notes are encrypted too, so the admin can follow funds across hops. SPP's admin page already decrypts and exports them.
+- **Ethereum pool (we add).** The same circuits and proving keys, a Solidity port of SPP's pool, and a Groth16 verifier exported with snarkjs.
+- **Private bridge (we add).** Two new circuits, bridge-out and bridge-in, move a note's hidden value from one chain's pool to the other's, using a Poseidon2 log of bridge messages like ProofBridge, but private. Nothing is minted: each pool holds liquidity we seed.
+- **Deadline and refund path (we add).** Bridge messages not claimed before their deadline are refunded, so funds are never lost.
+- **Trusted root poster and one relayer (we add).** An admin-run service copies each chain's bridge-outbox root to the other chain, and a relayer submits transactions so fresh addresses don't need gas. Both are accepted trust assumptions for testnet.
 
-Architecture: the user's browser (wallets, notes, Noir prover) sends transactions to a shielded pool, verifiers and vault on each chain; a root poster copies outbox roots between the chains; a relayer submits on both chains; an indexer serves events and Merkle paths; the admin dashboard decrypts every note. Proofs are made in the browser and checked on-chain; the off-chain services can stall the system but cannot move funds.
+Architecture: the user's browser (wallets, notes, Groth16 prover) sends transactions to a shielded pool with its verifiers and liquidity on each chain; a root poster copies outbox roots between the chains; a relayer submits on both chains; an indexer serves events and Merkle paths; the admin dashboard decrypts every note. Proofs are made in the browser and checked on-chain; the off-chain services can stall the system but cannot move funds.
 
-**In scope:** deposit, withdraw, bridge in both directions, refunds, admin dashboard, web app, testnet deployment.
+**In scope:** deposit, private transfer and withdraw on both chains, bridge in both directions, refunds, admin view on both chains, web app, testnet deployment.
 
-**Out of scope:** audits, mainnet, ZK light clients, private transfers inside a pool (stretch goal), multiple relayers, threshold admin key (stretch goal).
+**Out of scope:** audits, mainnet, ZK light clients, ASP allowlists and blocklists (SPP supports them; we run its open policy), multiple relayers, threshold admin key (stretch goal).
 
 ## Key design decisions
 
@@ -28,245 +27,204 @@ Lock these before writing code; changing them later means redoing circuits and c
 
 | Decision | Recommendation | Alternative |
 | --- | --- | --- |
-| Second chain | Ethereum Sepolia | Solana devnet (needs Sunspot and Groth16, more work) |
-| Proof system | Noir circuits proved with Groth16 (Noir-Groth16 backend), on both chains | Fork Stellar Private Payments (Circom + Groth16) for Stellar; Noir + UltraHonk only once Stellar's verifier supports zero-knowledge proofs |
-| Hash | Poseidon2, identical parameters in Noir, Soroban (via rs-soroban-poseidon) and Solidity | None; this must match everywhere |
-| Tree | Fixed-depth incremental Merkle tree, depth 20 (~1M leaves) | Merkle Mountain Range like ProofBridge (more complex circuits) |
-| Amounts | Both: Mode A (fixed denominations: 10, 100, 1,000 tUSDC) first, then Mode B (hidden amounts) | Mode B only (skips the simpler build that de-risks Soroban limits) |
+| Base | Fork Stellar Private Payments (SPP, Apache 2.0) | Write our own pool in Noir (about twice the work) |
+| Second chain | Ethereum Sepolia | Solana devnet (more work) |
+| Circuits and proofs | SPP's Circom circuits with Groth16 on BN254; the same circuits and keys on both chains | Noir with the Noir-Groth16 backend |
+| Pool policy | Open policy with a traceable Global View Key (SPP's `policy_tx_2_2_gvk_T` circuit) | Add ASP allowlists or blocklists later (SPP supports them) |
+| Hash | SPP's Poseidon2, plus a Solidity Poseidon2 that matches it exactly | None; this must match everywhere |
+| Tree | SPP's Merkle tree with root history | — |
+| Amounts | Hidden, using SPP's 2-in-2-out join-split | Fixed denominations (not needed with SPP) |
 | Token | Our own test token: a Stellar asset (SAC) and a mock ERC-20, both "tUSDC" | Circle's testnet USDC (faucet limits slow testing) |
-| Liquidity | Shared vault per chain, seeded by us | Per-trade Makers like ProofBridge |
-| Admin key | Single Grumpkin key for MVP | 2-of-3 threshold key (stretch) |
+| Liquidity | Extra unowned balance in each pool, seeded by us | Per-trade makers like ProofBridge |
+| Admin key | One Baby JubJub Global View Key per pool (the same key can serve both chains) | 2-of-3 threshold key (stretch) |
 | Root trust | Admin-run root poster | Multisig of posters, ZK light client (out of scope) |
-| Proving | In the browser (noir_js for the witness, snarkjs for the Groth16 proof) | Server-side prover for tests only (it would see secrets) |
+| Proving | In the browser with SPP's web SDK and prover worker | Server-side prover for tests only (it would see secrets) |
 | Refund proof | Admin-signed attestation after the deadline | Sparse Merkle tree non-membership proof (stretch) |
 
-**Why Groth16 and not UltraHonk.** Stellar's Noir (UltraHonk) verifier currently accepts only non-zero-knowledge proofs, which give no witness-hiding guarantee: private inputs such as amounts, spent notes and even spending keys could be recovered from a proof. Stellar's own privacy guide says not to use it for privacy-sensitive circuits until zero-knowledge verification ships, and to use Groth16 for hidden inputs. Groth16 is zero-knowledge, cheap to verify with Stellar's BN254 host functions, and the Noir-Groth16 backend lets us keep writing circuits in Noir. Using Groth16 on Ethereum too means one proving pipeline and identical proofs on both chains. Sources: [Stellar privacy and ZK guide](https://github.com/stellar/ecosystem-resources/tree/main/privacy-zk), [Nethermind UltraHonk verifier](https://github.com/NethermindEth/rs-soroban-ultrahonk), [Noir-Groth16 backend](https://github.com/jamesbachini/Noir-Groth16).
+**Why SPP.** Noir isn't required, and SPP already solves the hardest parts: hidden amounts, admin encryption enforced inside the circuit (its Global View Key), browser proving, an indexer and an admin page, all running on Stellar testnet with zero-knowledge Groth16 proofs. Building on it is about half the work of writing our own pool in Noir, and it avoids the Noir risks on Stellar today: Stellar's UltraHonk verifier doesn't hide private inputs, and the Noir-to-Groth16 path is a young one-person project. Our original work is the Ethereum pool and the private bridge. SPP is an unaudited work-in-progress reference implementation, which is fine for a testnet demo. We credit it and keep its licenses: Apache 2.0 for most code, GPLv3 for its circuit compiler tool, and LGPLv3 for compiled circuits, so the published app must include those license notices. Sources: [SPP repository](https://github.com/NethermindEth/stellar-private-payments), [SPP Global View Key docs](https://github.com/NethermindEth/stellar-private-payments/blob/main/docs/src/global_view_key.md), [Stellar privacy and ZK guide](https://github.com/stellar/ecosystem-resources/tree/main/privacy-zk).
 
-## Amount modes: fixed denominations vs hidden amounts
+## What we reuse from SPP and what we build
 
-Build both, in order: Mode A gives a working bridge with the smallest circuits, and Mode B reuses its spec, contracts and services while replacing the spend circuits. Ship Mode A to testnet before starting Mode B.
+We reuse SPP's pool, circuits and tooling unchanged where possible, and spend our effort on the Ethereum side and the bridge.
 
-| | Mode A: fixed denominations | Mode B: hidden amounts |
+| Part | Reused from SPP | We build |
 | --- | --- | --- |
-| What users can move | Only 10, 100 or 1,000 tUSDC per note | Any amount |
-| Amount visible to the public | Yes, but every note of a size looks the same | No, except at deposit and withdrawal |
-| Spend circuit | 1 note in, 0 notes out | 2 notes in, 2 notes out (join-split) |
-| Range checks | Not needed | Required on every amount |
-| Liquidity | Separate vault pays out each denomination | Held inside the pool as unowned balance |
-| Private transfers in the pool | Not needed | Built in (same circuit) |
-| Circuit size and proving time | Smallest | About 2–3 times larger |
-| Extra build time | — | About 3–5 days |
+| Pool circuit | `policy_tx_2_2_gvk_T`: 2 notes in, 2 out, hidden amounts, traceable Global View Key | — |
+| Bridge circuits | Its templates: transaction core, Merkle proof, Global View Key encryption, Poseidon2 | `bridge_out` and `bridge_in` |
+| Stellar contracts | `pool-gvk`, `pool-core`, the Circom Groth16 verifier, the public key registry | Bridge functions, an outbox tree, liquidity accounting |
+| Ethereum contracts | — | A Solidity port of `pool-gvk` plus the bridge functions, a matching Poseidon2 and Merkle tree, verifiers exported with snarkjs |
+| SDK, prover, indexer | Rust and web SDKs, prover worker, indexer, bootnode (Stellar event history) | Ethereum support and the bridge flows |
+| Admin view | Admin page with a Global View tab that decrypts and exports notes (Stellar) | The same view for Ethereum, and linking each bridge-out to its bridge-in |
+| App | Demo app: deposit, transfer, withdraw, Freighter, encrypted local storage | Bridge and claim screens, Ethereum wallet |
 
-### How Mode B works
+### How the bridge works on top of SPP
 
-**One join-split circuit, `transact`.** It spends up to two notes and creates up to two new ones, with a signed public amount. A deposit has a positive public amount, a withdrawal a negative one, and a private transfer zero. The circuit enforces:
+- **Bridge-out.** A new circuit, built from SPP's transaction template, spends up to two notes in the source pool with the same checks as SPP (ownership, nullifiers, Merkle proofs, amount range checks). Its outputs are a change note plus a bridge message `C = Poseidon2(tag, amount, asset, src_chain, dst_chain, recipient_pk, claim_secret, deadline)`, and it encrypts `C`'s contents to the Global View Key. The bridged amount stays hidden inside `C`.
+- **Outbox.** The source pool appends `C` to a separate outbox Merkle tree. The bridged value stays in the source pool and becomes liquidity there.
+- **Root posting.** The root poster copies the source outbox root to the destination chain.
+- **Bridge-in.** A second new circuit proves `C` is under that posted root, reveals a claim nullifier `H(tag, claim_secret)` that can't be linked to `C`, and creates a new note with the same hidden amount for the recipient, encrypted to the Global View Key. The destination pool backs it with its seeded liquidity.
+- **Deadline and refund.** If `C` isn't claimed before its deadline, the sender gets a refund note on the source chain, using an admin-signed attestation that it was never claimed.
+- **Solvency.** A pool can never pay out more tokens than it holds, so a shortfall stalls withdrawals rather than losing funds. On testnet, the admin reads the totals in the admin view and rebalances liquidity between chains by hand.
 
-- Value balance: `sum(inputs) + public_in = sum(outputs) + public_out + fee`.
-- Every amount is below 2^64. Without this, an attacker can use field wraparound (a "negative" note) to create money from nothing. This is the most important check in Mode B.
-- Each real input is in the tree, owned by the prover, with a correct nullifier. Zero-value dummy inputs skip the Merkle check so you can spend one note at a time.
-- Every output note and the public amount are encrypted to the admin key, as in Mode A.
-
-**Hidden-amount bridging.** `bridge_out` becomes a join-split whose outputs are a change note plus the bridge message `C`, so the bridged amount stays inside `C` and never appears on-chain. `bridge_in` creates a note of that same hidden amount on the destination chain. No tokens move publicly during a bridge, so no amount leaks.
-
-**Liquidity and solvency.** Because tokens don't move at bridge time, each pool must hold extra unowned tokens to back incoming notes. We seed both pools with liquidity through a public `add_liquidity` call. Bridged value builds up on the source chain and drains on the destination. On testnet, the admin reads totals from the dashboard and rebalances between chains by hand. The pool can never pay out more tokens than it holds, so a shortfall stalls withdrawals rather than losing funds.
-
-**Refunds** work as in Mode A: after the deadline, the sender gets back a note with the same hidden amount.
-
-**What still leaks in Mode B:** deposit and withdrawal amounts are public because tokens move in or out. Tell users to deposit round amounts, then split and merge inside the pool, and withdraw amounts that don't match any deposit. (Testnet option: since we issue tUSDC ourselves, the admin can mint it directly into the pool as shielded notes, so there is no public deposit amount at all; users who stay inside the pools keep every amount hidden.)
-
-### How Mode A fits in
-
-Mode A is a restricted version of the same design: one input note, fixed public amounts, and a vault that pays out exact denominations. The contracts keep a `mode` setting, so one deployment can run either. Mode A's circuits stay as a fallback if Mode B's circuits prove too slowly or hit backend limits.
+**What still leaks:** deposit and withdrawal amounts and addresses (tokens move in or out publicly), timing between a bridge-out and its bridge-in, the relayer seeing users' IP addresses, and the small number of users on a testnet pool. Users should deposit round amounts, split and merge inside the pool, and wait before withdrawing.
 
 ## Phase 0: Environment and toolchain
 
-Goal: prove a trivial Noir proof verifies on both chains before writing any real logic. This phase catches most toolchain problems early.
+Goal: run SPP unchanged on Stellar testnet, and verify one of its real proofs on Ethereum, before changing anything. This phase catches most toolchain problems early.
 
-1. Create a monorepo:
-   - `circuits/` (Noir), `contracts/stellar/` (Rust/Soroban), `contracts/evm/` (Foundry), `services/` (TypeScript), `app/` (React), `scripts/`.
-2. Install and pin versions in a `VERSIONS.md`:
-   - Rust with the Soroban wasm target, `stellar` CLI, `soroban-sdk`.
-   - `nargo` (via `noirup`) at the exact version the Noir-Groth16 backend supports, the backend itself, and `snarkjs`. Check the backend's README first; this is the most likely source of breakage.
-   - Foundry (`forge`, `anvil`), Node 20+, `@noir-lang/noir_js`, `snarkjs`, `@stellar/stellar-sdk`, `viem`.
+1. Bring SPP into the repo:
+   - Fork it, or add it as a git subtree (for example under `spp/`), keeping its LICENSE and NOTICE files. Record the exact SPP commit in `VERSIONS.md` and don't update it mid-project.
+2. Install and pin versions in `VERSIONS.md`:
+   - Rust (SPP's `rust-toolchain.toml` sets the version), the `stellar` CLI, Node 20+.
+   - Circom and snarkjs (SPP's `Makefile` and its circuit compiler tool build the circuits and keys).
+   - Foundry (`forge`, `anvil`) for Ethereum.
+   - SPP's tooling expects Linux or macOS; on Windows use WSL.
 3. Create testnet accounts:
    - Stellar: `stellar keys generate` for deployer, root poster, relayer; fund each with Friendbot.
-   - Sepolia: three EOAs funded from a faucet.
-4. Smoke test (hard gate before Phase 1):
-   - Hello-world Noir circuit → Groth16 artifacts with the Noir-Groth16 backend (a single-party trusted setup is fine on testnet) → proof with `snarkjs`.
-   - Verify it in the backend's Soroban Groth16 verifier, built on the BN254 host functions (unit test, then a real testnet invoke).
-   - Export a Solidity Groth16 verifier from the same artifacts with `snarkjs`, verify the same proof on `anvil`, then on Sepolia.
-   - Simulate the Soroban verify call and record CPU instructions, memory and fee against the network limits.
+   - Sepolia: three accounts funded from a faucet.
+4. Smoke test on Stellar (hard gate before Phase 1):
+   - Build SPP and deploy one open-policy pool in traceable Global View Key mode to testnet, following its `DEPLOY.md`.
+   - Run its demo app: deposit, transfer and withdraw tUSDC.
+   - Open its admin page, Global View tab, and decrypt the notes with the admin key.
+5. Smoke test on Ethereum:
+   - Export a Solidity Groth16 verifier with snarkjs from the same verification key, and verify a real SPP proof on `anvil`, then on Sepolia.
+   - Write down exactly how SPP encodes its public inputs (including its external-data hash), since the Solidity pool must match it.
+6. Poseidon2 check: find or write a Solidity Poseidon2 that gives exactly the same outputs as SPP's on a few test values. This is the riskiest part of the Ethereum port, so do it now.
 
-- [ ] Monorepo and pinned versions
+- [ ] SPP in the repo, versions pinned
 - [ ] Funded testnet accounts on both chains
-- [ ] Hello-world proof verified on Stellar testnet
-- [ ] Hello-world proof verified on Sepolia
-- [ ] Soroban resource numbers recorded, and a check that a secret circuit input can't be recovered from the proof or public inputs
+- [ ] SPP pool (traceable Global View Key) working on Stellar testnet, admin decryption checked
+- [ ] A real SPP proof verified on Sepolia
+- [ ] Solidity Poseidon2 matching SPP's test values
 
-## Phase 1: Shared crypto primitives
+## Phase 1: Spec for the new parts
 
-Goal: one spec for hashes, notes and encryption that Noir, Soroban, Solidity and TypeScript all implement identically. Write it as `SPEC.md` before coding circuits.
+Goal: a `SPEC.md` that documents SPP's existing formats and defines only the new bridge formats, so the circuits, the Soroban contracts and the Solidity contracts all agree.
 
-**Poseidon2 everywhere.** Noir's Poseidon2, a Solidity Poseidon2 library, and Stellar's Poseidon2 must produce identical outputs. Stellar's host functions are permutations, not complete hash functions, so on Stellar use the rs-soroban-poseidon library, which builds the hash on top of them. Create shared test vectors (hash of `[1, 2]`, a note commitment, the root of a 4-leaf tree) and check them in all four languages. Every hash takes a domain tag as its first input so values from different purposes can never collide.
+**Reuse SPP's formats as they are.** Keys, note commitments, nullifiers, the Global View Key ciphertext layout and the domain tags `0x01`–`0x06` all come from SPP. `SPEC.md` links to the exact files and lists the field order, so nobody has to dig through SPP's code.
 
-**Keys.** Each user has a spending key `sk`, a public owner key `owner_pk = H(TAG_OWNER, sk)`, and a Grumpkin viewing key pair for receiving encrypted notes. The app can derive `sk` deterministically from a wallet signature so users don't manage extra secrets.
+**New formats (new domain tags from `0x07`):**
 
-**Note.** `commitment = H(TAG_NOTE, amount, asset_id, owner_pk, blinding)`. Its nullifier is `H(TAG_NULL, sk, commitment)`, which only the owner can compute.
+- **Bridge message:** `C = Poseidon2(TAG_BRIDGE, amount, asset_id, src_chain, dst_chain, recipient_pk, claim_secret, deadline_bucket)`.
+- **Claim nullifier:** `Poseidon2(TAG_CLAIM, claim_secret)`, never a hash of `C`, so a claim can't be linked to its `C` on the other chain.
+- **Refund note:** the commitment the sender gets back if `C` expires, fixed at bridge-out time and stored with `C`.
+- **Deadline bucket:** the deadline rounded (for example, to the hour) so it reveals little.
+- **Encodings:** how chain IDs, Stellar addresses and Ethereum addresses become field elements, identically on both chains.
+- **Ethereum external-data hash:** how the Solidity pool hashes recipient, relayer, fee and ciphertexts into the proof's public input, mirroring what SPP does on Stellar.
+- **Attester key:** the key that signs refund attestations (for example, one secp256k1 key, checkable on both chains).
 
-**Bridge message.** `C = H(TAG_BRIDGE, amount, asset_id, src_chain, dst_chain, recipient_owner_pk, claim_secret, deadline)`. The claim nullifier is `H(TAG_CLAIM, claim_secret)`, not a hash of `C`, so nobody can link a claim on one chain to its `C` on the other.
+**Shared test vectors** for Poseidon2, a note commitment, a bridge message and an outbox root, checked in Circom tests, Rust and Solidity.
 
-**Admin encryption (enforced in every circuit).**
+- [ ] `SPEC.md` with SPP's formats and the new bridge formats
+- [ ] Test vectors passing in Circom, Rust and Solidity
 
-1. Pick a random scalar `r`; publish `R = r·G` on the Grumpkin curve (Noir's native embedded curve).
-2. Shared secret `S = r·ADMIN_PK`.
-3. Key stream `k_i = H(TAG_ENC, S.x, S.y, i)`; ciphertext `c_i = m_i + k_i` (field addition) for each note field.
-4. The circuit proves `R` and every `c_i` were computed this way from the same fields used in the commitment.
-5. The admin decrypts with `S = admin_sk·R`, then recomputes the commitment to confirm the plaintext is genuine.
+## Phase 2: Circuits (Circom)
 
-The same scheme, without in-circuit enforcement, encrypts note data to the recipient's viewing key so they can find their notes.
-
-- [ ] `SPEC.md` with every tag, field order and encoding
-- [ ] Poseidon2 test vectors passing in Noir, Rust, Solidity and TypeScript
-- [ ] Encryption round-trip test in TypeScript and Noir
-
-## Phase 2: Noir circuits
-
-Goal: four Mode A circuits, then three Mode B circuits, each with positive and negative tests. All share a `lib` package implementing `SPEC.md` (hashing, Merkle path check, admin encryption). The same circuits are used on both chains; only the chain IDs passed in differ.
+Goal: two new circuits built from SPP's templates. SPP's pool circuit (`policy_tx_2_2_gvk_T`) is reused unchanged on both chains.
 
 | Circuit | Proves | Public inputs | Private inputs |
 | --- | --- | --- | --- |
-| `deposit` | Commitment is well formed; admin ciphertext encrypts its fields | commitment, amount, asset_id, `R`, ciphertext | owner_pk, blinding |
-| `withdraw` | Note is in the tree, caller owns it, nullifier is correct | pool root, nullifier, amount, asset_id, recipient, relayer, fee, `R`, ciphertext | sk, blinding, leaf index, Merkle path |
-| `bridge_out` | Note is in the tree and owned; `C` carries the same amount and asset to the right destination | pool root, nullifier, `C`, deadline bucket, dst_chain, relayer, `R`, ciphertext | sk, note fields, Merkle path, recipient_owner_pk, claim_secret |
-| `bridge_in` | `C` is in the source chain's outbox tree; claim nullifier is correct; new note has the same amount and owner | remote outbox root, claim nullifier, new commitment, deadline bucket, src_chain, `R`, ciphertext | all fields of `C`, outbox Merkle path, new blinding |
+| `bridge_out` | Up to 2 input notes are in the source pool's tree, owned by the prover, with correct, distinct nullifiers; value balances: inputs = change note + bridged amount; every amount passes SPP's range check; `C` and the refund note are well formed; every note and `C`'s contents are encrypted to the Global View Key | pool root, 2 nullifiers, change commitment, `C`, refund commitment, deadline bucket, dst_chain, Global View Key `D`, nonce, ciphertexts, external-data hash | spending key, input notes and Merkle paths, change note, all fields of `C` |
+| `bridge_in` | `C` is under the source chain's outbox root; the claim nullifier comes from `C`'s claim secret; the new note has `C`'s amount, asset and recipient; the new note is encrypted to the Global View Key | remote outbox root, claim nullifier, new commitment, deadline bucket, src_chain, `D`, nonce, ciphertext, external-data hash | all fields of `C`, outbox Merkle path, new blinding |
 
-Notes on the Mode A design:
+Notes on the design:
 
-- `recipient`, `relayer` and `fee` are bound into the `withdraw` proof, so a relayer cannot redirect funds. On testnet the fee is 0.
-- The deadline is public but rounded to a bucket (for example, the hour) so it reveals little.
-- `bridge_in` is proved by the recipient. The sender gives them `C`'s fields by encrypting them to the recipient's viewing key in the `bridge_out` event.
-- A private `transfer` circuit (two notes in, two out) is a stretch goal; with fixed denominations, the demo works without it.
+- Reuse SPP's templates (transaction core, Merkle proof, Global View Key encryption, Poseidon2) rather than rewriting them, so the bridge inherits SPP's security fixes, such as the low-order key guard in the encryption.
+- `bridge_in` is proved by the recipient. The sender gives them `C`'s fields by encrypting them to the recipient's key in the bridge-out event, the same way SPP delivers notes.
+- The contracts must check that `D` equals the pool's stored admin key and that every nonce is unique. SPP's docs warn that the circuit alone can't guarantee either.
 
-**Mode B circuits** (replace `deposit`, `withdraw` and the spend part of `bridge_out`):
+Tests, in SPP's circuit test setup: a valid case, plus a wrong Merkle path, a wrong spending key, unbalanced amounts, an amount over SPP's range limit, two identical input nullifiers, a tampered ciphertext and a wrong chain ID, all of which must fail. Generate the Groth16 keys for each new circuit with SPP's tooling; a single-party setup is fine on testnet.
 
-| Circuit | Proves | Public inputs | Private inputs |
-| --- | --- | --- | --- |
-| `transact` | Up to 2 notes in, 2 out; value balances with the signed public amount; every amount below 2^64 | pool root, 2 nullifiers, 2 output commitments, public amount, recipient, relayer, fee, `R`, ciphertexts | sk, input notes and Merkle paths, output note fields |
-| `bridge_out_b` | Same as `transact`, but one output is the bridge message `C` with a hidden amount | pool root, 2 nullifiers, change commitment, `C`, deadline bucket, dst_chain, `R`, ciphertexts | sk, input notes and paths, change note, all fields of `C` |
-| `bridge_in_b` | Same as Mode A's `bridge_in`, with the amount kept private | remote outbox root, claim nullifier, new commitment, deadline bucket, src_chain, `R`, ciphertext | all fields of `C`, outbox path, new blinding |
-
-The two nullifiers in one transaction must differ, or a user could spend the same note twice in one proof. Test this explicitly.
-
-Tests per circuit with `nargo test`: a valid case, plus a wrong Merkle path, a wrong secret key, mismatched amounts, a tampered ciphertext and a wrong chain ID, all of which must fail. For Mode B, also an amount of 2^64 or more, a field-wraparound "negative" amount, unbalanced inputs and outputs, and two identical input nullifiers. Record each circuit's constraint count (reported by the Noir-Groth16 backend; proving time grows with it), and run a per-circuit Groth16 setup, committing the proving and verification keys. Do not use `bb gates` here: those are UltraHonk tools.
-
-- [ ] Shared `lib` package
-- [ ] `deposit`, `withdraw`, `bridge_out`, `bridge_in` with tests
-- [ ] Verification keys generated and committed
-- [ ] Constraint counts recorded
+- [ ] `bridge_out` and `bridge_in` with tests
+- [ ] Groth16 proving and verification keys generated and committed
+- [ ] Admin decryption of bridge notes and `C` checked with SPP's audit code
 
 ## Phase 3: Stellar (Soroban) contracts
 
-Goal: a pool contract, a liquidity vault and four verifier contracts on Stellar testnet, all tested with `soroban-sdk` test utilities before deployment.
+Goal: extend SPP's `pool-gvk` contract with the bridge, tested with `soroban-sdk` test utilities before deployment. SPP's `transact` (deposit, transfer, withdraw) stays as it is.
 
-**Verifier contracts.** One per circuit, each holding that circuit's verification key. Use the Groth16 verifier contract from the Noir-Groth16 backend (built on Stellar's BN254 pairing host functions), with Stellar Private Payments' Groth16 verifier as a reference. Do not use the UltraHonk verifiers: they accept only non-zero-knowledge proofs.
+**Verifier contracts.** SPP's Circom Groth16 verifier contract, one per circuit, with the verification key built in: SPP's pool circuit plus our `bridge_out` and `bridge_in`.
 
-**Pool contract state:**
+**New pool state:**
 
-- Incremental Merkle tree: the frontier and a ring buffer of the last 30 roots, hashed with rs-soroban-poseidon (Poseidon2 built on the host permutation).
-- Nullifier set and claim-nullifier set in persistent storage.
-- Outbox tree of `C` values, plus a record of each pending `C` with its amount and deadline bucket.
+- An outbox Merkle tree of `C` values, reusing SPP's Merkle tree with root history.
+- A record of each pending `C` with its deadline bucket and refund commitment.
+- A claim-nullifier set.
 - Known remote (Ethereum) outbox roots, written only by the root poster.
-- Admin public key, root poster address, token address (the tUSDC asset contract), allowed denominations.
+- Root poster and attester addresses.
 
-**Pool contract functions:**
+**New pool functions:**
 
-1. `deposit(from, amount, commitment, R, ciphertext, recipient_ct, proof)`: requires `from`'s authorization, pulls tokens, verifies, inserts the leaf, emits an event.
-2. `withdraw(proof, root, nullifier, recipient, relayer, fee, amount, R, ciphertext)`: checks the root is recent and the nullifier unused, verifies, marks the nullifier, pays out.
-3. `bridge_out(proof, root, nullifier, C, deadline_bucket, R, ciphertext, recipient_ct)`: verifies, marks the nullifier, moves the amount into bridge escrow, appends `C` to the outbox tree.
-4. `bridge_in(proof, remote_root, claim_nullifier, new_commitment, deadline_bucket, R, ciphertext)`: checks the remote root is known and the deadline not passed, verifies, takes the amount from the vault, inserts the new note.
-5. `post_remote_root(root)`: root poster only.
-6. `finalize(C)` and `refund(C, attestation)`: after the deadline, the admin attests whether `C` was claimed on Ethereum; escrow then goes to the vault, or back to the sender as a new note.
+1. `bridge_out(proof, …)`: checks the root and nullifiers like `transact`, checks the Global View Key and nonce, verifies, marks the nullifiers, inserts the change note, appends `C` to the outbox tree, emits an event with the ciphertexts.
+2. `bridge_in(proof, …)`: checks the remote root is known, the deadline hasn't passed and the claim nullifier is unused, checks the Global View Key and nonce, verifies, inserts the new note.
+3. `post_remote_root(root)`: root poster only.
+4. `finalize(C)` and `refund(C, attestation)`: after the deadline, with the attester's signature saying whether `C` was claimed; a refund inserts the stored refund commitment.
+5. `add_liquidity(amount)`: admin only on testnet; adds unowned balance that backs incoming bridge notes.
 
-**Liquidity vault:** public `add_liquidity` and `remove_liquidity` for us as the seeding party; only the pool can draw from it.
+**Stellar-specific gotchas** (SPP already handles some):
 
-**Stellar-specific gotchas:**
-
-- Persistent storage entries expire unless their TTL is extended. Extend the TTL of nullifiers and roots on every write, and test what happens when an entry is archived.
+- Persistent storage expires unless its time-to-live is extended; SPP has a helper for this, so use it for every new entry.
+- RPC nodes keep events for only about 7 days; SPP's bootnode keeps the history.
 - Watch per-transaction CPU, memory and size limits; simulate every call.
-- Recipients of a public withdrawal need an existing account with a tUSDC trustline. For the demo, pre-create recipient accounts or have the relayer sponsor them.
+- Recipients of a public withdrawal need an account with a tUSDC trustline.
 
-**Mode B changes (Stellar):**
-
-- Add a `transact(proof, root, nullifiers[2], commitments[2], public_amount, recipient, relayer, fee, R, ciphertexts)` function. A positive public amount pulls tokens in; a negative one pays out.
-- Replace `bridge_out` and `bridge_in` with the Mode B versions; the contract never sees bridged amounts.
-- Drop the vault: liquidity sits in the pool, added through a public `add_liquidity` (admin only on testnet). Withdrawals fail cleanly if the pool's token balance is too low.
-- Insert two leaves per transaction, and check both nullifiers are unused and different.
-
-- [ ] Verifiers deployed and passing tests
-- [ ] Pool contract with unit tests for every function and failure case
-- [ ] Vault contract
+- [ ] Verifiers for the bridge circuits deployed and tested
+- [ ] Bridge functions with unit tests for every function and failure case
 - [ ] Deployed to testnet with addresses recorded
 
 ## Phase 4: Ethereum (Solidity) contracts
 
-Goal: the same pool, vault and verifiers on Sepolia, mirroring the Stellar contracts function for function, so both sides behave identically.
+Goal: a Solidity port of SPP's `pool-gvk` plus the same bridge functions as on Stellar, so both pools behave identically. This is the biggest piece of new work.
 
-1. Export one Solidity Groth16 verifier per circuit with snarkjs, from the same keys used on Stellar. Do not use `bb` for this: its verifier is for UltraHonk proofs, and one proof format on both chains keeps things simple.
-2. Write `MockUSDC` (an ERC-20 called tUSDC, 6 decimals to match).
-3. Write `ShieldedPool.sol` with the same state and functions as the Soroban pool: `deposit`, `withdraw`, `bridgeOut`, `bridgeIn`, `postRemoteRoot`, `finalize`, `refund`. Use a Solidity Poseidon2 library that passes the Phase 1 test vectors for the incremental tree.
-4. Write `LiquidityVault.sol`.
-5. Test with Foundry: every function and failure case, plus a gas report. On-chain Poseidon2 hashing is the main gas cost; Groth16 verification itself is cheap. Neither matters on Sepolia.
-6. Deploy with a Foundry script and record addresses in a shared `deployments.json` that the services and app read.
+1. Export Solidity Groth16 verifiers with snarkjs for SPP's pool circuit and for `bridge_out` and `bridge_in`, from the same keys used on Stellar. These verifiers already reject public inputs that are too large.
+2. Write `MockUSDC` (an ERC-20 called tUSDC, with the same decimals as the Stellar asset).
+3. Write `ShieldedPool.sol`, porting SPP's pool logic function for function: Merkle tree with root history, nullifier set, external-data hash, public amount handling, Global View Key and nonce checks, and events carrying the ciphertexts. Then add `bridgeOut`, `bridgeIn`, `postRemoteRoot`, `finalize`, `refund` and `addLiquidity`.
+4. Use the Solidity Poseidon2 validated in Phase 0 for the Merkle trees.
+5. Test with Foundry: every function and failure case, plus a gas report. On-chain Poseidon2 hashing is the main gas cost; it doesn't matter on Sepolia.
+6. Deploy with a Foundry script and record addresses in a shared `deployments.json`.
 
-A mismatch between the two pools is the most likely source of cross-chain bugs. Keep one shared list of field orders and encodings (addresses, chain IDs, deadline buckets) in `SPEC.md`, and convert Stellar addresses and Ethereum addresses to field elements the same way on both sides.
-
-For Mode B, make the same changes as on Stellar: add `transact`, swap in the Mode B bridge functions and verifiers, and hold liquidity inside the pool instead of a vault.
+A mismatch between the two pools is the most likely source of cross-chain bugs. Read SPP's `pool-core` code side by side while porting, and keep every field order and encoding in `SPEC.md`.
 
 - [ ] Verifiers generated and tested on `anvil`
-- [ ] Pool and vault contracts with full Foundry tests
+- [ ] `ShieldedPool.sol` with full Foundry tests, including SPP's own test cases ported
 - [ ] Deployed to Sepolia; `deployments.json` updated
 
 ## Phase 5: Off-chain services
 
-Goal: four small TypeScript services that keep the system moving. None of them can steal funds; at worst they stall it.
+Goal: reuse SPP's indexing for Stellar and add the small services the bridge needs. None of them can steal funds; at worst they stall the system.
 
-**Indexer.** Watches events on both chains (Soroban RPC `getEvents`, `viem` event watchers), stores commitments, ciphertexts, `C` values and roots in SQLite, and rebuilds each Merkle tree locally so clients can fetch Merkle paths. Run it continuously: Soroban RPC only keeps recent events, so a stopped indexer can miss history.
+**Indexer.** On Stellar, SPP's SDK indexer and bootnode already sync pool events and keep history beyond the RPC's 7-day window. Add an Ethereum indexer (`viem` event watchers) with the same data model, plus both chains' outbox trees, so clients can fetch Merkle paths for bridge messages.
 
 **Root poster.** Every few minutes, reads each chain's latest outbox root and calls `post_remote_root` / `postRemoteRoot` on the other chain. Wait for Sepolia finality before posting an Ethereum root. It holds its own key, separate from the deployer key.
 
-**Relayer.** An HTTP endpoint that accepts a proof and its public inputs, simulates the call, and submits it from its own funded account on Stellar or Sepolia. This is what lets withdrawals go to fresh addresses with no funds.
+**Relayer.** An HTTP endpoint that accepts a proof and its public inputs, simulates the call, and submits it from its own funded account on Stellar or Sepolia. This lets withdrawals and claims go to fresh addresses with no funds.
 
 **Refund attester.** After each deadline bucket, checks whether each pending `C` was claimed on the other chain and signs the attestation that `finalize` or `refund` needs.
 
-**Admin dashboard.** A local web page that loads the admin secret key (never uploaded), pulls every ciphertext from the indexer, decrypts it, recomputes each commitment to confirm the plaintext, and shows the full path of each fund flow: deposit → bridge-out → bridge-in → withdraw, with amounts and owners. Flag any ciphertext that fails to decrypt or doesn't match its commitment; that would mean a circuit bug.
+**Admin view.** SPP's admin page already decrypts every Stellar note in its Global View tab, with CSV export. Extend it, or build a small dashboard on SPP's audit code, to also decrypt Ethereum notes and bridge messages, and to link each bridge-out to its bridge-in, showing the full path: deposit → bridge-out → bridge-in → withdraw.
 
-- [ ] Indexer with Merkle path API
+- [ ] Ethereum indexer and outbox trees, with a Merkle path API
 - [ ] Root poster running against both testnets
 - [ ] Relayer for both chains
 - [ ] Refund attester
-- [ ] Admin dashboard
+- [ ] Admin view covering both chains and bridge links
 
 ## Phase 6: Frontend and wallets
 
-Goal: a React app where a user can deposit, bridge, claim and withdraw, with all proofs generated in their browser so secrets never leave the device.
+Goal: a web app where a user can deposit, transfer, bridge, claim and withdraw, with all proofs generated in their browser so secrets never leave the device.
 
-1. Set up React + Vite. Connect Stellar wallets with Stellar Wallets Kit (Freighter) and Ethereum wallets with wagmi/RainbowKit (MetaMask).
-2. Shielded account: derive `sk` from a wallet signature over a fixed message, plus a Grumpkin viewing key pair. Store notes in IndexedDB and rescan the indexer on load.
-3. Proving: compute the witness with `noir_js`, then generate the Groth16 proof with `snarkjs`, both in a Web Worker. Show a progress indicator; expect seconds to tens of seconds per proof.
-4. Screens:
-   - **Deposit:** pick a chain and denomination, approve the token, deposit.
-   - **Balance:** shielded notes per chain.
-   - **Bridge:** pick a note and a destination; status tracker showing burned → root posted → claimed (or refunded).
-   - **Claim:** detects incoming bridge messages via the viewing key and builds the `bridge_in` proof.
-   - **Withdraw:** enter a fresh address; submitted through the relayer.
-5. Show a short "privacy tips" panel: wait before withdrawing, and use a fresh address.
+1. Start from SPP's web SDK (the `stellar-private-payments` npm package): it already handles Freighter, key derivation from a wallet signature, encrypted local storage, background sync and in-browser proving in a worker. Either extend SPP's demo app or use the SDK inside our own React app in `apps/frontend`.
+2. Add Ethereum: MetaMask via wagmi/RainbowKit, and the Ethereum pool through the same note format and prover.
+3. Screens:
+   - **Deposit, transfer, withdraw:** SPP's existing flows, on either chain.
+   - **Bridge:** pick an amount and a destination; status tracker showing burned → root posted → claimed (or refunded).
+   - **Claim:** detects incoming bridge messages with the user's key and builds the `bridge_in` proof.
+   - **Balance:** shielded balance per chain.
+4. Show a short "privacy tips" panel: deposit round amounts, wait before withdrawing, and use a fresh address.
 
-**Mode B frontend changes:** a free amount field instead of denomination buttons; automatic note selection (pick up to two notes, return change); a "merge notes" action for wallets with many small notes; and a warning when a withdrawal amount exactly matches one of the user's own deposits.
-
-- [ ] Wallet connections on both chains
-- [ ] Shielded key derivation and local note store
-- [ ] In-browser proving in a Web Worker
-- [ ] All five screens working against testnet
+- [ ] SPP's SDK running in our app on Stellar testnet
+- [ ] Ethereum wallet and pool support
+- [ ] Bridge, claim and balance screens working against testnet
 
 ## Phase 7: Testing and testnet deployment
 
@@ -274,29 +232,27 @@ Goal: every layer tested in isolation, then the full flow run end to end on both
 
 **Test layers, bottom up:**
 
-1. Circuit tests (`nargo test`).
-2. Cross-language test vectors (Poseidon2, commitments, encryption).
-3. Contract unit tests (Soroban test utilities, Foundry).
+1. Circuit tests for `bridge_out` and `bridge_in`, in SPP's circuit test setup.
+2. Cross-language test vectors (Poseidon2, commitments, bridge messages).
+3. Contract unit tests: SPP's existing tests still passing, plus our bridge tests (Soroban test utilities, Foundry).
 4. Local end-to-end: Soroban tests and `anvil`, with the root poster mocked.
 5. Testnet end-to-end script: deposit → bridge-out → root posted → bridge-in → withdraw, in both directions.
 
-**Must-fail cases:** spending a note twice, claiming a bridge message twice, a tampered admin ciphertext, an unknown or stale root, claiming after the deadline, refunding a message that was already claimed, a relayer changing the recipient.
-
-**Mode B must-fail cases:** an amount of 2^64 or more, a wraparound "negative" output, outputs worth more than inputs, two identical nullifiers in one transaction, and a withdrawal larger than the pool's token balance. Also run a test that bridges many random amounts back and forth and checks that the admin's decrypted totals match each pool's token balance.
+**Must-fail cases:** spending a note twice, claiming a bridge message twice, an amount over the range limit, outputs worth more than inputs, a ciphertext under a different admin key, a reused nonce, an unknown or stale root, claiming after the deadline, refunding a message that was already claimed, a relayer changing the recipient, and a withdrawal larger than the pool's token balance. Also run a test that bridges many random amounts back and forth and checks that the admin's decrypted totals match each pool's token balance.
 
 **Deployment order:**
 
 1. tUSDC on both chains.
-2. Verifiers.
-3. Vaults and pools; set the admin public key, root poster, relayer and remote chain IDs.
-4. Seed both vaults with liquidity.
-5. Start the indexer, root poster, relayer and refund attester.
-6. Deploy the frontend.
-7. Run a script that makes ~50 dummy deposits so the demo has a visible crowd to hide in.
+2. Verifiers (SPP's pool circuit, `bridge_out`, `bridge_in`) on both chains.
+3. Pools in traceable Global View Key mode, with the admin's public key, root poster, attester, relayer and remote chain IDs.
+4. Seed both pools with liquidity.
+5. Start SPP's bootnode, the Ethereum indexer, the root poster, the relayer and the refund attester.
+6. Deploy the web app.
+7. Run a script that makes ~50 dummy transactions so the demo has a visible crowd to hide in.
 
 - [ ] All test layers passing in CI
 - [ ] End-to-end script passing in both directions on testnet
-- [ ] Dummy deposits seeded
+- [ ] Dummy transactions seeded
 
 ## Phase 8: Demo and presentation
 
@@ -305,7 +261,7 @@ Goal: show in about five minutes that outsiders can't follow the money while the
 **Demo script:**
 
 1. Open the Stellar testnet explorer and Sepolia Etherscan side by side.
-2. Deposit 100 tUSDC on Stellar. On the explorer, only a commitment and a ciphertext appear.
+2. Deposit 100 tUSDC on Stellar. On the explorer, the deposit amount is visible, but the new note appears only as a commitment and a ciphertext.
 3. Bridge it to Ethereum. The explorer shows a nullifier and a `C`, with no amount or recipient.
 4. Claim on Ethereum. Show there's nothing linking this claim to the Stellar transaction.
 5. Withdraw to a fresh Ethereum address through the relayer.
@@ -315,47 +271,47 @@ Goal: show in about five minutes that outsiders can't follow the money while the
 
 - Architecture diagram and what each proof checks.
 - What's hidden from the public vs what the admin sees.
-- Known leaks and how mainnet would handle them: public entry and exit, timing, amounts (handled by denominations), the relayer seeing IPs, the small anonymity set, the trusted root poster, the single admin key.
-- What we took from ProofBridge and what we added.
+- Known leaks and how mainnet would handle them: public entry and exit, timing, deposit and withdrawal amounts, the relayer seeing IPs, the small anonymity set, the trusted root poster, the single admin key.
+- What we took from SPP and ProofBridge, and what we added (the Ethereum pool and the private bridge).
 
 ## Risks, open questions and timeline
 
-The biggest risk is the Noir-Groth16 backend, a young one-person project; Phase 0 tests it end to end on both chains on day one.
+The biggest risk is porting SPP's pool to Solidity exactly, especially Poseidon2 and the public-input encoding; Phase 0 checks both on day one.
 
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
-| Noir-Groth16 backend can't compile a circuit or has a bug | That circuit can't be proved | Keep circuits simple; test the backend in Phase 0; port that circuit to Circom, using Stellar Private Payments' circuits as a model |
-| Noir / Groth16 backend / snarkjs version mismatch | Proofs fail to verify | Pin versions in Phase 0 and never upgrade mid-project |
-| Poseidon2 mismatch across languages | Roots and commitments disagree between chains | Shared test vectors in CI |
-| Admin encryption bug | Admin can't decrypt some transactions | Dashboard recomputes every commitment and flags mismatches |
-| Soroban storage expiry | Nullifiers or roots become unavailable | Extend TTLs on write; test archival |
-| Indexer misses events | Users can't build Merkle paths | Run continuously; add a backfill script |
+| Solidity Poseidon2 doesn't match SPP's | Ethereum roots disagree; proofs fail | Find or port a matching implementation in Phase 0; shared test vectors in CI |
+| Solidity pool behaves differently from SPP's | Cross-chain bugs, lost or stuck notes | Port function for function, port SPP's tests, keep encodings in `SPEC.md` |
+| SPP changes upstream mid-project | Our fork breaks | Pin one SPP commit; never update mid-project |
+| SPP is unaudited work in progress | Hidden bugs | Testnet only; say so in the pitch |
+| A bridge function doesn't check the admin key or nonce | Notes the admin can't decrypt | Check both in every contract function; test with a wrong key and a reused nonce |
+| Circom and Rust learning curve | Slower start | Start from SPP's own tests and templates |
+| Soroban storage expiry | Nullifiers or roots become unavailable | Use SPP's time-to-live helper on every new entry; test archival |
 | Root poster down | Bridges stall (funds stay safe) | Restart alerts; refunds after the deadline |
-
-Mode B adds one serious risk: a missing or wrong range check lets someone create money from nothing. Mitigate it with the must-fail tests above, a second person reviewing every amount constraint, and the dashboard's check that decrypted totals match on-chain balances. Mode B's larger circuits also mean slower proving in the browser and more strain on the young backend; Mode A stays as the fallback.
+| License obligations | Publishing the app without the required notices | Keep SPP's LICENSE and NOTICE files and ship them with the app |
 
 **Open questions for the team:**
 
-- Does the assignment require Solana, or is Ethereum acceptable?
+- Is Ethereum acceptable as the second chain, or is Solana required?
 - Who holds the admin key, and is a threshold key expected?
-- Is Mode A enough for the assignment, or is Mode B (hidden amounts) required for the demo?
+- Do we want an ASP allowlist or blocklist (SPP supports both), or the open policy?
 
-**Estimated timeline:**
+**Estimated timeline** (with Claude Code writing most of the code and the three of you working in parallel):
 
-1. Phase 0, toolchain and smoke tests: 1–2 days.
-2. Phases 1–2, spec and circuits: 2–3 days.
-3. Phases 3–4, contracts on both chains: 2–3 days.
-4. Phases 5–6, services and frontend: 2–3 days.
-5. Phases 7–8, testnet end-to-end and demo: 2–3 days.
+1. Phase 0, SPP running on Stellar testnet and a proof verified on Sepolia: 1–2 days.
+2. Phases 1–2, spec and bridge circuits: 2–3 days.
+3. Phases 3–4, Stellar bridge functions and the Solidity port: 3–4 days, in parallel with Phases 1–2.
+4. Phases 5–6, services and frontend: 2–3 days, partly in parallel.
+5. Phases 7–8, testnet end-to-end and demo: 1–2 days.
 
-Total: about 1.5–2.5 weeks of calendar time for Mode A, plus about 3–5 days to add Mode B (circuits, contract changes, frontend and extra tests). These are estimates; Phase 0's results with the Groth16 backend will make them firmer.
+Total: about 1–1.5 weeks of calendar time. These are estimates; Phase 0 will show how smoothly SPP builds and ports.
 
 ## Team split
 
 | Person | Role | Owns |
 | --- | --- | --- |
-| Person 1 | ZK & cryptography | `SPEC.md`, the four Mode A circuits (then Mode B), Groth16 keys, a TypeScript crypto library (create notes, encrypt/decrypt, generate proofs), the "known leaks" slide |
-| Person 2 (Emin) | Smart contracts & bridge | Soroban and Solidity pools, vaults, verifiers, bridge messages, deadlines and refunds, root poster, relayer, indexer |
-| Person 3 | Frontend, admin & integration | React app, wallets, Deposit / Bridge / Claim / Withdraw screens, admin dashboard (using Person 1's library), presentation and demo |
+| Person 1 | ZK & cryptography | `SPEC.md`, the `bridge_out` and `bridge_in` Circom circuits, their Groth16 keys, the Solidity Poseidon2 check |
+| Person 2 (Emin) | Smart contracts & bridge | Bridge functions in SPP's Soroban pool, the Solidity port of the pool, verifiers, root poster, relayer, refund attester, Ethereum indexer |
+| Person 3 | Frontend, admin & integration | The web app on SPP's SDK, Ethereum wallet, bridge and claim screens, admin view for both chains, presentation and demo |
 
-Order of work: Phase 0 and `SPEC.md` (everyone, Persons 1 and 2 leading) → circuits and contracts in parallel (contracts start with a mock verifier, the app with a mock library) → integration days → Mode B if time allows → demo.
+Order of work: Phase 0 together → spec, circuits and contracts in parallel (contracts start with a mock verifier) → integration → demo.
