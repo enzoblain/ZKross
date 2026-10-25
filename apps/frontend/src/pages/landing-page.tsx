@@ -74,13 +74,13 @@ const principles = [
     icon: WalletMinimal,
     index: 'P-01',
     title: 'Public settlement',
-    description: 'Vault deposits, withdrawals, balances, and chain activity remain visible.',
+    description: 'Pool deposits, withdrawals, balances, and chain activity remain visible.',
   },
   {
     icon: Fingerprint,
     index: 'P-02',
     title: 'Private linkage',
-    description: 'A note proof is designed to break the direct protocol-level deposit-to-payout link.',
+    description: 'SPP-derived proofs break the direct public bridge-out to bridge-in link.',
   },
   {
     icon: KeyRound,
@@ -153,8 +153,8 @@ function LandingPage({ onNavigate }: LandingPageProps) {
               Public settlement. Private connection.
             </h1>
             <p className="mt-7 max-w-2xl text-balance text-base leading-7 text-muted sm:text-lg">
-              Move USDC between Ethereum and Stellar through independent destination reserves,
-              with a protocol designed to protect the transfer link and confidential context.
+              Move USDC between Ethereum and Stellar through two shielded pools,
+              with a protocol that protects note ownership and the cross-chain transfer link.
             </p>
             <p className="mt-3 max-w-xl text-xs leading-5 text-subtle">
               Browser proving and Stellar testnet contracts are connected. The Sepolia pool deployment is still required for an end-to-end transfer.
@@ -220,8 +220,8 @@ function LandingPage({ onNavigate }: LandingPageProps) {
             <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">Where it fits</p>
             <h2 className="mt-4 text-balance text-3xl font-medium tracking-[-0.045em] sm:text-5xl">Built for capital that needs context.</h2>
             <p className="mt-5 text-sm leading-6 text-muted sm:text-base">
-              The product separates public settlement rails from the sensitive relationship and
-              business information that give a transaction meaning.
+              The product separates public entry and exit transactions from the private note path
+              that carries value between the two pools.
             </p>
           </div>
 
