@@ -16,3 +16,4 @@ cache/
 # Local forge deploy output (Sepolia addresses are copied into deployments.json)
 /contracts/ethereum/deploy-out/
 /contracts/ethereum/broadcast/**/31337/
+/deploy-out/
