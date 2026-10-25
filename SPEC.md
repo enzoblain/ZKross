@@ -128,7 +128,7 @@ Both circuits are built from SPP's templates: transaction core (keypair, signatu
   - `claimNullifier = P2(claim_secret, 0; 0x08)`.
   - Both new notes are owned by `recipient_pk`, and `out0 + out1 = amount × scale`.
   - Two GVK ciphertexts, for out0 (idx 0) and out1 (idx 1).
-- **Public signals, in order:** 2 ciphertexts field-major (10), then `D[2], nonce, remoteRoot, extDataHash, claimNullifier, outputCommitment[2], scale, assetId, srcChain, dstChain, deadlineBucket` (14). Total: 24.
+- **Public signals, in order:** 2 ciphertexts field-major (10), then `D[2], nonce, remoteRoot, extDataHash, claimNullifier, outputCommitment[2], scale, assetId, srcChain, dstChain, deadlineBucket` (13). Total: 23.
 
 **How the admin links a bridge.** The admin decrypts `C`'s GVK ciphertext on the source chain, which gives `amount`, `recipient_pk` and `claim_secret`. From those it computes `claim_nullifier` and finds the matching claim on the destination chain.
 

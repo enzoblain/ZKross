@@ -11,8 +11,8 @@ import {StrictMockVerifier, RevertingVerifier} from "./mocks/StrictMockVerifier.
 
 /// Exposes the pool's pure amount helpers for SPP's `amounts.rs` tests.
 contract ShieldedPoolHarness is ShieldedPool {
-    constructor(address admin_, address token_, address verifier_)
-        ShieldedPool(admin_, token_, verifier_, 1000, 3, "tests", BabyJubJubPoint(1, 2), VIEW_ONLY)
+    constructor(address admin_, address token_, address verifier_, ShieldedPool.BridgeConfig memory cfg)
+        ShieldedPool(admin_, token_, verifier_, 1000, 3, "tests", BabyJubJubPoint(1, 2), VIEW_ONLY, cfg)
     {}
 
     function calculatePublicAmount(int256 a) external pure returns (uint256) {
@@ -34,19 +34,40 @@ contract ShieldedPoolHarness is ShieldedPool {
 /// `StrictMockVerifier` plays both roles: it refuses everything except an
 /// (proof, public inputs) pair a test registered, with the inputs built here
 /// independently of the pool.
-contract ShieldedPoolTest is Test {
+abstract contract PoolTestBase is Test {
     uint256 constant R = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint32 constant VIEW_ONLY = 1;
     uint32 constant TRACEABLE = 2;
     string constant KDF_DOMAIN = "tests";
 
+    /// SPEC.md B2: chain_id of Stellar testnet.
+    uint256 constant STELLAR_TESTNET = 33353711811639397682;
+    /// Throwaway attester key for tests (never funded).
+    uint256 constant ATTESTER_KEY = 0xA77E57;
+
     address admin = makeAddr("admin");
+    address rootPoster = makeAddr("rootPoster");
     MockUSDC token;
     StrictMockVerifier verifier;
+    StrictMockVerifier bridgeOutVerifier;
+    StrictMockVerifier bridgeInVerifier;
 
-    function setUp() public {
+    function setUp() public virtual {
         token = new MockUSDC();
         verifier = new StrictMockVerifier();
+        bridgeOutVerifier = new StrictMockVerifier();
+        bridgeInVerifier = new StrictMockVerifier();
+    }
+
+    function _bridgeConfig() internal view returns (ShieldedPool.BridgeConfig memory) {
+        return ShieldedPool.BridgeConfig({
+            rootPoster: rootPoster,
+            attester: vm.addr(ATTESTER_KEY),
+            remoteChainId: STELLAR_TESTNET,
+            assetId: 1,
+            bridgeOutVerifier: bridgeOutVerifier,
+            bridgeInVerifier: bridgeInVerifier
+        });
     }
 
     // ========== Helpers (mirroring SPP's) ==========
@@ -59,7 +80,9 @@ contract ShieldedPoolTest is Test {
         internal
         returns (ShieldedPool)
     {
-        return new ShieldedPool(admin, address(token), address(verifier), maxDeposit, levels, KDF_DOMAIN, d, mode);
+        return new ShieldedPool(
+            admin, address(token), address(verifier), maxDeposit, levels, KDF_DOMAIN, d, mode, _bridgeConfig()
+        );
     }
 
     /// SPP's `register_open_pool_gvk`: view-only, cap 1000, depth 3.
@@ -193,6 +216,9 @@ contract ShieldedPoolTest is Test {
         v[1] = b;
     }
 
+}
+
+contract ShieldedPoolTest is PoolTestBase {
     // ========== Constructor and getters ==========
 
     function test_constructorSetsState() public {
@@ -400,7 +426,7 @@ contract ShieldedPoolTest is Test {
     // ========== Amounts (pool-core amounts.rs) ==========
 
     function test_calculatePublicAmountAcceptsValuesInsideTheBound() public {
-        ShieldedPoolHarness h = new ShieldedPoolHarness(admin, address(token), address(verifier));
+        ShieldedPoolHarness h = new ShieldedPoolHarness(admin, address(token), address(verifier), _bridgeConfig());
         int256 largest = (int256(1) << 248) - 1;
         assertEq(h.calculatePublicAmount(largest), uint256(largest));
         assertEq(h.calculatePublicAmount(-largest), R - uint256(largest));
@@ -409,7 +435,7 @@ contract ShieldedPoolTest is Test {
     }
 
     function test_calculatePublicAmountRefusesTheBoundInEitherSign() public {
-        ShieldedPoolHarness h = new ShieldedPoolHarness(admin, address(token), address(verifier));
+        ShieldedPoolHarness h = new ShieldedPoolHarness(admin, address(token), address(verifier), _bridgeConfig());
         int256[4] memory bad = [int256(1) << 248, -(int256(1) << 248), type(int256).max, type(int256).min];
         for (uint256 i = 0; i < bad.length; i++) {
             vm.expectRevert(ShieldedPool.WrongExtAmount.selector);
@@ -418,7 +444,7 @@ contract ShieldedPoolTest is Test {
     }
 
     function test_toI128NonNegRefusesNegativeAndOversizedValues() public {
-        ShieldedPoolHarness h = new ShieldedPoolHarness(admin, address(token), address(verifier));
+        ShieldedPoolHarness h = new ShieldedPoolHarness(admin, address(token), address(verifier), _bridgeConfig());
         vm.expectRevert(ShieldedPool.WrongExtAmount.selector);
         h.toI128NonNeg(-1);
         vm.expectRevert(ShieldedPool.WrongExtAmount.selector);
@@ -753,7 +779,9 @@ contract ShieldedPoolTest is Test {
     /// `try_verify` mapping of verifier errors).
     function test_transactReportsAVerifierRevertAsInvalidProof() public {
         ShieldedPool pool =
-            new ShieldedPool(admin, address(token), address(new RevertingVerifier()), 1000, 3, KDF_DOMAIN, _pt(1, 2), VIEW_ONLY);
+            new ShieldedPool(
+            admin, address(token), address(new RevertingVerifier()), 1000, 3, KDF_DOMAIN, _pt(1, 2), VIEW_ONLY, _bridgeConfig()
+        );
         (ShieldedPool.Proof memory p, ShieldedPool.ExtData memory e) = _mkProof(pool, 0xE5, VIEW_ONLY);
         _expectTransactRevert(pool, p, e, ShieldedPool.InvalidProof.selector);
     }
