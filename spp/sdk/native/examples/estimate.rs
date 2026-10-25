@@ -1,0 +1,66 @@
+//! Demonstrates cost/plan estimation without proving or submitting.
+//!
+//! This example shows how to obtain an [`Estimate`] (transaction count) from
+//! [`PrivatePool::estimate`]. It uses a read-only client and only plans
+//! transactions; no proof is built and nothing is submitted.
+//!
+//! Run:
+//!   cargo run --release --example estimate
+//!
+//! Required env var:
+//!   STELLAR_SECRET_KEY   Stellar secret key for the account (used to derive
+//!                        the address and for plan reads).
+//! Optional env vars:
+//!   SPP_RPC_URL          default: https://soroban-testnet.stellar.org
+//!   SPP_WALLET_PATH      default: ./spp-example-wallet.sqlite
+//!   SPP_DEPLOYMENT_JSON  default: deployments/testnet/deployments.json
+//!   SPP_POOL_CONTRACT_ID default: first enabled pool in deployment config
+//!   SPP_AMOUNT_STROOPS   default: 10000000 (1 XLM)
+
+mod common;
+
+use stellar_private_payments::Error;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_tracing()?;
+
+    let config = common::load_contract_config()?;
+    let storage = common::open_storage()?;
+    let client = common::build_readonly_client(storage, config.clone())?;
+    let account = common::build_account(&client)?;
+    common::require_onboarded(&account)?;
+
+    let (pool, pool_config) = common::open_account_pool(&account, &config)?;
+    let amount = common::amount()?;
+
+    println!("Pool:      {}", pool_config.pool_contract_id);
+    println!("Asset:     {}", pool_config.token_label());
+    println!("Amount:    {} stroops", u128::from(amount));
+    println!();
+
+    // `PrivatePool::estimate()` provides the number of transactions required to
+    // perform a transfer or withdraw. These operations may require multiple
+    // transactions because several note merges may need to be performed to
+    // create a note with the required amount. Deposits only require one
+    // transaction.
+    println!("Estimating transaction count for a transfer/withdraw...");
+    match pool.estimate(amount) {
+        Ok(estimate) => {
+            println!(
+                "Estimated number of on-chain transactions: {}",
+                estimate.tx_count
+            );
+        }
+        Err(Error::Plan(e)) => {
+            println!("Estimate unavailable: {e}");
+            println!("(This usually means the wallet has no spendable notes yet.)");
+        }
+        Err(e) if common::is_retention_gap_error(&e) => common::skip_on_retention_gap(&e),
+        Err(e) => return Err(Box::new(e)),
+    }
+
+    println!();
+    println!("No transactions were built, signed, or submitted.");
+
+    Ok(())
+}

@@ -1,0 +1,289 @@
+use crate::{
+    account::Account,
+    artifacts::{load_disclosure_artifacts, load_key_ownership_artifacts, load_transact_artifacts},
+    config::CliConfig,
+    signer::AliasSigner,
+    stellar_cli::StellarNetwork,
+};
+use anyhow::Result;
+use stellar_private_payments::{
+    LocalProver, LocalStorage, ProverHandle, SignerHandle,
+    blocking::{Account as SdkAccount, Client, PrivatePool},
+    types::{
+        EncryptionPublicKey, NoteOwnerAddress, NotePublicKey, Sensitive, SignerAddress,
+        TransferRecipient,
+    },
+};
+
+/// SDK `Client` → `Account` session; open pools via [`Self::pool`].
+pub struct ClientSession {
+    client: Client,
+    account: SdkAccount,
+}
+
+impl ClientSession {
+    /// Bind wallet + deployment. `readonly` skips circuit artifact load
+    /// (balance/notes/sync only).
+    ///
+    /// `owner` holds the notes; the payer that sources and signs every
+    /// envelope comes from [`CliConfig::require_signer`] and is `owner` itself
+    /// unless `--sign-as` named another alias.
+    pub fn new(
+        config: &CliConfig,
+        owner: &Account,
+        network: &StellarNetwork,
+        readonly: bool,
+    ) -> Result<Self> {
+        let storage_path = config.db_path().to_string_lossy().into_owned();
+        let storage = LocalStorage::open_with_key(&storage_path, config.database_key()?)
+            .map_err(|e| anyhow::anyhow!("open storage: {e}"))?;
+        let bootnode_setting = storage
+            .storage()
+            .get_bootnode_setting()
+            .map_err(|e| anyhow::anyhow!("load bootnode setting: {e:#}"))?;
+        let bootnode_url = (bootnode_setting.enabled && !bootnode_setting.url.trim().is_empty())
+            .then_some(bootnode_setting.url);
+
+        let client = if readonly {
+            Client::init_readonly(
+                network.rpc_url.clone(),
+                storage,
+                config.deployment.clone(),
+                bootnode_url,
+            )
+            .map_err(|e| anyhow::anyhow!("init client: {e}"))?
+        } else {
+            let artifacts = load_transact_artifacts(
+                &config.circuits_dir_path(),
+                &config.circuit_keys_dir_path(),
+                &config.circuit_lock()?,
+            )?;
+            let prover = ProverHandle::from(
+                LocalProver::from_artifacts(&artifacts)
+                    .map_err(|e| anyhow::anyhow!("init transact prover: {e}"))?,
+            );
+            Client::init(
+                network.rpc_url.clone(),
+                storage,
+                prover,
+                config.deployment.clone(),
+                bootnode_url,
+            )
+            .map_err(|e| anyhow::anyhow!("init client: {e}"))?
+        };
+        let sdk_account = open_account(&client, config, owner, network)?;
+
+        Ok(Self {
+            client,
+            account: sdk_account,
+        })
+    }
+
+    /// As [`Self::new`], over a disclosure-only client.
+    pub fn new_disclosure(
+        config: &CliConfig,
+        owner: &Account,
+        network: &StellarNetwork,
+    ) -> Result<Self> {
+        let client = disclosure_client(config, network)?;
+        let sdk_account = open_account(&client, config, owner, network)?;
+        Ok(Self {
+            client,
+            account: sdk_account,
+        })
+    }
+
+    /// As [`Self::new`], over a client that can only prove key ownership.
+    pub fn new_registration(
+        config: &CliConfig,
+        owner: &Account,
+        network: &StellarNetwork,
+    ) -> Result<Self> {
+        let artifacts = load_key_ownership_artifacts(
+            &config.circuits_dir_path(),
+            &config.circuit_keys_dir_path(),
+            &config.circuit_lock()?,
+        )?;
+        let prover = LocalProver::from_key_ownership_artifacts(&artifacts)
+            .map_err(|e| anyhow::anyhow!("init key ownership prover: {e}"))?;
+        let client = client_with_prover(config, network, ProverHandle::from(prover))?;
+        let sdk_account = open_account(&client, config, owner, network)?;
+        Ok(Self {
+            client,
+            account: sdk_account,
+        })
+    }
+
+    pub fn account(&self) -> &SdkAccount {
+        &self.account
+    }
+
+    pub fn operational_feed(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<stellar_private_payments::types::OperationalFeedItem>> {
+        self.client
+            .operational_feed(limit)
+            .map_err(|e| anyhow::anyhow!("operational feed: {e}"))
+    }
+
+    pub fn recipient_lookup(
+        &self,
+        address: &str,
+    ) -> Result<stellar_private_payments::types::RecipientLookup> {
+        self.client
+            .recipient_lookup(address)
+            .map_err(|e| anyhow::anyhow!("look up recipient {address}: {e}"))
+    }
+
+    pub fn pool(&self, pool_contract_id: &str) -> Result<PrivatePool> {
+        log::info!("Opening pool {pool_contract_id}");
+        self.account
+            .pool(pool_contract_id)
+            .map_err(|e| anyhow::anyhow!("open pool session: {e}"))
+    }
+
+    pub fn token_decimals<'a>(
+        &self,
+        pool_ids: impl IntoIterator<Item = &'a str>,
+    ) -> std::collections::HashMap<String, Result<u32>> {
+        let pools: std::collections::HashMap<_, _> = pool_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|id| (id.to_string(), self.pool(id)))
+            .collect();
+        std::thread::scope(|scope| {
+            let reads: Vec<_> = pools
+                .into_iter()
+                .map(|(id, pool)| {
+                    (
+                        id,
+                        scope.spawn(move || pool.and_then(|pool| Ok(pool.token_decimals()?))),
+                    )
+                })
+                .collect();
+            reads
+                .into_iter()
+                .map(|(id, read)| {
+                    let result = read
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("token precision read failed")));
+                    (id, result)
+                })
+                .collect()
+        })
+    }
+
+    /// Register this account's public keys on the deployment-wide registry.
+    pub fn register_public_keys(
+        &self,
+    ) -> Result<stellar_private_payments::types::TransactionResult> {
+        log::info!("Registering public keys");
+        self.account
+            .register_public_keys()
+            .map_err(|e| anyhow::anyhow!("register public keys: {e}"))
+    }
+}
+
+/// A disclosure only client.
+pub fn disclosure_client(config: &CliConfig, network: &StellarNetwork) -> Result<Client> {
+    client_with_prover(
+        config,
+        network,
+        ProverHandle::from(disclosure_prover(config)?),
+    )
+}
+
+fn client_with_prover(
+    config: &CliConfig,
+    network: &StellarNetwork,
+    prover: ProverHandle,
+) -> Result<Client> {
+    let storage_path = config.db_path().to_string_lossy().into_owned();
+    let storage = LocalStorage::open_with_key(&storage_path, config.database_key()?)
+        .map_err(|e| anyhow::anyhow!("open storage: {e}"))?;
+    let bootnode_setting = storage
+        .storage()
+        .get_bootnode_setting()
+        .map_err(|e| anyhow::anyhow!("load bootnode setting: {e:#}"))?;
+    let bootnode_url = (bootnode_setting.enabled && !bootnode_setting.url.trim().is_empty())
+        .then_some(bootnode_setting.url);
+    Client::init(
+        network.rpc_url.clone(),
+        storage,
+        prover,
+        config.deployment.clone(),
+        bootnode_url,
+    )
+    .map_err(|e| anyhow::anyhow!("init client: {e}"))
+}
+
+/// A native prover with all registered selective-disclosure circuits.
+pub fn disclosure_prover(config: &CliConfig) -> Result<LocalProver> {
+    let artifacts = load_disclosure_artifacts(
+        &config.circuits_dir_path(),
+        &config.circuit_keys_dir_path(),
+        &config.circuit_lock()?,
+    )?;
+    LocalProver::from_disclosure_artifacts(&artifacts)
+        .map_err(|e| anyhow::anyhow!("init disclosure prover: {e}"))
+}
+
+/// Open the SDK session for the two roles: `owner` is the address the notes
+/// belong to, the payer sources and signs the envelopes and is the one whose
+/// alias reaches [`AliasSigner`].
+fn open_account(
+    client: &Client,
+    config: &CliConfig,
+    owner: &Account,
+    network: &StellarNetwork,
+) -> Result<SdkAccount> {
+    let signer = config.require_signer(owner)?;
+    if signer.address != owner.address {
+        log::info!(
+            "Signing as {} for notes owned by {}",
+            Sensitive(&signer.address),
+            Sensitive(&owner.address)
+        );
+    }
+    client
+        .account(
+            NoteOwnerAddress::new(owner.address.as_str()),
+            alias_signer(config, &signer, network),
+        )
+        .map_err(|e| anyhow::anyhow!("open account session: {e}"))
+}
+
+/// The signer delegates identity to the Stellar CLI keystore, so it carries the
+/// payer's alias and address.
+fn alias_signer(config: &CliConfig, signer: &Account, network: &StellarNetwork) -> SignerHandle {
+    SignerHandle::from(AliasSigner {
+        alias: signer.alias.clone(),
+        rpc_url: network.rpc_url.clone(),
+        network_passphrase: network.passphrase.clone(),
+        config_dir: config.stellar_config_dir.clone(),
+        signer_address: SignerAddress::new(signer.address.as_str()),
+    })
+}
+
+/// Parse `--to` address or explicit note + encryption keys into a
+/// [`TransferRecipient`].
+pub fn parse_transfer_recipient(
+    to: Option<&str>,
+    note_key: Option<&str>,
+    encryption_key: Option<&str>,
+) -> Result<TransferRecipient> {
+    match (to, note_key, encryption_key) {
+        (Some(address), None, None) => Ok(TransferRecipient::from(address)),
+        (None, Some(note_key), Some(encryption_key)) => Ok(TransferRecipient::keys(
+            NotePublicKey::parse(note_key)
+                .map_err(|e| anyhow::anyhow!("invalid recipient note key: {e}"))?,
+            EncryptionPublicKey::parse(encryption_key)
+                .map_err(|e| anyhow::anyhow!("invalid recipient encryption key: {e}"))?,
+        )),
+        _ => anyhow::bail!(
+            "specify the recipient with --to <G…>, or both --note-key <hex> and --encryption-key <hex>"
+        ),
+    }
+}

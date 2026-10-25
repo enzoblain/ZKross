@@ -1,0 +1,18 @@
+{
+  "name": "zkross-bridge-services",
+  "private": true,
+  "type": "module",
+  "description": "ZKross root poster, refund attester and the shared chain/prover library (run inside WSL)",
+  "scripts": {
+    "root-poster": "tsx src/root-poster.ts",
+    "refund-attester": "tsx src/refund-attester.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.3.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

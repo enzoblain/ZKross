@@ -1,0 +1,91 @@
+//! Sync wrapper around [`crate::Account`] via a shared Tokio runtime.
+
+use crate::types::{
+    AssetDescriptor, EncryptionPublicKey, Field, NoteOwnerAddress, NotePublicKey, PortfolioBalance,
+    SignerAddress, UserNoteSummary,
+};
+
+use crate::{
+    Error, SignerHandle, StorageHandle, account::Account as AsyncAccount, types::TransactionResult,
+};
+
+use super::{pool::PrivatePool, runtime::block_on};
+
+/// Stellar account session (address + signer) with blocking pool factory.
+///
+/// Construct via [`super::Client::account`].
+pub struct Account {
+    inner: AsyncAccount,
+}
+
+impl Account {
+    pub(crate) fn from_inner(inner: AsyncAccount) -> Self {
+        Self { inner }
+    }
+
+    /// The account that owns the notes.
+    pub fn user_address(&self) -> &NoteOwnerAddress {
+        self.inner.user_address()
+    }
+
+    /// The account that signs and pays.
+    pub fn signer_address(&self) -> &SignerAddress {
+        self.inner.signer_address()
+    }
+
+    pub fn signer(&self) -> &SignerHandle {
+        self.inner.signer()
+    }
+
+    pub fn storage(&self) -> &StorageHandle {
+        self.inner.storage()
+    }
+
+    /// Catch local storage up to the current chain tip for the deployment.
+    pub fn sync(&self) -> Result<(), Error> {
+        block_on(self.inner.sync())
+    }
+
+    pub fn portfolio(&self) -> Result<Vec<PortfolioBalance>, Error> {
+        block_on(self.inner.portfolio())
+    }
+
+    /// This account's classical on-chain balance of `asset`, in its smallest
+    /// unit (stroops for native XLM).
+    pub fn balance(&self, asset: &AssetDescriptor) -> Result<u128, Error> {
+        block_on(self.inner.balance(asset))
+    }
+
+    pub fn privacy_keys(&self) -> Result<(NotePublicKey, EncryptionPublicKey), Error> {
+        block_on(self.inner.privacy_keys())
+    }
+
+    pub fn derive_privacy_keys(&self) -> Result<(NotePublicKey, EncryptionPublicKey), Error> {
+        block_on(self.inner.derive_privacy_keys())
+    }
+
+    pub fn asp_secret(&self) -> Result<Field, Error> {
+        block_on(self.inner.asp_secret())
+    }
+
+    pub fn derive_asp_user_leaf(&self) -> Result<Field, Error> {
+        block_on(self.inner.derive_asp_user_leaf())
+    }
+
+    pub fn user_notes(&self, limit: u32) -> Result<Vec<UserNoteSummary>, Error> {
+        block_on(self.inner.user_notes(limit))
+    }
+
+    pub fn is_registered(&self) -> Result<bool, Error> {
+        block_on(self.inner.is_registered())
+    }
+
+    /// Register this account's public keys on the deployment-wide registry.
+    pub fn register_public_keys(&self) -> Result<TransactionResult, Error> {
+        block_on(self.inner.register_public_keys())
+    }
+
+    pub fn pool(&self, pool_contract_id: impl Into<String>) -> Result<PrivatePool, Error> {
+        Ok(PrivatePool::from_inner(self.inner.pool(pool_contract_id)?))
+    }
+}

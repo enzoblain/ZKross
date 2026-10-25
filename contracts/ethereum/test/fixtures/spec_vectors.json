@@ -1,0 +1,123 @@
+{
+  "asset_id_usdc": 1,
+  "attestations": {
+    "attester_private_key": "0x0000000000000000000000000000000000000000000000000000000000000001 (public test key, never fund)",
+    "cases": [
+      {
+        "attester_address": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+        "digest": "0x6eddac03159c03616181367ccdda01d705fe068b753351ee505899e764348562",
+        "message": "0x5a4b524f53532d4154544553542d7631000000000000000000000000000000000000000000000001cee0302d59844d32222222222222222222222222222222222222222222222222222222222222222202c044ae68d5b5f49a84c83a1d6fac77d69929054971f6fd8415c80f99cf98e701",
+        "signature": "0xfe5617759b0b7dc21dc12d1684a498bb0028c895d4b25b88b721054b67b89d602d55d93b15d8c50efcde0e30426c8013eb4481e0f4e8f7162f3437b9ca263c4c1c",
+        "status": 1
+      },
+      {
+        "attester_address": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+        "digest": "0xfce1caa8a7905709b7aab26f5f1b6324462ddef708820dfb76c3546f4077e415",
+        "message": "0x5a4b524f53532d4154544553542d76310000000000000000000000000000000000000000000000000000000000aa36a7000000000000000000000000111111111111111111111111111111111111111102c044ae68d5b5f49a84c83a1d6fac77d69929054971f6fd8415c80f99cf98e702",
+        "signature": "0xac3dd4636d7e787d9d881a091341f9e03b1cb56c7fbbab4a5e0d63a153ec3bf02259f63a2048e25d26da77407b466a1d1a006824998802dd5157ba38308f3cdb1c",
+        "status": 2
+      }
+    ],
+    "ethereum_source_pool_id": "0x0000000000000000000000001111111111111111111111111111111111111111",
+    "stellar_source_pool_id": "0x2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "bridge_messages": [
+    {
+      "C": "0x02c044ae68d5b5f49a84c83a1d6fac77d69929054971f6fd8415c80f99cf98e7",
+      "amount": 1234567,
+      "asset_id": 1,
+      "claim_nullifier": "0x0ee9fbd40a110c62fbef35ac20370dca69b5f6aed5e8f6d18b3cb5d256ee4f53",
+      "claim_secret": "0x16662d8bb77f55d75e6c926ed1f442af3da6b33b67712f593d15c439e793ca26",
+      "deadline_bucket": "493000",
+      "dst_chain": "11155111",
+      "dst_value": 1234567,
+      "h1": "0x14598a58d228409626590a90e697b0fad585845051b2de5e61bab04565f8cfcb",
+      "h2": "0x0011aa57254bfcfd113841ec4119e8a02b7c57e85ba2032e50a319606e0a5d43",
+      "outbox_root_after_insert": "0x127e678fec81caf0c995ec3dae1efb6bc30c3292b69b6dd972ac23a591ef3bd6",
+      "recipient_pk": "0x06a49f2251f94f6a938df4a314e2edc65e9248374a3ffcab8bf5db79be65ede5",
+      "recipient_sk": "0x0ec54e1b7a1c8d054b0a9a2f7682f5b447fe872ab00ab0f7d77c9ecb3157ded5",
+      "refund_blinding": "0x119a4c4d78ef24ac6ba2815a0685b43e38e94339126d00175c344ddc3be93e58",
+      "refund_commitment": "0x12ff142fbab872cf42419e33e3d4af38725dad8890d3a64a136810a3acd2ca54",
+      "refund_pk": "0x1e1acb38c9a7381f619b9cdfb7c93b613ba78cb2b9c033d961a232152b5edfe6",
+      "refund_value": 12345670,
+      "scale_dst": 1,
+      "scale_src": 10,
+      "src_chain": "33353711811639397682"
+    },
+    {
+      "C": "0x198926851845855259094c0c0ca0043e33062140c9ce82a3265b4d90af65dc55",
+      "amount": 2000000,
+      "asset_id": 1,
+      "claim_nullifier": "0x28450f3d1ca1fde1b4bd66df1b19b89266fca679dcf328c36f0a63e12839239e",
+      "claim_secret": "0x121d96a67ff34b4424a240400d329d241c47e6d3eeb44d0fe6bfb145a6a1cc53",
+      "deadline_bucket": "494000",
+      "dst_chain": "33353711811639397682",
+      "dst_value": 20000000,
+      "h1": "0x1b8493f6c150a7e220d7c63f0b8e1f35ae6ae64ac0b5305b0fb47ce6919bb382",
+      "h2": "0x2f1fd82dd87f799bc0d36ba1e7d4711ad8290e41ad43cc85f2f9f28f3381ec03",
+      "outbox_root_after_insert": "0x2c0b4d06de2c277630caa141670d07067af19a2623d0219bb8b10ae39b6a1756",
+      "recipient_pk": "0x2a1740d6a459e41e33e2a01ffb57db12c238f6444f9d7fe327b14c310774cbf8",
+      "recipient_sk": "0x2ad91c6be99dc82ff3358f533502a6bad161632abf82798d854b0638190e2321",
+      "refund_blinding": "0x0682e112e8f199c12030998e1311a56537b850f0674cb1e642d3aa990220a5a4",
+      "refund_commitment": "0x0e95e66bfe232e444375cef7521ab4c60de171e232e2473cd7c59e2aa7eb8685",
+      "refund_pk": "0x2d9553606bd68c60487faaeac16f70ea3b4451abaed7e904963e3bddcf3924e1",
+      "refund_value": 2000000,
+      "scale_dst": 10,
+      "scale_src": 1,
+      "src_chain": "11155111"
+    }
+  ],
+  "chain_ids": {
+    "sepolia": "11155111",
+    "stellar_testnet": "33353711811639397682"
+  },
+  "decimal_conversion": [
+    {
+      "back_to_stellar_stroops": 12345670,
+      "bridge_amount": 1234567,
+      "ethereum_units": 1234567,
+      "stellar_change": 8,
+      "stellar_stroops": 12345678
+    },
+    {
+      "back_to_stellar_stroops": 10,
+      "bridge_amount": 1,
+      "ethereum_units": 1,
+      "stellar_change": 0,
+      "stellar_stroops": 10
+    },
+    {
+      "back_to_stellar_stroops": 0,
+      "bridge_amount": 0,
+      "ethereum_units": 0,
+      "stellar_change": 9,
+      "stellar_stroops": 9
+    },
+    {
+      "back_to_stellar_stroops": 0,
+      "bridge_amount": 0,
+      "ethereum_units": 0,
+      "stellar_change": 0,
+      "stellar_stroops": 0
+    },
+    {
+      "back_to_stellar_stroops": 70000000,
+      "bridge_amount": 7000000,
+      "ethereum_units": 7000000,
+      "stellar_change": 1,
+      "stellar_stroops": 70000001
+    },
+    {
+      "back_to_stellar_stroops": 20000000,
+      "bridge_amount": 2000000,
+      "ethereum_units": 2000000,
+      "stellar_change": 0,
+      "stellar_stroops": 20000000
+    }
+  ],
+  "source": "SPEC.md Part B, computed with SPP's taceo_poseidon2 and SPP's pool-core tree in the Soroban host",
+  "tags": {
+    "bridge": 7,
+    "claim": 8
+  }
+}

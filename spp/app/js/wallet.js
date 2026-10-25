@@ -1,0 +1,318 @@
+import { loadDeploymentConfig } from './wasm-facade.js';
+import { validateNetwork } from './network-config.js';
+/**
+ * Wallet adapter boundary for the Freighter browser extension.
+ *
+ * SEP-0043 v1.2.1 standardizes getAddress, signTransaction, signAuthEntry,
+ * signMessage, and getNetwork. The additional Freighter-only symbols imported
+ * below (WatchWalletChanges, isConnected, isAllowed,
+ * requestAccess, setAllowed) are intentional adapter extensions: SEP-0043 is
+ * still Draft and defines no connect/permission-gating or watch/change API,
+ * so the app relies on Freighter's extension for those capabilities.
+ *
+ * Network identity comes from SEP-0043 getNetwork; the RPC endpoint comes
+ * from deployment configuration, independently of wallet settings.
+ * The app no longer needs getNetworkDetails for endpoint discovery: the
+ * deployment selects the RPC, and the wallet passphrase must match it.
+ */
+import {
+    WatchWalletChanges,
+    getAddress,
+    getNetwork,
+    isAllowed,
+    isConnected,
+    requestAccess,
+    setAllowed,
+    signAuthEntry,
+    signTransaction,
+    signMessage
+} from '@stellar/freighter-api';
+
+import { verifySignerAddress } from './wallet-signer-guard.js';
+
+/**
+ * Request wallet access and return the active public key.
+ *
+ * Throws when the extension is missing or unavailable.
+ *
+ * @returns {Promise<void>}
+ */
+async function assertFreighterInstalled() {
+    const conn = await isConnected();
+    if (conn?.error) {
+        throw normalizeWalletError(conn.error, "Failed to check Freighter connection");
+    }
+    if (!conn?.isConnected) {
+        throw new Error("Freighter not detected. Install from https://www.freighter.app/");
+    }
+}
+
+/**
+ * Ensure Freighter is installed, connected, and allowed for this site.
+ *
+ * Optionally requests wallet access and returns the active public key.
+ *
+ * @param {Object} [opts] - Optional configuration.
+ * @param {boolean} [opts.requestAddress=false] - Whether to request and return the active address.
+ * @returns {Promise<string|void>} - Connected Stellar public key when requested.
+ */
+async function ensureFreighterReady(opts = {}) {
+    const { requestAddress = false } = opts;
+
+    await assertFreighterInstalled();
+
+    const allowed = await isAllowed();
+    if (allowed?.error) {
+        throw normalizeWalletError(allowed.error, "Failed to check Freighter allow-list");
+    }
+
+    if (!allowed?.isAllowed) {
+        const set = await setAllowed();
+        if (set?.error) {
+            throw normalizeWalletError(set.error, "Freighter access could not be granted");
+        }
+    }
+
+    if (requestAddress) {
+        const access = await requestAccess();
+        if (access?.error) {
+            throw normalizeWalletError(access.error, "Freighter access request failed");
+        }
+        if (!access?.address) {
+            throw new Error("No public key returned");
+        }
+        return access.address;
+    }
+}
+
+/**
+ * Request wallet access and return the active public key.
+ *
+ * Validates Freighter availability, prompts for access if needed,
+ * and returns the connected Stellar address.
+ *
+ * @returns {Promise<string>} - Connected Stellar public key (G...).
+ */
+export async function connectWallet() {
+    return await ensureFreighterReady({requestAddress: true});
+}
+
+/**
+ * Return the active address only if Freighter is already connected AND allowed
+ * for this origin, without prompting. Returns null otherwise. Lets a page
+ * restore a session already established elsewhere in the app (same origin)
+ * without showing a connection popup.
+ * @returns {Promise<string|null>}
+ */
+export async function getConnectedAddress() {
+    try {
+        const conn = await isConnected();
+        if (!conn?.isConnected) return null;
+        const allowed = await isAllowed();
+        if (!allowed?.isAllowed) return null;
+        const res = await getAddress();
+        if (res?.error || !res?.address) return null;
+        return res.address;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Fetch the currently active public key from Freighter without prompting.
+ * @returns {Promise<string>}
+ */
+export async function getWalletAddress() {
+    await ensureFreighterReady();
+    const res = await getAddress();
+    if (res?.error) {
+        throw normalizeWalletError(res.error, "Failed to get active Freighter address");
+    }
+    if (!res?.address) {
+        throw new Error("No public key returned");
+    }
+    return res.address;
+}
+
+/**
+ * Watch Freighter's active account.
+ *
+ * Freighter shares an account only with sites allowed for it, so the callback
+ * gets an empty address while the active account is not allowed here (or the
+ * wallet is locked), and no address at all when Freighter could not be asked.
+ *
+ * @param {{intervalMs?: number, onChange: function({address: string|null}): void}} opts
+ * @returns {function} stop watcher
+ */
+export function startWalletWatcher(opts) {
+    const { intervalMs = 3000, onChange } = opts || {};
+    const watcher = new WatchWalletChanges(intervalMs);
+    const res = watcher.watch((info) => {
+        if (info?.error) return;
+        try {
+            onChange?.({ address: typeof info?.address === 'string' ? info.address : null });
+        } catch (e) {
+            console.warn('[Wallet] watch callback failed:', e);
+        }
+    });
+    if (res?.error) {
+        throw normalizeWalletError(res.error, 'Failed to start wallet watcher');
+    }
+    return () => watcher.stop();
+}
+
+/**
+ * Fetch current network details from Freighter.
+ *
+ * Useful for displaying network name and ensuring app/network alignment.
+ *
+ * Validates the wallet network against the deployment and uses the deployment
+ * RPC URL. Wallet endpoint settings do not control the app connection.
+ *
+ * @returns {Promise<{network: string, networkPassphrase: string, sorobanRpcUrl: string}>}
+ */
+export async function getWalletNetwork() {
+    const details = await getNetwork();
+    if (details?.error) {
+        throw normalizeWalletError(details.error, "Failed to get Freighter network details");
+    }
+
+    const { network, networkPassphrase } = details;
+    const config = await loadDeploymentConfig();
+    validateNetwork(config, networkPassphrase);
+    if (typeof config.rpcUrl !== 'string' || !config.rpcUrl.trim()) {
+        throw new Error('Deployment config is missing rpcUrl');
+    }
+    let rpcUrl;
+    try {
+        rpcUrl = new URL(config.rpcUrl);
+    } catch {
+        throw new Error('Deployment config rpcUrl must be an absolute HTTP or HTTPS URL');
+    }
+    if (rpcUrl.protocol !== 'http:' && rpcUrl.protocol !== 'https:') {
+        throw new Error('Deployment config rpcUrl must be an absolute HTTP or HTTPS URL');
+    }
+    return { network, networkPassphrase, sorobanRpcUrl: config.rpcUrl };
+}
+
+/**
+ * Normalize Freighter errors to a consistent shape.
+ *
+ * Marks common rejection phrases as USER_REJECTED for UI handling.
+ *
+ * @param {Object} error - Raw Freighter error payload.
+ * @param {string} fallbackMessage - Default message when none provided.
+ * @returns {Error} - Error with `code` set to USER_REJECTED or WALLET_ERROR.
+ */
+function normalizeWalletError(error, fallbackMessage = "Wallet error") {
+    const message = error?.message || fallbackMessage;
+    const lower = String(message).toLowerCase();
+    const err = new Error(message);
+    // SEP-0043 v1.2.1 defines code -4 as user rejection. Check the structured
+    // code first, then fall back to the message regex for wallets/versions that
+    // do not yet set it.
+    //
+    // NOTE: the regex below runs against `fallbackMessage` too whenever the
+    // wallet payload carries no message of its own. Callers must therefore keep
+    // their fallback strings free of reject/declin/denied/cancel wording, or an
+    // arbitrary wallet failure will be reported to the user as a cancellation.
+    if (error?.code === -4) {
+        err.code = 'USER_REJECTED';
+    } else if (/reject|declin|denied|cancel/.test(lower)) {
+        err.code = 'USER_REJECTED';
+    } else {
+        err.code = 'WALLET_ERROR';
+    }
+    err.cause = error;
+    return err;
+}
+
+/**
+ * Request the user to sign a transaction XDR via Freighter.
+ *
+ * Ensures wallet access, then returns the signed XDR and signer address.
+ *
+ * @param {string} transactionXdr - Unsigned transaction XDR (base64).
+ * @param {Object} opts - Optional signing context.
+ * @param {string} [opts.networkPassphrase] - Network passphrase for signing.
+ * @param {string} [opts.address] - Specific account to sign with.
+ * @returns {Promise<{signedTxXdr: string, signerAddress: string}>}
+ */
+export async function signWalletTransaction(transactionXdr, opts = {}) {
+    await ensureFreighterReady();
+
+    const { signedTxXdr, signerAddress, error } = await signTransaction(transactionXdr, opts);
+    if (error) {
+        throw normalizeWalletError(error, 'Transaction signature failed');
+    }
+    verifySignerAddress('signTransaction', opts.address, signerAddress);
+
+    return { signedTxXdr, signerAddress };
+}
+
+/**
+ * Request the user to sign a Soroban auth preimage via Freighter.
+ *
+ * Takes HashIdPreimage XDR (base64); returns raw signature bytes for authorizeEntry.
+ *
+ * @param {string} entryXdr - Authorization preimage XDR (base64).
+ * @param {Object} opts - Optional signing context.
+ * @param {string} [opts.networkPassphrase] - Network passphrase for signing.
+ * @param {string} [opts.address] - Specific account to sign with.
+ * @returns {Promise<{signedAuthEntry: string | null, signerAddress: string}>}
+ */
+export async function signWalletAuthEntry(entryXdr, opts = {}) {
+    await ensureFreighterReady();
+
+    const { signedAuthEntry, signerAddress, error } = await signAuthEntry(entryXdr, opts);
+    if (error) {
+        throw normalizeWalletError(error, 'Auth entry signature failed');
+    }
+    verifySignerAddress('signAuthEntry', opts.address, signerAddress);
+
+    return { signedAuthEntry, signerAddress };
+}
+
+/**
+ * Request the user to sign an arbitrary message via Freighter.
+ *
+ * Used for deriving encryption keys deterministically.
+ *
+ * @param {string} message - Message to sign.
+ * @param {Object} [opts] - Optional signing context.
+ * @param {string} [opts.address] - Specific account to sign with.
+ * @param {string} [opts.networkPassphrase] - Network passphrase for signing context.
+ * @returns {Promise<{signedMessage: string | null, signerAddress: string}>}
+ */
+export async function signWalletMessage(message, opts = {}) {
+    const { skipEnsureReady = false, ...freighterOpts } = opts || {};
+    if (!skipEnsureReady) {
+        await ensureFreighterReady();
+    }
+
+    console.log('[Wallet] Requesting message signature for:', message.substring(0, 30) + '...');
+    const result = await signMessage(message, freighterOpts);
+    console.log('[Wallet] signMessage result:', {
+        hasSignedMessage: !!result?.signedMessage,
+        hasError: !!result?.error,
+        error: result?.error,
+    });
+
+    const { signedMessage, signerAddress, error } = result || {};
+    if (error) {
+        throw normalizeWalletError(error, 'Message signature failed');
+    }
+    // If SignMessage returns null. Older Freighter versions return a null
+    // signature instead of an error payload when the user declines, so classify
+    // this as a rejection via the structured code rather than by wording the
+    // message so that a substring matcher happens to catch it.
+    if (!signedMessage) {
+        const err = new Error('No signature returned by the wallet.');
+        err.code = 'USER_REJECTED';
+        throw err;
+    }
+
+    verifySignerAddress('signMessage', freighterOpts.address, signerAddress);
+
+    return { signedMessage, signerAddress };
+}

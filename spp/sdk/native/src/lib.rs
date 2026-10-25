@@ -1,0 +1,95 @@
+//! Stellar Private Payments SDK
+//!
+//! Entry point: [`Client`] → [`Account`] → [`PrivatePool`].
+//!
+//! # Example
+//!
+//! ```no_run
+//! use stellar_private_payments::{
+//!     CircuitStore, Client, LocalProver, LocalSigner, LocalStorage,
+//!     types::{CircuitStem, ContractConfig, NoteOwnerAddress, PolicyFlags, SignerAddress},
+//! };
+//!
+//! # async fn example(deployment: ContractConfig, key: stellar_private_payments::state::database_key::DatabaseKey) -> Result<(), Box<dyn std::error::Error>> {
+//! let storage = LocalStorage::open_encrypted("wallet.sqlite", key, stellar_private_payments::state::database_key::OpenPurpose::OpenExisting)?.into();
+//!
+//! let lock = stellar_private_payments::circuit_lock(&std::fs::read_to_string("./circuits.json")?)?;
+//! let store = CircuitStore::open("./circuits", lock);
+//! store.ensure_blocking()?;
+//! let artifacts = store.transact_artifacts()?;
+//! let prover = LocalProver::from_artifacts(&artifacts)?.into();
+//! let signer = LocalSigner::new(
+//!     "S...",
+//!     "Test SDF Network ; September 2015",
+//!     SignerAddress::new("G..."),
+//! )?
+//! .into();
+//!
+//! let client = Client::init(
+//!     "https://soroban-testnet.stellar.org",
+//!     storage,
+//!     prover,
+//!     deployment,
+//!     None,
+//! )?;
+//! let account = client.account(
+//!     NoteOwnerAddress::new("G..."),
+//!     signer,
+//! )?;
+//! account.derive_privacy_keys().await?;
+//! let pool = account.pool("CA2TZ...")?;
+//!
+//! pool.deposit(10_000_000u128.into()).await?;
+//! let balance = pool.balance().await?;
+//! # Ok(())
+//! # }
+//! ```
+
+#![deny(unsafe_code)]
+
+pub mod chain;
+pub mod circuits;
+pub mod disclosure;
+pub mod gvk;
+pub mod network_defaults;
+pub mod plan;
+pub mod planner;
+pub mod prover;
+pub mod registration;
+pub mod state;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stellar_cli;
+pub mod transact;
+pub mod types;
+pub mod zk;
+
+mod account;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod blocking;
+mod client;
+mod core;
+mod correlation;
+pub mod crypto;
+mod error;
+mod handle;
+mod pool;
+mod signer;
+mod sleep;
+mod storage;
+mod sync;
+
+pub use account::Account;
+#[cfg(not(target_arch = "wasm32"))]
+pub use circuits::CircuitStore;
+pub use circuits::{CircuitLockfile, circuit_lock};
+pub use client::Client;
+pub use error::{Error, PlanExecutionError, RetentionGap};
+pub use handle::Handle;
+pub use pool::PrivatePool;
+pub use prover::{LocalProver, Prover, ProverHandle};
+pub use signer::{LocalSigner, Signer, SignerHandle};
+pub use storage::{LocalStorage, Storage, StorageHandle};
+pub use sync::{BackgroundSync, BackgroundSyncStop, SyncMode, bootnode_required};
+
+/// Groth16 prove output for a transact step (simulate / sign / submit).
+pub type PreparedTransaction = transact::PreparedProverTx;
