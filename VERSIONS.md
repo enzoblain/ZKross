@@ -21,4 +21,5 @@ All builds run inside WSL2 (Ubuntu 26.04.1 LTS).
 | Node.js | 20.20.2 (npm 10.8.2) | Installed with nvm |
 | snarkjs | 0.7.6 | `npm install -g snarkjs` |
 | Foundry (forge, anvil) | 1.8.6 (`6bad0a66`) | Installed with `foundryup` |
+| solc | 0.8.37 | Pinned in `contracts/ethereum/foundry.toml` |
 | Circom | not installed | SPP compiles circuits with its own `tools/circuit-compiler`, which links Circom as a library |
