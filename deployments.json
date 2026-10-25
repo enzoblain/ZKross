@@ -1,0 +1,19 @@
+{
+  "stellarTestnet": {
+    "networkPassphrase": "Test SDF Network ; September 2015",
+    "rpcUrl": "https://soroban-testnet.stellar.org",
+    "usdc": {
+      "asset": "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+      "issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+      "sac": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+      "decimals": 7
+    }
+  },
+  "sepolia": {
+    "chainId": 11155111,
+    "usdc": {
+      "address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "decimals": 6
+    }
+  }
+}
