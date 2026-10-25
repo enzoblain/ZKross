@@ -22,7 +22,7 @@ type WalletConnectDialogProps = {
   network: NetworkId | null
   open: boolean
   onOpenChange: (open: boolean) => void
-  purpose?: 'required' | 'optional' | 'liquidity'
+  purpose?: 'required' | 'destination' | 'optional' | 'liquidity'
 }
 
 function WalletConnectDialog({
@@ -38,9 +38,10 @@ function WalletConnectDialog({
   const wallet = wallets[network]
   const isConnecting = connecting === network
   const purposeCopy = {
-    required: 'This is the source wallet for the selected route. Only this wallet is required.',
+    required: 'This source wallet deposits USDC and authorizes the bridge-out transaction.',
+    destination: 'This wallet derives the destination note key, submits the claim, and withdraws to your public address.',
     optional: 'Optional: connect it to use its public address as the recipient.',
-    liquidity: 'This is the owner wallet for the selected single-chain vault. No second wallet is required.',
+    liquidity: 'Only the configured pool administrator can add testnet liquidity.',
   }[purpose]
 
   return (
@@ -71,8 +72,8 @@ function WalletConnectDialog({
             <div className="flex items-start gap-3">
               <ShieldCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-accent" />
               <p>
-                Zkross requests only the public account address. It never asks for a seed
-                phrase or private key. No signature is requested by this prototype.
+                Zkross requests the public account now. During a transfer, it asks the wallet
+                to derive a note key and approve testnet transactions. It never asks for a seed phrase or private key.
               </p>
             </div>
           </div>

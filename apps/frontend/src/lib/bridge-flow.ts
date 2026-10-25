@@ -25,7 +25,7 @@ const ORDER: FlowStepId[] = ['keys', 'deposit', 'bridgeOut', 'root', 'claim', 'w
 
 /** The last step each transfer status has completed. */
 const DONE: Record<Transfer['status'], number> = {
-  created: 0,
+  created: -1,
   deposited: 1,
   sent: 2,
   rootPosted: 3,
@@ -110,7 +110,11 @@ async function settleNotes(network: NetworkId, pending: PendingNote[], tries = 6
 
 /** Up to two unspent notes worth at least `amount` (fewest and smallest first). */
 function selectNotes(available: Note[], amount: bigint): Note[] | null {
-  const sorted = available.slice().sort((x, y) => (BigInt(x.amount) < BigInt(y.amount) ? -1 : 1))
+  const sorted = available.slice().sort((x, y) => {
+    const a = BigInt(x.amount)
+    const b = BigInt(y.amount)
+    return a < b ? -1 : a > b ? 1 : 0
+  })
   const single = sorted.find((n) => BigInt(n.amount) >= amount)
   if (single) return [single]
   const top = sorted.slice(-2)
@@ -155,10 +159,16 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
   const amount = BigInt(t.amount)
   const amountFrom = toNoteAmount(t.from, amount)
   const amountTo = toNoteAmount(t.to, amount)
-  update('keys', 'active')
-  const keys = await keysFor(t)
-  if (t.recipientPk === '0x') save(t, { recipientPk: keys.to.pk, refundPk: keys.from.pk })
-  update('keys', 'complete')
+  let derivedKeys: { from: NoteKey; to: NoteKey } | undefined
+  await step('keys', async () => {
+    derivedKeys = await keysFor(t)
+    if (t.recipientPk === '0x') {
+      save(t, { recipientPk: derivedKeys.to.pk, refundPk: derivedKeys.from.pk, error: undefined })
+    }
+  })
+  // A resumed transfer still needs both in-memory spending keys even though
+  // the key step is already shown as complete.
+  const keys = derivedKeys ?? (await keysFor(t))
 
   await step('deposit', async () => {
     if (t.depositNote && (await settleNotes(t.from, [t.depositNote], 1))) return save(t, { status: 'deposited', error: undefined })
@@ -202,7 +212,9 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
   await step('bridgeOut', async () => {
     if (t.bridgeMessage && (await src.bridgeStatus(t.bridgeMessage)) !== 'none') {
       store.markSpent(t.from, t.inputs ?? [])
-      await settleNotes(t.from, t.changeNotes ?? [])
+      if (!(await settleNotes(t.from, t.changeNotes ?? []))) {
+        throw new Error('Bridge out landed, but its change note is not indexed yet. Retry shortly.')
+      }
       return save(t, { status: 'sent', error: undefined })
     }
     const chosen = selectNotes(store.notes(t.from, keys.from.pk), amountFrom)
@@ -254,7 +266,9 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     const sent = await src.bridgeOut(t.sender, proof)
     save(t, { txs: { ...t.txs, bridgeOut: sent.hash } })
     store.markSpent(t.from, t.inputs ?? [])
-    await settleNotes(t.from, change)
+    if (!(await settleNotes(t.from, change))) {
+      throw new Error('Bridge out landed, but its change note is not indexed yet. Retry shortly.')
+    }
     save(t, { status: 'sent', error: undefined })
   })
 
@@ -280,11 +294,15 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
 
   await step('claim', async () => {
     if (await dst.isClaimed(t.claimNullifier!)) {
-      await settleNotes(t.to, t.claimNotes ?? [])
+      if (!t.claimNotes?.length) throw new Error('The claim exists on-chain, but this browser has no matching note record.')
+      if (!(await settleNotes(t.to, t.claimNotes))) {
+        throw new Error('The claim landed, but its destination note is not indexed yet. Retry shortly.')
+      }
       return save(t, { status: 'claimed', error: undefined })
     }
     const leaves = (await src.outboxLeaves()).slice(0, t.remoteLeafCount)
     const index = leaves.findIndex((l) => l !== undefined && BigInt(l) === BigInt(t.bridgeMessage!))
+    if (index < 0) throw new Error('The bridge message is not present under the posted remote root.')
     const claim: PendingNote[] = [amountTo, 0n].map((value) => ({
       network: t.to,
       pk: keys.to.pk,
@@ -320,7 +338,9 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     // TODO(relayer): sent from the user's destination wallet for now.
     const sent = await dst.bridgeIn(t.claimer, proof)
     save(t, { txs: { ...t.txs, bridgeIn: sent.hash } })
-    await settleNotes(t.to, claim)
+    if (!(await settleNotes(t.to, claim))) {
+      throw new Error('The claim landed, but its destination note is not indexed yet. Retry shortly.')
+    }
     save(t, { status: 'claimed', error: undefined })
   })
 

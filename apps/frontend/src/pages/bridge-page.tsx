@@ -1,3 +1,4 @@
+import { StrKey } from '@stellar/stellar-sdk'
 import {
   AlertTriangle,
   ArrowRight,
@@ -5,7 +6,7 @@ import {
   CheckCircle2,
   ChevronDown,
   Circle,
-  Copy,
+  ExternalLink,
   FileKey2,
   Info,
   LoaderCircle,
@@ -14,13 +15,12 @@ import {
   RotateCcw,
   ShieldCheck,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { isAddress } from 'viem'
 
 import { Spotlight } from '../components/aceternity/spotlight'
 import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
-import { WalletConnectDialog } from '../components/wallet-connect-dialog'
-import { useWallets } from '../components/wallet-context'
 import {
   Dialog,
   DialogClose,
@@ -29,105 +29,196 @@ import {
   DialogHeader,
   DialogTitle,
 } from '../components/ui/dialog'
-import {
-  mockBridgeAdapter,
-  networkMeta,
-  type NetworkId,
-  type TransferProgressStep,
-} from '../lib/networks'
+import { WalletConnectDialog } from '../components/wallet-connect-dialog'
+import { useWallets } from '../components/wallet-context'
+import { formatMessage, formatNote, parseUnits } from '../lib/amounts'
+import { createProgress, createTransfer, runTransfer, type FlowStepId } from '../lib/bridge-flow'
+import { chainId, explorer, isDeployed, poolAddress, protocol } from '../lib/config'
+import { networkMeta, otherNetwork, type NetworkId, type TransferProgressStep } from '../lib/networks'
+import { pools } from '../lib/pools'
+import * as store from '../lib/store'
+import type { Transfer } from '../lib/store'
 import { cn } from '../lib/utils'
 import { truncateAddress } from '../lib/wallet-adapters'
 
-const compactNumber = new Intl.NumberFormat('en-US', {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-})
+type RunStatus = 'idle' | 'running' | 'complete' | 'failed'
 
-type RunStatus = 'idle' | 'running' | 'complete'
+const unfinishedTransfer = () =>
+  store.transfers().find((item) => item.status !== 'withdrawn' && item.status !== 'refunded')
 
-const routeCapacity: Record<NetworkId, number> = {
-  ethereum: 930000,
-  stellar: 610000,
+function validRecipient(network: NetworkId, address: string) {
+  const value = address.trim()
+  return network === 'stellar' ? StrKey.isValidEd25519PublicKey(value) : isAddress(value)
+}
+
+function stepTransactions(transfer: Transfer | null, step: FlowStepId) {
+  if (!transfer) return []
+  const source = transfer.from
+  const destination = transfer.to
+  const rows: { hash: string; network: NetworkId; label: string }[] = []
+  if (step === 'deposit') {
+    if (transfer.txs.approve) rows.push({ hash: transfer.txs.approve, network: source, label: 'Approval' })
+    if (transfer.txs.deposit) rows.push({ hash: transfer.txs.deposit, network: source, label: 'Deposit' })
+  }
+  if (step === 'bridgeOut' && transfer.txs.bridgeOut) {
+    rows.push({ hash: transfer.txs.bridgeOut, network: source, label: 'Bridge out' })
+  }
+  if (step === 'claim' && transfer.txs.bridgeIn) {
+    rows.push({ hash: transfer.txs.bridgeIn, network: destination, label: 'Claim' })
+  }
+  if (step === 'withdraw') {
+    if (transfer.txs.trustline) rows.push({ hash: transfer.txs.trustline, network: destination, label: 'Trustline' })
+    if (transfer.txs.withdraw) rows.push({ hash: transfer.txs.withdraw, network: destination, label: 'Withdrawal' })
+  }
+  return rows
 }
 
 function BridgePage() {
   const { wallets, connecting } = useWallets()
-  const [from, setFrom] = useState<NetworkId>('ethereum')
-  const to: NetworkId = from === 'ethereum' ? 'stellar' : 'ethereum'
+  const [initial] = useState(() => unfinishedTransfer())
+  const [from, setFrom] = useState<NetworkId>(initial?.from ?? 'ethereum')
+  const to = otherNetwork(from)
   const [walletDialogNetwork, setWalletDialogNetwork] = useState<NetworkId | null>(null)
-  const [amount, setAmount] = useState('250')
-  const [recipient, setRecipient] = useState('')
+  const [amount, setAmount] = useState(initial ? formatMessage(BigInt(initial.amount)) : '')
+  const [recipient, setRecipient] = useState(initial?.recipient ?? '')
   const [reviewOpen, setReviewOpen] = useState(false)
-  const [runStatus, setRunStatus] = useState<RunStatus>('idle')
+  const [transfer, setTransfer] = useState<Transfer | null>(initial ?? null)
+  const [runStatus, setRunStatus] = useState<RunStatus>(initial?.error ? 'failed' : 'idle')
   const [progress, setProgress] = useState<TransferProgressStep[]>(() =>
-    mockBridgeAdapter.createProgress(),
+    createProgress(initial?.from ?? 'ethereum', initial?.to ?? 'stellar', initial),
+  )
+  const [liveReads, setLiveReads] = useState<{
+    key: string
+    publicBalance: bigint | null
+    destinationCapacity: bigint | null
+    error: string
+  }>({ key: '', publicBalance: null, destinationCapacity: null, error: '' })
+  const privateBalance = useSyncExternalStore(
+    store.subscribe,
+    () => store.privateBalance(from),
+    () => 0n,
   )
 
-  const numericAmount = Number.parseFloat(amount) || 0
-  const quote = useMemo(
-    () => mockBridgeAdapter.getQuote(numericAmount),
-    [numericAmount],
+  const sourceWallet = wallets[from]
+  const destinationWallet = wallets[to]
+  const recipientValue = recipient || destinationWallet?.address || ''
+  const messageAmount = useMemo(() => parseUnits(amount, 6), [amount])
+  const recipientIsValid = validRecipient(to, recipientValue)
+  const deploymentReady = isDeployed(from) && isDeployed(to)
+  const readKey = `${from}:${sourceWallet?.address ?? ''}:${to}`
+  const publicBalance = liveReads.key === readKey ? liveReads.publicBalance : null
+  const destinationCapacity = liveReads.key === readKey ? liveReads.destinationCapacity : null
+  const readError = liveReads.key === readKey ? liveReads.error : ''
+  const canReview = Boolean(
+    sourceWallet &&
+      destinationWallet &&
+      messageAmount &&
+      messageAmount > 0n &&
+      recipientIsValid &&
+      deploymentReady &&
+      runStatus !== 'running',
   )
-  const recipientIsValid =
-    to === 'stellar'
-      ? recipient.trim().startsWith('G') && recipient.trim().length >= 16
-      : /^0x[a-fA-F0-9]{40}$/.test(recipient.trim())
-  const canReview =
-    Boolean(wallets[from]) &&
-    numericAmount > 0 &&
-    recipientIsValid &&
-    runStatus !== 'running'
 
   useEffect(() => {
-    if (runStatus !== 'running') return undefined
+    let cancelled = false
+    const load = async () => {
+      const [balanceResult, capacityResult] = await Promise.allSettled([
+        sourceWallet ? pools[from].usdcBalance(sourceWallet.address) : Promise.resolve(null),
+        isDeployed(to) ? pools[to].poolUsdcBalance() : Promise.resolve(null),
+      ])
+      if (cancelled) return
+      const error = [balanceResult, capacityResult]
+        .filter((result) => result.status === 'rejected')
+        .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason))
+        .join(' ')
+      setLiveReads({
+        key: readKey,
+        publicBalance: balanceResult.status === 'fulfilled' ? balanceResult.value : null,
+        destinationCapacity: capacityResult.status === 'fulfilled' ? capacityResult.value : null,
+        error,
+      })
+    }
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [from, readKey, sourceWallet, to])
 
-    let activeIndex = 0
-    const interval = window.setInterval(() => {
-      activeIndex += 1
-      if (activeIndex >= progress.length) {
-        setProgress((steps) => steps.map((step) => ({ ...step, status: 'complete' })))
-        setRunStatus('complete')
-        window.clearInterval(interval)
-        return
-      }
-
-      setProgress((steps) =>
-        steps.map((step, index) => ({
-          ...step,
-          status:
-            index < activeIndex
-              ? 'complete'
-              : index === activeIndex
-                ? 'active'
-                : 'idle',
-        })),
-      )
-    }, 1100)
-
-    return () => window.clearInterval(interval)
-  }, [runStatus, progress.length])
-
-  const beginSimulation = () => {
-    setProgress(
-      mockBridgeAdapter.createProgress().map((step, index) => ({
-        ...step,
-        status: index === 0 ? ('active' as const) : ('idle' as const),
-      })),
+  const updateProgress = (step: FlowStepId, status: TransferProgressStep['status'], description?: string) => {
+    setProgress((current) =>
+      current.map((item) =>
+        item.id === step ? { ...item, status, description: description ?? item.description } : item,
+      ),
     )
-    setRunStatus('running')
-    setReviewOpen(false)
   }
 
-  const resetSimulation = () => {
-    setProgress(mockBridgeAdapter.createProgress())
+  const execute = async (next: Transfer) => {
+    setTransfer({ ...next })
+    setProgress(createProgress(next.from, next.to, next))
+    setRunStatus('running')
+    setReviewOpen(false)
+    try {
+      await runTransfer(next, (step, status, description) => {
+        updateProgress(step, status, description)
+        setTransfer({ ...next })
+      })
+      setTransfer({ ...next })
+      setRunStatus('complete')
+    } catch {
+      setTransfer({ ...next })
+      setRunStatus('failed')
+    }
+  }
+
+  const beginTransfer = () => {
+    if (!sourceWallet || !destinationWallet || !messageAmount || !canReview) return
+    const next = createTransfer({
+      from,
+      to,
+      amount: messageAmount,
+      sender: sourceWallet.address,
+      claimer: destinationWallet.address,
+      recipient: recipientValue.trim(),
+    })
+    void execute(next)
+  }
+
+  const resetTransfer = () => {
+    setTransfer(null)
+    setProgress(createProgress(from, to))
     setRunStatus('idle')
+    setAmount('')
+    setRecipient(destinationWallet?.address ?? '')
   }
 
   const reverseRoute = () => {
-    setFrom(to)
-    setRecipient('')
-    resetSimulation()
+    if (runStatus === 'running') return
+    const nextFrom = to
+    const nextTo = from
+    setFrom(nextFrom)
+    setTransfer(null)
+    setProgress(createProgress(nextFrom, nextTo))
+    setRunStatus('idle')
+    setAmount('')
+    setRecipient(wallets[nextTo]?.address ?? '')
   }
+
+  const useMaximum = () => {
+    if (publicBalance === null) return
+    setAmount(formatMessage(publicBalance / protocol.scale[from]))
+  }
+
+  const currentError = transfer?.error ?? readError
+  const amountLabel = messageAmount && messageAmount > 0n ? formatMessage(messageAmount) : '0.00'
+  const latestCanResume = Boolean(
+    transfer &&
+      transfer.status !== 'withdrawn' &&
+      transfer.status !== 'refunded' &&
+      sourceWallet?.address === transfer.sender &&
+      destinationWallet?.address === transfer.claimer &&
+      deploymentReady &&
+      runStatus !== 'running',
+  )
 
   return (
     <div className="page-enter">
@@ -135,109 +226,68 @@ function BridgePage() {
         <div className="mx-auto mb-4 flex w-fit items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
           <span className="h-px w-6 bg-accent/60" />
           <NetworkRouteMark from={from} to={to} />
-          {networkMeta[from].shortName} → {networkMeta[to].shortName}
+          Self-bridge · {networkMeta[from].shortName} → {networkMeta[to].shortName}
           <span className="h-px w-6 bg-accent/60" />
         </div>
-        <h1 className="text-balance text-4xl font-medium tracking-[-0.055em] sm:text-5xl">
-          One transfer. Clear boundaries.
-        </h1>
-        <p className="mx-auto mt-5 max-w-xl text-sm leading-6 text-muted">
-          A public source deposit funds a public destination payout. The target protocol
-          protects the link between them — not the on-chain actions themselves.
-        </p>
+        <h1 className="text-balance text-4xl font-medium tracking-[-0.055em] sm:text-5xl">Move your USDC. Break the public link.</h1>
+        <p className="mx-auto mt-5 max-w-xl text-sm leading-6 text-muted">Move value between wallets you control. Deposits and withdrawals stay public; Groth16 proofs hide the protocol-level link between the two pool positions.</p>
       </div>
 
-      <div className="mx-auto grid max-w-[980px] items-start gap-5 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,0.65fr)]">
-        <section
-          aria-labelledby="transfer-title"
-          className="hairline-card relative overflow-hidden rounded-[2rem] border border-border bg-surface"
-        >
+      <div className="mx-auto grid max-w-[1040px] items-start gap-5 lg:grid-cols-[minmax(0,1.38fr)_minmax(300px,0.62fr)]">
+        <section aria-labelledby="transfer-title" className="hairline-card relative overflow-hidden rounded-[2rem] border border-border bg-surface">
           <Spotlight className="-right-44 -top-52" />
           <div className="relative flex items-center justify-between gap-4 border-b border-border px-5 py-5 sm:px-7">
             <div>
-              <h2 id="transfer-title" className="text-base font-semibold tracking-[-0.02em]">
-                New test transfer
-              </h2>
-              <p className="mt-1 text-xs text-subtle">Review everything before the simulated flow.</p>
+              <h2 id="transfer-title" className="text-base font-semibold tracking-[-0.02em]">Private self-transfer</h2>
+              <p className="mt-1 text-xs text-subtle">Testnet contracts · real wallet confirmations and proofs</p>
             </div>
-            <span className="rounded-full border border-warning/25 bg-warning/[0.06] px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.12em] text-warning">
-              Prototype
-            </span>
+            <span className="rounded-full border border-accent/25 bg-accent/[0.06] px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.12em] text-accent">Testnet</span>
           </div>
 
           <div className="relative space-y-6 p-5 sm:p-7">
             <div>
-              <div className="mb-3 flex items-center justify-between">
-                <span className="text-xs font-medium text-muted">Wallet for this transfer</span>
-                <span className="text-[10px] text-subtle">One required · one optional</span>
+              <div className="mb-3 flex items-center justify-between gap-4">
+                <span className="text-xs font-medium text-muted">Wallets you control</span>
+                <span className="text-[10px] text-subtle">Both required for now</span>
               </div>
               <div className="grid gap-2 sm:grid-cols-2">
                 {([from, to] as NetworkId[]).map((network) => {
                   const connection = wallets[network]
                   const isConnecting = connecting === network
                   const isSource = network === from
-
                   return (
                     <button
                       key={network}
                       type="button"
                       onClick={() => setWalletDialogNetwork(network)}
-                      className={cn(
-                        'focus-ring flex min-h-18 items-center gap-3 rounded-2xl border bg-background/55 px-3.5 text-left transition-colors hover:border-border-strong',
-                        isSource ? 'border-accent/30' : 'border-border',
-                      )}
+                      className={cn('focus-ring flex min-h-20 items-center gap-3 rounded-2xl border bg-background/55 px-3.5 text-left transition-colors hover:border-border-strong', connection ? 'border-success/25' : isSource ? 'border-accent/30' : 'border-border')}
                     >
                       <NetworkMark network={network} />
                       <span className="min-w-0 flex-1">
-                        <span className={cn('block text-[9px] font-semibold uppercase tracking-[0.1em]', isSource ? 'text-accent' : 'text-subtle')}>
-                          {isSource ? 'Sender · required' : 'Recipient · optional'}
-                        </span>
-                        <span className="mt-1 block truncate text-xs font-medium text-foreground">
-                          {connection
-                            ? truncateAddress(connection.address)
-                            : isConnecting
-                              ? 'Waiting for wallet…'
-                              : `Connect ${networkMeta[network].wallet}`}
-                        </span>
+                        <span className={cn('block text-[9px] font-semibold uppercase tracking-[0.1em]', isSource ? 'text-accent' : 'text-subtle')}>{isSource ? 'Source · deposit + bridge out' : 'Destination · claim + withdraw'}</span>
+                        <span className="mt-1 block truncate text-xs font-medium text-foreground">{connection ? truncateAddress(connection.address) : isConnecting ? 'Waiting for wallet…' : `Connect ${networkMeta[network].wallet}`}</span>
                       </span>
-                      {isConnecting ? (
-                        <LoaderCircle aria-hidden="true" className="size-4 animate-spin text-accent" />
-                      ) : connection ? (
-                        <CheckCircle2 aria-hidden="true" className="size-4 text-success" />
-                      ) : (
-                        <ArrowRight aria-hidden="true" className="size-4 text-subtle" />
-                      )}
+                      {isConnecting ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin text-accent" /> : connection ? <CheckCircle2 aria-hidden="true" className="size-4 text-success" /> : <ArrowRight aria-hidden="true" className="size-4 text-subtle" />}
                     </button>
                   )
                 })}
               </div>
-              <p className="mt-3 text-[10px] leading-4 text-subtle">
-                The source wallet would authorize the send. The recipient only needs a public
-                destination address; connecting its wallet is a convenience, not a requirement.
-              </p>
+              <p className="mt-3 text-[10px] leading-4 text-subtle">The destination wallet currently submits the claim and withdrawal. A relayer will remove that visible fee-payer link later.</p>
             </div>
 
             <div className="overflow-hidden rounded-[1.75rem] border border-border bg-background/55">
               <div className="grid grid-cols-[1fr_auto_1fr] items-center border-b border-border px-4 py-5 sm:px-6">
                 <div className="flex min-w-0 flex-col items-center text-center">
                   <NetworkMark network={from} className="size-12 rounded-[18px]" />
-                  <p className="mt-3 text-[9px] font-semibold uppercase tracking-[0.15em] text-accent">You send</p>
+                  <p className="mt-3 text-[9px] font-semibold uppercase tracking-[0.15em] text-accent">From your wallet</p>
                   <p className="mt-1 truncate text-xs font-medium">{networkMeta[from].shortName}</p>
                 </div>
-
-                <button
-                  type="button"
-                  aria-label={`Reverse route to ${networkMeta[to].shortName} to ${networkMeta[from].shortName}`}
-                  title="Reverse transfer direction"
-                  onClick={reverseRoute}
-                  className="focus-ring group mx-3 grid size-11 place-items-center rounded-full border border-border-strong bg-surface-raised text-muted transition-colors hover:border-accent/45 hover:text-accent sm:mx-8"
-                >
+                <button type="button" disabled={runStatus === 'running'} aria-label={`Reverse route to ${networkMeta[to].shortName} to ${networkMeta[from].shortName}`} title="Reverse transfer direction" onClick={reverseRoute} className="focus-ring group mx-3 grid size-11 place-items-center rounded-full border border-border-strong bg-surface-raised text-muted transition-colors hover:border-accent/45 hover:text-accent disabled:opacity-40 sm:mx-8">
                   <Repeat2 key={from} aria-hidden="true" className="route-turn size-4" />
                 </button>
-
                 <div className="flex min-w-0 flex-col items-center text-center">
                   <NetworkMark network={to} className="size-12 rounded-[18px]" />
-                  <p className="mt-3 text-[9px] font-semibold uppercase tracking-[0.15em] text-subtle">They receive</p>
+                  <p className="mt-3 text-[9px] font-semibold uppercase tracking-[0.15em] text-subtle">To your wallet</p>
                   <p className="mt-1 truncate text-xs font-medium">{networkMeta[to].shortName}</p>
                 </div>
               </div>
@@ -245,259 +295,110 @@ function BridgePage() {
               <div className="px-5 py-6 sm:px-7">
                 <div className="flex items-center justify-between gap-4">
                   <label htmlFor="bridge-amount" className="text-[10px] font-medium text-subtle">Amount</label>
-                  <span className="text-[10px] text-subtle">Balance · 1,250.00 USDC</span>
+                  <span className="text-right text-[10px] text-subtle">Public {publicBalance === null ? '—' : formatNote(from, publicBalance)} · Private {formatNote(from, privateBalance)} USDC</span>
                 </div>
                 <div className="mt-3 flex items-end gap-3">
-                  <input
-                    id="bridge-amount"
-                    inputMode="decimal"
-                    value={amount}
-                    onChange={(event) => setAmount(event.target.value.replace(/[^0-9.]/g, ''))}
-                    className="min-w-0 flex-1 bg-transparent text-4xl font-medium tracking-[-0.06em] outline-none placeholder:text-subtle sm:text-5xl"
-                    placeholder="0.00"
-                  />
-                  <button
-                    type="button"
-                    className="focus-ring mb-1 rounded-full border border-border px-3 py-1.5 text-[10px] font-semibold text-accent hover:border-accent/40"
-                    onClick={() => setAmount('1250')}
-                  >
-                    MAX
-                  </button>
+                  <input id="bridge-amount" inputMode="decimal" value={amount} disabled={runStatus === 'running'} onChange={(event) => setAmount(event.target.value.replace(/[^0-9.]/g, ''))} className="min-w-0 flex-1 bg-transparent text-4xl font-medium tracking-[-0.06em] outline-none placeholder:text-subtle disabled:opacity-60 sm:text-5xl" placeholder="0.00" />
+                  <button type="button" disabled={publicBalance === null || runStatus === 'running'} className="focus-ring mb-1 rounded-full border border-border px-3 py-1.5 text-[10px] font-semibold text-accent hover:border-accent/40 disabled:opacity-40" onClick={useMaximum}>MAX</button>
                   <span className="mb-1 rounded-full bg-surface-raised px-3 py-1.5 text-xs font-semibold">USDC</span>
                 </div>
-                <div className="mt-5 flex items-center justify-between border-t border-border pt-4 text-[11px]">
-                  <span className="text-subtle">Estimated at destination</span>
-                  <span className="font-mono">≈ {compactNumber.format(quote.amountOut)} USDC</span>
-                </div>
-                <div className="mt-2 flex items-center justify-between text-[10px]">
-                  <span className="text-subtle">Illustrative {networkMeta[to].shortName} capacity</span>
-                  <span className="font-mono text-muted">{compactNumber.format(routeCapacity[to])} USDC</span>
-                </div>
+                {amount && messageAmount === null && <p className="mt-3 text-[10px] text-danger">Use at most 6 decimal places. Bridge amounts are exact and never rounded.</p>}
+                <div className="mt-5 flex items-center justify-between border-t border-border pt-4 text-[11px]"><span className="text-subtle">Received after claim + withdrawal</span><span className="font-mono">{amountLabel} USDC</span></div>
+                <div className="mt-2 flex items-center justify-between text-[10px]"><span className="text-subtle">Live destination pool balance</span><span className="font-mono text-muted">{destinationCapacity === null ? 'Unavailable' : `${formatNote(to, destinationCapacity)} USDC`}</span></div>
               </div>
 
               <div className="border-t border-border px-5 py-5 sm:px-7">
-                <label htmlFor="recipient" className="block text-[10px] font-medium text-subtle">
-                  Receiving {networkMeta[to].shortName} address
-                </label>
+                <label htmlFor="recipient" className="block text-[10px] font-medium text-subtle">Your public {networkMeta[to].shortName} withdrawal address</label>
                 <div className="mt-3 flex items-center rounded-xl border border-border bg-surface/60 px-3 focus-within:border-accent/50">
-                  <input
-                    id="recipient"
-                    value={recipient}
-                    onChange={(event) => setRecipient(event.target.value)}
-                    aria-invalid={recipient.length > 0 && !recipientIsValid}
-                    className="min-w-0 flex-1 bg-transparent py-3 font-mono text-xs outline-none placeholder:text-subtle"
-                    placeholder={to === 'stellar' ? 'G…' : '0x…'}
-                  />
-                  <button
-                    type="button"
-                    aria-label={`Use a demo ${networkMeta[to].shortName} recipient`}
-                    title="Use demo recipient"
-                    className="focus-ring rounded-lg p-2 text-subtle hover:text-foreground"
-                    onClick={() => setRecipient(
-                      to === 'stellar'
-                        ? 'GCFX4N6W4FZDB3A7XUVKQ5BIRXW3S2E5HUEXAMPLEADDR'
-                        : '0x1111111111111111111111111111111111111111',
-                    )}
-                  >
-                    <Copy aria-hidden="true" className="size-4" />
-                  </button>
+                  <input id="recipient" value={recipientValue} disabled={runStatus === 'running'} onChange={(event) => setRecipient(event.target.value)} aria-invalid={recipientValue.length > 0 && !recipientIsValid} className="min-w-0 flex-1 bg-transparent py-3 font-mono text-xs outline-none placeholder:text-subtle disabled:opacity-60" placeholder={to === 'stellar' ? 'G…' : '0x…'} />
+                  {destinationWallet && <button type="button" className="focus-ring rounded-lg px-2 py-1 text-[10px] font-medium text-accent hover:text-accent-strong" onClick={() => setRecipient(destinationWallet.address)}>Use wallet</button>}
                 </div>
-                {recipient.length > 0 && !recipientIsValid && (
-                  <p className="mt-2 text-[10px] text-danger">
-                    {to === 'stellar'
-                      ? 'Enter a Stellar public address beginning with G.'
-                      : 'Enter a 42-character Ethereum address beginning with 0x.'}
-                  </p>
-                )}
-                {wallets[to] && recipient !== wallets[to]?.address && (
-                  <button
-                    type="button"
-                    className="focus-ring mt-2 rounded-md text-[10px] font-medium text-accent hover:text-accent-strong"
-                    onClick={() => setRecipient(wallets[to]?.address ?? '')}
-                  >
-                    Use connected {networkMeta[to].wallet} address
-                  </button>
-                )}
-                {wallets[to] && recipient === wallets[to]?.address && (
-                  <p className="mt-2 flex items-center gap-1.5 text-[10px] text-success">
-                    <CheckCircle2 aria-hidden="true" className="size-3" />
-                    Filled from connected {networkMeta[to].wallet}
-                  </p>
-                )}
+                {recipientValue.length > 0 && !recipientIsValid && <p className="mt-2 text-[10px] text-danger">Enter a valid {networkMeta[to].shortName} public address.</p>}
+                {destinationWallet && recipientValue === destinationWallet.address && <p className="mt-2 flex items-center gap-1.5 text-[10px] text-success"><CheckCircle2 aria-hidden="true" className="size-3" />Matches the connected destination wallet</p>}
               </div>
             </div>
+
+            {!deploymentReady && (
+              <div role="status" className="flex items-start gap-3 rounded-2xl border border-warning/20 bg-warning/[0.055] p-4 text-[11px] leading-5 text-muted">
+                <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
+                <p><span className="font-medium text-foreground">Sepolia pool is not deployed yet.</span> Contract reads that do not require it remain available, but sending is disabled until `deployments.json` contains `sepolia.zkross`.</p>
+              </div>
+            )}
 
             <div className="grid gap-2 text-xs sm:grid-cols-2">
-              <div className="rounded-2xl border border-border bg-background/40 p-4">
-                <p className="text-[10px] text-subtle">Settlement visibility</p>
-                <p className="mt-2 flex items-center gap-2 font-medium">
-                  <Info aria-hidden="true" className="size-3.5 text-muted" />
-                  Deposit + payout are public
-                </p>
-              </div>
-              <div className="rounded-2xl border border-border bg-background/40 p-4">
-                <p className="text-[10px] text-subtle">Link protection</p>
-                <p className="mt-2 flex items-center gap-2 font-medium">
-                  <LockKeyhole aria-hidden="true" className="size-3.5 text-warning" />
-                  Planned · circuit missing
-                </p>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-border bg-background/35 p-4 text-xs">
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-subtle">Estimated received</span>
-                <span className="font-mono font-medium">{compactNumber.format(quote.amountOut)} USDC</span>
-              </div>
-              <div className="mt-2 flex items-center justify-between gap-4">
-                <span className="text-subtle">Illustrative fees</span>
-                <span className="font-mono text-muted">{compactNumber.format(quote.networkFee + quote.protocolFee)} USDC</span>
-              </div>
-              <div className="mt-2 flex items-center justify-between gap-4">
-                <span className="text-subtle">Destination vault capacity</span>
-                <span className="font-mono text-muted">{compactNumber.format(routeCapacity[to])} USDC</span>
-              </div>
-              <div className="mt-2 flex items-center justify-between gap-4">
-                <span className="text-subtle">Simulation duration</span>
-                <span className="font-mono text-muted">~4 seconds</span>
-              </div>
+              <div className="rounded-2xl border border-border bg-background/40 p-4"><p className="text-[10px] text-subtle">Public boundary</p><p className="mt-2 flex items-center gap-2 font-medium"><Info aria-hidden="true" className="size-3.5 text-muted" />Entry + final exit stay visible</p></div>
+              <div className="rounded-2xl border border-success/20 bg-success/[0.035] p-4"><p className="text-[10px] text-subtle">Proof system</p><p className="mt-2 flex items-center gap-2 font-medium"><LockKeyhole aria-hidden="true" className="size-3.5 text-success" />Circom + Groth16 active</p></div>
             </div>
 
             <details className="group rounded-2xl border border-border bg-background/30 px-4 py-3">
-              <summary className="focus-ring flex cursor-pointer list-none items-center justify-between rounded-lg text-xs font-medium">
-                Advanced protocol details
-                <ChevronDown aria-hidden="true" className="size-4 text-subtle transition-transform group-open:rotate-180" />
-              </summary>
+              <summary className="focus-ring flex cursor-pointer list-none items-center justify-between rounded-lg text-xs font-medium">Advanced protocol details<ChevronDown aria-hidden="true" className="size-4 text-subtle transition-transform group-open:rotate-180" /></summary>
               <dl className="mt-4 space-y-3 border-t border-border pt-4 text-[11px]">
-                <div className="flex justify-between gap-4">
-                  <dt className="text-subtle">Ethereum chain ID</dt>
-                  <dd className="font-mono">11155111 · Sepolia</dd>
-                </div>
-                <div className="flex justify-between gap-4">
-                  <dt className="text-subtle">Stellar network</dt>
-                  <dd className="font-mono">TESTNET</dd>
-                </div>
-                <div className="flex justify-between gap-4">
-                  <dt className="text-subtle">Bridge contract</dt>
-                  <dd>Not connected</dd>
-                </div>
-                <div className="flex justify-between gap-4">
-                  <dt className="text-subtle">Circuit</dt>
-                  <dd>Not connected</dd>
-                </div>
-                <div className="flex justify-between gap-4">
-                  <dt className="text-subtle">Public event policy</dt>
-                  <dd>Not implemented</dd>
-                </div>
+                <div className="flex justify-between gap-4"><dt className="text-subtle">Chain IDs</dt><dd className="text-right font-mono">11155111 · {chainId('stellar').toString()}</dd></div>
+                <div className="flex justify-between gap-4"><dt className="text-subtle">Source pool</dt><dd className="max-w-[65%] break-all text-right font-mono">{poolAddress(from) ?? 'Not deployed'}</dd></div>
+                <div className="flex justify-between gap-4"><dt className="text-subtle">Destination pool</dt><dd className="max-w-[65%] break-all text-right font-mono">{poolAddress(to) ?? 'Not deployed'}</dd></div>
+                <div className="flex justify-between gap-4"><dt className="text-subtle">Circuits</dt><dd className="text-right">bridge_out · bridge_in · policy_tx_2_2_gvk_T</dd></div>
+                <div className="flex justify-between gap-4"><dt className="text-subtle">Admin visibility</dt><dd className="text-right">Traceable Global View Key</dd></div>
               </dl>
             </details>
 
-            <Button
-              variant="accent"
-              size="lg"
-              className="w-full"
-              disabled={Boolean(wallets[from]) && !canReview}
-              onClick={() => wallets[from] ? setReviewOpen(true) : setWalletDialogNetwork(from)}
-            >
-              <ShieldCheck aria-hidden="true" />
-              {wallets[from]
-                ? recipientIsValid
-                  ? 'Review test transfer'
-                  : `Enter ${networkMeta[to].shortName} recipient`
-                : `Connect ${networkMeta[from].wallet} to send`}
-            </Button>
-            <p className="text-center text-[10px] leading-4 text-subtle">
-              Never enter a private key or seed phrase. This prototype never requests one.
-            </p>
+            {currentError && <div role="alert" className="rounded-2xl border border-danger/25 bg-danger/[0.055] p-4 text-[11px] leading-5 text-danger">{currentError}</div>}
+
+            {latestCanResume && transfer ? (
+              <div className="grid gap-2 sm:grid-cols-2">
+                <Button variant="secondary" size="lg" onClick={resetTransfer}><RotateCcw aria-hidden="true" />New transfer</Button>
+                <Button variant="accent" size="lg" onClick={() => void execute(transfer)}><ShieldCheck aria-hidden="true" />Resume transfer</Button>
+              </div>
+            ) : (
+              <Button
+                variant="accent"
+                size="lg"
+                className="w-full"
+                disabled={Boolean(sourceWallet && destinationWallet) && !canReview}
+                onClick={() => {
+                  if (!sourceWallet) setWalletDialogNetwork(from)
+                  else if (!destinationWallet) setWalletDialogNetwork(to)
+                  else if (canReview) setReviewOpen(true)
+                }}
+              >
+                <ShieldCheck aria-hidden="true" />
+                {!sourceWallet ? `Connect ${networkMeta[from].wallet}` : !destinationWallet ? `Connect ${networkMeta[to].wallet}` : !deploymentReady ? 'Sepolia pool not deployed' : !messageAmount || messageAmount <= 0n ? 'Enter an amount' : !recipientIsValid ? 'Enter a valid withdrawal address' : 'Review transfer'}
+              </Button>
+            )}
+            <p className="text-center text-[10px] leading-4 text-subtle">Never enter a private key or seed phrase. Note keys are derived from wallet signatures and kept in memory.</p>
           </div>
         </section>
 
         <aside className="space-y-4 lg:sticky lg:top-24">
           <section className="rounded-3xl border border-border bg-surface p-5 sm:p-6" aria-labelledby="progress-title">
             <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-subtle">Prototype trace</p>
-                <h2 id="progress-title" className="mt-2 text-base font-semibold tracking-[-0.02em]">
-                  {runStatus === 'complete' ? 'Local simulation complete' : runStatus === 'running' ? 'Simulating workflow' : 'Ready for review'}
-                </h2>
-              </div>
-              <span
-                aria-hidden="true"
-                className={cn(
-                  'mt-1 size-2 rounded-full',
-                  runStatus === 'complete' ? 'bg-success' : runStatus === 'running' ? 'dot-pulse bg-accent' : 'bg-subtle',
-                )}
-              />
+              <div><p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-subtle">Transfer trace</p><h2 id="progress-title" className="mt-2 text-base font-semibold tracking-[-0.02em]">{runStatus === 'complete' ? 'Transfer withdrawn' : runStatus === 'running' ? 'Transfer in progress' : runStatus === 'failed' ? 'Action required' : transfer ? 'Transfer ready to resume' : 'Ready for review'}</h2></div>
+              <span aria-hidden="true" className={cn('mt-1 size-2 rounded-full', runStatus === 'complete' ? 'bg-success' : runStatus === 'running' ? 'dot-pulse bg-accent' : runStatus === 'failed' ? 'bg-danger' : 'bg-subtle')} />
             </div>
 
             <ol className="mt-6" aria-live="polite">
-              {progress.map((step, index) => (
-                <li key={step.id} className="relative flex gap-3.5 pb-6 last:pb-0">
-                  {index < progress.length - 1 && (
-                    <span
-                      aria-hidden="true"
-                      className={cn(
-                        'absolute left-[9px] top-5 h-[calc(100%-8px)] w-px',
-                        step.status === 'complete' ? 'bg-success/50' : 'bg-border',
-                      )}
-                    />
-                  )}
-                  <span className="relative z-10 mt-0.5 grid size-5 shrink-0 place-items-center rounded-full bg-surface">
-                    {step.status === 'complete' ? (
-                      <span className="grid size-5 place-items-center rounded-full bg-success text-background">
-                        <Check aria-hidden="true" className="size-3" strokeWidth={3} />
-                      </span>
-                    ) : step.status === 'active' ? (
-                      <LoaderCircle aria-hidden="true" className="size-5 animate-spin text-accent" />
-                    ) : (
-                      <Circle aria-hidden="true" className="size-5 text-border-strong" />
-                    )}
-                  </span>
-                  <div>
-                    <p className={cn('text-xs font-medium', step.status === 'idle' ? 'text-muted' : 'text-foreground')}>
-                      {step.label}
-                    </p>
-                    <p className="mt-1 text-[11px] leading-4 text-subtle">{step.description}</p>
-                  </div>
-                </li>
-              ))}
+              {progress.map((step, index) => {
+                const transactions = stepTransactions(transfer, step.id as FlowStepId)
+                return (
+                  <li key={step.id} className="relative flex gap-3.5 pb-6 last:pb-0">
+                    {index < progress.length - 1 && <span aria-hidden="true" className={cn('absolute left-[9px] top-5 h-[calc(100%-8px)] w-px', step.status === 'complete' ? 'bg-success/50' : 'bg-border')} />}
+                    <span className="relative z-10 mt-0.5 grid size-5 shrink-0 place-items-center rounded-full bg-surface">{step.status === 'complete' ? <span className="grid size-5 place-items-center rounded-full bg-success text-background"><Check aria-hidden="true" className="size-3" strokeWidth={3} /></span> : step.status === 'active' ? <LoaderCircle aria-hidden="true" className="size-5 animate-spin text-accent" /> : step.status === 'failed' ? <AlertTriangle aria-hidden="true" className="size-5 text-danger" /> : <Circle aria-hidden="true" className="size-5 text-border-strong" />}</span>
+                    <div className="min-w-0">
+                      <p className={cn('text-xs font-medium', step.status === 'idle' ? 'text-muted' : 'text-foreground')}>{step.label}</p>
+                      <p className="mt-1 text-[11px] leading-4 text-subtle">{step.description}</p>
+                      {transactions.map((tx) => <a key={tx.hash} href={explorer.tx(tx.network, tx.hash)} target="_blank" rel="noreferrer" className="focus-ring mt-2 inline-flex items-center gap-1.5 rounded text-[10px] font-medium text-accent hover:text-accent-strong">{tx.label} · {truncateAddress(tx.hash)}<ExternalLink aria-hidden="true" className="size-3" /></a>)}
+                    </div>
+                  </li>
+                )
+              })}
             </ol>
 
-            {runStatus === 'complete' && (
-              <div className="mt-6 space-y-3">
-                <div className="rounded-2xl border border-success/20 bg-success/[0.055] p-4 text-[11px] leading-5 text-muted">
-                  UI flow completed locally. No transaction hash, proof ID, explorer link,
-                  or on-chain confirmation exists.
-                </div>
-                <details className="group rounded-2xl border border-border px-4 py-3">
-                  <summary className="focus-ring flex cursor-pointer list-none items-center justify-between rounded-lg text-xs font-medium">
-                    Technical details
-                    <ChevronDown aria-hidden="true" className="size-4 text-subtle transition-transform group-open:rotate-180" />
-                  </summary>
-                  <dl className="mt-4 space-y-2 border-t border-border pt-4 text-[10px]">
-                    <div className="flex justify-between gap-3"><dt className="text-subtle">Transaction hash</dt><dd>Not created</dd></div>
-                    <div className="flex justify-between gap-3"><dt className="text-subtle">Proof identifier</dt><dd>Not created</dd></div>
-                    <div className="flex justify-between gap-3"><dt className="text-subtle">Verification</dt><dd>Not performed</dd></div>
-                  </dl>
-                </details>
-                <Button variant="secondary" size="sm" className="w-full" onClick={resetSimulation}>
-                  <RotateCcw aria-hidden="true" />
-                  Reset simulation
-                </Button>
-              </div>
-            )}
+            {runStatus === 'complete' && <div className="mt-6 rounded-2xl border border-success/20 bg-success/[0.055] p-4 text-[11px] leading-5 text-muted">The destination note was claimed and withdrawn. Use the explorer links above to inspect each public boundary.</div>}
           </section>
 
           <section className="rounded-3xl border border-warning/20 bg-warning/[0.045] p-5">
             <div className="flex items-start gap-3">
               <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
-              <div>
-                <p className="text-xs font-medium">Privacy boundary</p>
-                <p className="mt-1 text-[11px] leading-5 text-muted">
-                  Amounts, sender and recipient addresses remain public. The planned proof
-                  protects the note and protocol-level link; timing or amount correlation may remain.
-                </p>
-              </div>
+              <div><p className="text-xs font-medium">What privacy means here</p><p className="mt-1 text-[11px] leading-5 text-muted">Proofs hide the note ownership and direct bridge-out → bridge-in link. Deposit and withdrawal addresses and amounts remain public; timing and unique amounts can still correlate them. Until the relayer exists, the destination wallet also appears as the claim fee payer.</p></div>
             </div>
           </section>
         </aside>
@@ -506,61 +407,33 @@ function BridgePage() {
       <Dialog open={reviewOpen} onOpenChange={setReviewOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Review test transfer</DialogTitle>
-            <DialogDescription>
-              This starts a timed interface simulation only. No additional wallet prompt, signature,
-              proof, transaction, or asset movement will occur.
-            </DialogDescription>
+            <DialogTitle>Review testnet transfer</DialogTitle>
+            <DialogDescription>This submits real testnet transactions. Expect three proofs, several wallet confirmations, and a wait while the remote root is posted.</DialogDescription>
           </DialogHeader>
-
           <div className="rounded-2xl border border-border bg-background/50 p-5">
             <div className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-3">
-                <NetworkMark network={from} />
-                <div>
-                  <p className="text-[10px] uppercase tracking-wider text-subtle">Send</p>
-                  <p className="mt-1 text-sm font-medium">{compactNumber.format(numericAmount)} USDC</p>
-                </div>
-              </div>
+              <div className="flex items-center gap-3"><NetworkMark network={from} /><div><p className="text-[10px] uppercase tracking-wider text-subtle">Your source</p><p className="mt-1 text-sm font-medium">{amountLabel} USDC</p></div></div>
               <ArrowRight aria-hidden="true" className="size-4 text-subtle" />
-              <div className="flex items-center gap-3 text-right">
-                <div>
-                  <p className="text-[10px] uppercase tracking-wider text-subtle">Receive</p>
-                  <p className="mt-1 text-sm font-medium">{compactNumber.format(quote.amountOut)} USDC</p>
-                </div>
-                <NetworkMark network={to} />
-              </div>
+              <div className="flex items-center gap-3 text-right"><div><p className="text-[10px] uppercase tracking-wider text-subtle">Your destination</p><p className="mt-1 text-sm font-medium">{amountLabel} USDC</p></div><NetworkMark network={to} /></div>
             </div>
             <div className="my-5 h-px bg-border" />
             <dl className="space-y-3 text-xs">
               <div className="flex justify-between gap-4"><dt className="text-subtle">Route</dt><dd>{networkMeta[from].name} → {networkMeta[to].name}</dd></div>
-              <div className="flex justify-between gap-4"><dt className="text-subtle">Recipient</dt><dd className="max-w-[230px] truncate font-mono">{recipient}</dd></div>
-              <div className="flex justify-between gap-4"><dt className="text-subtle">On-chain visibility</dt><dd>Public deposit + payout</dd></div>
-              <div className="flex justify-between gap-4"><dt className="text-subtle">ZK link protection</dt><dd className="text-warning">Not active</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">Withdrawal address</dt><dd className="max-w-[230px] truncate font-mono">{recipientValue}</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">Protocol fee</dt><dd>0 USDC</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">Wallet actions</dt><dd>Deposit · bridge out · claim · withdraw</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">ZK link protection</dt><dd className="text-success">Active</dd></div>
             </dl>
           </div>
-
-          <div className="flex items-start gap-3 rounded-2xl border border-warning/20 bg-warning/[0.055] p-4 text-[11px] leading-5 text-muted">
-            <Info aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
-            The completion state will remain a local prototype result, not a blockchain success state.
-          </div>
-
+          <div className="flex items-start gap-3 rounded-2xl border border-warning/20 bg-warning/[0.055] p-4 text-[11px] leading-5 text-muted"><Info aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />This is unaudited testnet software. Do not use mainnet funds. Keep this browser’s note backup until encrypted note delivery is implemented.</div>
           <div className="grid gap-2 sm:grid-cols-2">
             <DialogClose asChild><Button variant="secondary">Back to edit</Button></DialogClose>
-            <Button variant="accent" onClick={beginSimulation}>
-              <FileKey2 aria-hidden="true" />
-              Run local simulation
-            </Button>
+            <Button variant="accent" onClick={beginTransfer}><FileKey2 aria-hidden="true" />Start testnet transfer</Button>
           </div>
         </DialogContent>
       </Dialog>
 
-      <WalletConnectDialog
-        network={walletDialogNetwork}
-        open={Boolean(walletDialogNetwork)}
-        onOpenChange={(open) => !open && setWalletDialogNetwork(null)}
-        purpose={walletDialogNetwork === from ? 'required' : 'optional'}
-      />
+      <WalletConnectDialog network={walletDialogNetwork} open={Boolean(walletDialogNetwork)} onOpenChange={(open) => !open && setWalletDialogNetwork(null)} purpose={walletDialogNetwork === from ? 'required' : 'destination'} />
     </div>
   )
 }
