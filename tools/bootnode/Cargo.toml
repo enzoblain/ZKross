@@ -1,0 +1,84 @@
+[package]
+name = "bootnode"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+repository = "https://github.com/NethermindEth/stellar-private-transactions"
+license = "Apache-2.0"
+publish = true
+
+[lib]
+name = "bootnode"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bootnode"
+path = "bin/bootnode.rs"
+
+[dependencies]
+# workspace
+stellar-private-payments = { path = "../../sdk/native", version = "0.2.1" }
+
+# external
+sha2 = "0.11.0"
+anyhow = { version = "1", default-features = false }
+async-trait = { version = "0.1.92", default-features = false }
+axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
+axum-server = "0.8.0"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+deadpool-postgres = "0.14.2"
+http-body-util = "0.1.5"
+jsonrpsee = { version = "0.26.1", default-features = false, features = ["server", "macros"] }
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+opentelemetry = { version = "0.33.0", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["rt-tokio", "trace"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rustls-acme = { version = "0.15.4", default-features = false, features = ["axum", "ring", "webpki-roots"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false }
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["cors", "set-header", "trace"] }
+tower_governor = "0.8.0"
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+
+[dev-dependencies]
+stellar-xdr = { version = "28.0.0", default-features = false, features = ["base64", "std"] }
+# workspace
+stellar-private-payments = { path = "../../sdk/native", version = "0.2.1" }
+
+# external
+getrandom = { version = "0.4", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false }
+
+[lints.rust]
+missing_docs = "allow"
+unsafe_code = "deny"
+
+[lints.clippy]
+arithmetic_side_effects = "deny"
+cast_lossless = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+cast_sign_loss = "deny"
+needless_return = "deny"
+panicking_overflow_checks = "deny"
+unwrap_used = "deny"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

@@ -1,0 +1,495 @@
+import { closeAndReload } from './storage-lock.js';
+import { startAutoLock, loadAutoLockSetting, clearAutoLockSetting } from './storage-timeout.js';
+/**
+ * Browser runtime facade — single entry for SDK `Storage`, `Client`, `Account`, and app persistence.
+ *
+ * Lifecycle: `bootnodeCheck` / `bootnodeRequired` → `initializeRuntime` →
+ * `client().backgroundSync` → `client().openAccount` → `account().pool`.
+ *
+ * Privacy key reads use the SDK (`account().privacyKeys`, `account().aspSecret`, etc.).
+ * App-only persistence (disclaimer, explorer, bootnode, op history, key probe) stays on `storage()`.
+ */
+
+import init, {
+  Client,
+  parseTokenAmount,
+  readTokenDecimals as sdkReadTokenDecimals,
+  DisclosureRequest,
+  Storage,
+  bootnodeRequired as sdkBootnodeRequired,
+  deriveAspUserLeaf as sdkDeriveAspUserLeaf,
+  verifySelectiveDisclosure as sdkVerifySelectiveDisclosure,
+  configureTelemetry,
+  dump_recent_logs,
+  debugLogsEnabled as sdkDebugLogsEnabled,
+} from 'stellar-private-payments';
+import { FreighterSigner } from 'stellar-private-payments/freighter';
+
+import { deploymentDefaults, networkPresentation } from './network-config.js';
+import { AppStorage } from './app-storage.js';
+import { openWalletStorage } from './storage-key.js';
+import { confirmStorageAccount } from './storage-account-dialog.js';
+import { verifyStorageSignature } from './storage-signature.js';
+import { migratePrivateSigners } from './private-signers.js';
+import { STORAGE_RECORD_KEY, exportStorageBackup, importStorageBackup, parseBackup, resetStorage, hasEncryptedStorage, hasLegacyPlaintextStorage, removeLegacyPlaintextStorage, acquireStorageLease } from './storage-backup.js';
+import { getWalletAddress, signWalletMessage, startWalletWatcher } from './wallet.js';
+import { StrKey } from '@stellar/stellar-sdk';
+// Trunk bundles the selected deployment's trusted fingerprints into the app.
+import circuitLock from 'app-circuit-lock';
+
+export { DisclosureRequest, parseTokenAmount };
+
+const DEPLOYMENT_CONFIG_URL = new URL('./deployments.json', document.baseURI).href;
+const CIRCUITS_BASE_URL = new URL(
+  './js/stellar-private-payments/dist/circuits/',
+  window.location.href,
+).href;
+
+let storageHandle = null;
+let stopAutoLock = null;
+let storageLocking = false;
+export const STORAGE_STATE_EVENT = 'spp:storage-state';
+const LOCKED_SESSION_KEY = 'spp.storageLocked';
+export function storageWasLocked() {
+    return sessionStorage.getItem(LOCKED_SESSION_KEY) === 'true';
+}
+export function isStorageUnlocked() { return !!storageHandle && !storageLocking; }
+function setStorageState(state) {
+    document.body.dataset.storageState = state;
+    window.dispatchEvent(new Event(STORAGE_STATE_EVENT));
+}
+
+/** Close the worker, then reload to discard all decrypted UI and WASM state. */
+export async function lockStorage() {
+    if (storageLocking) return;
+    storageLocking = true;
+    sessionStorage.setItem(LOCKED_SESSION_KEY, 'true');
+    stopAutoLock?.();
+    stopAutoLock = null;
+    clearAutoLockSetting();
+    disposeClient();
+    setStorageState('locking');
+    // Cover decrypted content immediately, including dialogs and settings.
+    document.body.inert = true;
+    document.body.style.visibility = 'hidden';
+    const handle = storageHandle;
+    storageHandle = null;
+    appStorageInstance = null;
+    await closeAndReload(handle);
+}
+
+let storageOpening = null;
+let appStorageInstance = null;
+let wrappedClient = null;
+let boundAccount = null;
+let wasmReady = false;
+let currentRpcUrl = null;
+let currentBootnodeUrl = null;
+let boundUserAddress = null;
+let boundSignerAddress = null;
+let deploymentConfigPromise = null;
+
+export async function ensureWasmInit() {
+    if (!wasmReady) {
+        await init();
+        wasmReady = true;
+    }
+}
+
+/** Load the app deployment config served at `/deployments.json`. */
+export async function loadDeploymentConfig() {
+    if (!deploymentConfigPromise) {
+        deploymentConfigPromise = fetch(DEPLOYMENT_CONFIG_URL)
+            .then(async (res) => {
+                if (!res.ok) {
+                    throw new Error(
+                        `failed to load deployment config from ${DEPLOYMENT_CONFIG_URL}`,
+                    );
+                }
+                const config = await res.json();
+                Object.assign(deploymentDefaults, {
+                    network: config.network,
+                    rpcUrl: config.rpcUrl,
+                    ...networkPresentation(config),
+                });
+                return config;
+            })
+            .catch((err) => {
+                deploymentConfigPromise = null;
+                throw err;
+            });
+    }
+    return deploymentConfigPromise;
+}
+
+export function circuitsBaseUrl() {
+    return CIRCUITS_BASE_URL;
+}
+
+function wrapSdkClient(sdk) {
+    return {
+        ...sdk,
+        contractConfig() {
+            return sdk.contractConfig();
+        },
+        storage() {
+            if (!appStorageInstance) {
+                throw new Error('Storage not ready. Call ensureStorage or initializeRuntime first.');
+            }
+            return appStorageInstance;
+        },
+        async backgroundSync() {
+            await sdk.backgroundSync();
+        },
+        async sync() {
+            await sdk.sync();
+        },
+        stopBackgroundSync() {
+            sdk.stopBackgroundSync();
+        },
+        async openAccount(
+            { networkPassphrase, userAddress, signerAddress },
+            signer = new FreighterSigner(),
+        ) {
+            const effectiveSigner = signerAddress ?? userAddress;
+            if (
+                boundUserAddress === userAddress &&
+                boundSignerAddress === effectiveSigner &&
+                boundAccount
+            ) {
+                return boundAccount;
+            }
+
+            boundAccount = await sdk.account(
+                {
+                    networkPassphrase,
+                    userAddress,
+                    signerAddress: effectiveSigner,
+                },
+                signer,
+            );
+            boundUserAddress = userAddress;
+            boundSignerAddress = effectiveSigner;
+            return boundAccount;
+        },
+        account() {
+            if (!boundAccount) {
+                throw new Error('Account session not open. Call openAccount() first.');
+            }
+            return {
+                portfolio: () => boundAccount.portfolio(),
+                privacyKeys: () => boundAccount.privacyKeys(),
+                derivePrivacyKeys: () => boundAccount.derivePrivacyKeys(),
+                aspSecret: () => boundAccount.aspSecret(),
+                userNotes: (limit) => boundAccount.userNotes(limit),
+                isRegistered: () => boundAccount.isRegistered(),
+                registerPublicKeys: () => boundAccount.registerPublicKeys(),
+                deriveAspUserLeaf: () => boundAccount.deriveAspUserLeaf(),
+                pool: (options) => boundAccount.pool(options),
+            };
+        },
+    };
+}
+
+async function openWrappedClient(sdkStorage, rpcUrl, bootnodeUrl) {
+    const contractConfig = await loadDeploymentConfig();
+    const sdk = await Client.new({
+        storage: sdkStorage,
+        rpcUrl,
+        bootnodeUrl: bootnodeUrl ?? undefined,
+        contractConfig,
+        circuitsBaseUrl: circuitsBaseUrl(),
+        circuitLock,
+    });
+    return wrapSdkClient(sdk);
+}
+
+/** Stop background sync and drop the in-memory client/account (e.g. disconnect or rebuild). */
+export function disposeClient() {
+    try {
+        wrappedClient?.stopBackgroundSync?.();
+    } catch {
+        // Client may already be tearing down.
+    }
+    wrappedClient = null;
+    boundAccount = null;
+    boundUserAddress = null;
+    boundSignerAddress = null;
+}
+
+/**
+ * Open local persistence (and app storage helpers) without building a Client.
+ * @returns {Promise<import('./app-storage.js').AppStorage>}
+ */
+export async function ensureStorage({ unlock = false } = {}) {
+    if (storageWasLocked() && !unlock) throw new Error('Local data is locked. Use Unlock to continue.');
+    if (storageLocking) throw new Error('Storage is locking.');
+    await ensureWasmInit();
+    if (!storageHandle) {
+        if (!storageOpening) {
+            setStorageState('unlocking');
+            storageOpening = openWalletStorage({
+                ...walletStorageOptions(),
+                hasExistingStorage: async () => hasEncryptedStorage(await navigator.storage.getDirectory()),
+            }).then(async handle => {
+                const settings = new AppStorage(handle);
+                try {
+                    await loadAutoLockSetting(settings);
+                    await migratePrivateSigners(settings);
+                } catch (error) {
+                    await handle.close().catch(() => {});
+                    clearAutoLockSetting();
+                    throw error;
+                }
+                appStorageInstance = settings;
+                storageHandle = handle;
+                sessionStorage.removeItem(LOCKED_SESSION_KEY);
+                stopAutoLock = startAutoLock(() => void lockStorage());
+                await checkLegacyPlaintextStorage().catch(() => {});
+                setStorageState('ready');
+                installStoragePauseOnUnload();
+            }).catch(error => {
+                if (error?.code === 'storage-recovery-required') document.body.dataset.storageRecovery = 'required';
+                setStorageState('locked');
+                throw error;
+            }).finally(() => { storageOpening = null; });
+        }
+        await storageOpening;
+    }
+    return appStorageInstance;
+}
+
+function walletStorageOptions() {
+    return {
+        storage: Storage,
+        confirmAccount: details => confirmStorageAccount({ ...details, watchAccount: startWalletWatcher }),
+        getAddress: getWalletAddress,
+        signMessage: signWalletMessage,
+        verifySignature: (address, message, signature) =>
+            verifyStorageSignature(StrKey.decodeEd25519PublicKey(address), message, signature),
+    };
+}
+
+export async function checkLegacyPlaintextStorage() {
+    const root = await navigator.storage?.getDirectory?.();
+    if (!root) return false;
+    const present = await hasLegacyPlaintextStorage(root);
+    if (present) document.body.dataset.legacyStorage = 'present';
+    else delete document.body.dataset.legacyStorage;
+    window.dispatchEvent(new Event(STORAGE_STATE_EVENT));
+    return present;
+}
+
+export async function deleteLegacyStorage() {
+    const root = await navigator.storage.getDirectory();
+    await removeLegacyPlaintextStorage(root);
+    delete document.body.dataset.legacyStorage;
+    window.dispatchEvent(new Event(STORAGE_STATE_EVENT));
+}
+
+export async function manageStorageBackup(action, text) {
+    if (storageOpening || storageLocking) throw new Error('Wait for the current storage operation to finish.');
+    // Each action closes open storage itself before touching its files.
+    const wasUnlocked = isStorageUnlocked();
+    const backup = action === 'import' ? parseBackup(text) : null;
+    if (!['export', 'import', 'reset'].includes(action)) throw new Error('Unknown storage action.');
+    storageLocking = true;
+    if (wasUnlocked || action !== 'export') sessionStorage.setItem(LOCKED_SESSION_KEY, 'true');
+    setStorageState('locking');
+    try {
+        await ensureWasmInit();
+        return await navigator.locks.request(STORAGE_RECORD_KEY, { mode: 'exclusive' }, async () => {
+            const root = await navigator.storage.getDirectory();
+            if (wasUnlocked) {
+                stopAutoLock?.();
+                stopAutoLock = null;
+                clearAutoLockSetting();
+                disposeClient();
+                const handle = storageHandle;
+                storageHandle = null;
+                appStorageInstance = null;
+                await handle.close();
+            }
+            if (action === 'export') {
+                const release = await acquireStorageLease(root);
+                try { return await exportStorageBackup({ root }); }
+                finally { await release(); }
+            }
+            const release = await acquireStorageLease(root);
+            if (action === 'reset') {
+                // Release the handles so deletion is possible. The Web Lock
+                // still prevents app tabs from starting an open during reset.
+                await release();
+                await resetStorage({ root });
+                // Nothing is left to unlock; the next connect creates new storage.
+                sessionStorage.removeItem(LOCKED_SESSION_KEY);
+                return;
+            }
+            try { await importStorageBackup({ backup, root, validate: async record => {
+                let value = JSON.stringify(record);
+                const handle = await openWalletStorage({
+                    ...walletStorageOptions(),
+                    // This operation already owns the cross-tab storage lock.
+                    locks: { request: async (_name, _options, callback) => callback() },
+                    records: { getItem: () => value, setItem: (_key, next) => { value = next; } },
+                });
+                try {
+                    const response = await handle.call('CheckIntegrity', 120_000);
+                    if (response !== 'Saved') throw new Error('Backup integrity check failed. Existing data has been preserved.');
+                } finally { await handle.close(); }
+            } }); } finally { await release(); }
+        });
+    } finally {
+        storageLocking = false;
+        setStorageState('locked');
+    }
+}
+
+let pauseOnUnloadInstalled = false;
+
+/**
+ * Ask the storage worker to release its OPFS sync access handles as soon as
+ * this page starts unloading, instead of waiting for the worker to be torn
+ * down by the browser (which happens asynchronously and can race the next
+ * page's worker trying to acquire the same handles — surfacing as a false
+ * "another tab is using this app" error).
+ *
+ * Fire-and-forget: we don't await the response, since the page may not
+ * survive long enough to receive it. Posting the request is enough — the
+ * worker releases the handles synchronously as soon as it processes the
+ * message.
+ */
+function installStoragePauseOnUnload() {
+    if (pauseOnUnloadInstalled) {
+        return;
+    }
+    pauseOnUnloadInstalled = true;
+    window.addEventListener('pagehide', () => {
+        try {
+            storageHandle?.call('Pause', 1_000)?.catch(() => {});
+        } catch {
+            // Best-effort: nothing to do if the worker is already gone.
+        }
+    });
+}
+
+/**
+ * Probe whether the wallet RPC needs a historical-sync bootnode.
+ * Opens storage if needed; does not build a Client.
+ * @param {string} rpcUrl
+ */
+export async function bootnodeRequired(rpcUrl) {
+    if (!rpcUrl) {
+        throw new Error('rpcUrl is required');
+    }
+    await ensureStorage();
+    const contractConfig = await loadDeploymentConfig();
+    return sdkBootnodeRequired(rpcUrl, storageHandle, { contractConfig });
+}
+
+/**
+ * Open storage + client shell for the given Soroban RPC URL.
+ * Prefer resolving bootnode (via {@link bootnodeRequired} + settings/modal)
+ * before this so the Client is built once with the right URL.
+ * @param {string} rpcUrl
+ * @param {{ bootnodeUrl?: string|null }} [options]
+ */
+export async function initializeRuntime(rpcUrl, { bootnodeUrl } = {}) {
+    await ensureStorage();
+
+    if (currentRpcUrl !== rpcUrl) {
+        disposeClient();
+        currentRpcUrl = rpcUrl;
+        currentBootnodeUrl = null;
+    }
+
+    let resolvedBootnode = bootnodeUrl;
+    if (resolvedBootnode === undefined && appStorageInstance) {
+        resolvedBootnode = await appStorageInstance.getStoredBootnodeUrl();
+    }
+
+    if (
+        !wrappedClient ||
+        (resolvedBootnode ?? null) !== (currentBootnodeUrl ?? null)
+    ) {
+        disposeClient();
+        currentBootnodeUrl = resolvedBootnode ?? null;
+        wrappedClient = await openWrappedClient(
+            storageHandle,
+            rpcUrl,
+            currentBootnodeUrl,
+        );
+    }
+
+    return client();
+}
+
+/**
+ * The Soroban RPC URL the current runtime was initialized with, or `null`
+ * before {@link initializeRuntime} has run.
+ * @returns {string|null}
+ */
+export function getCurrentRpcUrl() {
+    return currentRpcUrl;
+}
+
+/**
+ * Derive the ASP membership leaf from explicit public inputs (no account session).
+ * @param {string} notePublicKey `0x`-prefixed 32-byte hex
+ * @param {string} membershipBlinding `0x`-prefixed 32-byte hex field
+ * @returns {Promise<string>} leaf as `0x` hex
+ */
+export async function deriveAspUserLeaf(notePublicKey, membershipBlinding) {
+    await ensureWasmInit();
+    return sdkDeriveAspUserLeaf(notePublicKey, membershipBlinding);
+}
+
+/**
+ * Verify a selective-disclosure receipt with no wallet, no local storage, and
+ * no prior `initializeRuntime` call — skips the OPFS/SQLite storage worker
+ * entirely, since verification never reads local state.
+ */
+export async function verifySelectiveDisclosure(rpcUrl, receiptJson, expectedVkHash) {
+    await ensureWasmInit();
+    const contractConfig = await loadDeploymentConfig();
+    return sdkVerifySelectiveDisclosure(rpcUrl, receiptJson, expectedVkHash, {
+        contractConfig,
+        circuitsBaseUrl: circuitsBaseUrl(),
+        circuitLock,
+    });
+}
+
+/** SDK deployment client + cached account session. */
+export function client() {
+    if (!wrappedClient) {
+        throw new Error(storageWasLocked() ? 'Local data is locked. Use Unlock to continue.' : 'Runtime not initialized. Call initializeRuntime first.');
+    }
+    return wrappedClient;
+}
+
+/** Whether a runtime (wallet-bound or anonymous) is already open. */
+export function isRuntimeReady() {
+    return wrappedClient !== null;
+}
+
+/** Configure telemetry settings in the WASM SDK. */
+export async function configureTelemetrySettings(config) {
+    await ensureWasmInit();
+    configureTelemetry(config);
+}
+
+/** Dump recent logs from the WASM SDK ring buffer. */
+export async function dumpTelemetryLogs() {
+    await ensureWasmInit();
+    return dump_recent_logs();
+}
+
+/** Whether the WASM build supports debug/trace logging and sensitive reveal. */
+export function debugLogsEnabled() {
+    return wasmReady && sdkDebugLogsEnabled();
+}
+
+export async function readTokenDecimals(rpcUrl, tokenContract) {
+    await ensureWasmInit();
+    return sdkReadTokenDecimals(rpcUrl, tokenContract);
+}

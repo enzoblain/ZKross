@@ -1,0 +1,2197 @@
+#[cfg(test)]
+mod tests {
+    use crate::test::utils::{
+        circom_tester::{
+            Inputs, SignalKey, generate_keys, prove_and_verify, prove_and_verify_with_keys,
+        },
+        general::{load_artifacts, poseidon2_hash2, scalar_to_bigint},
+        global_view_key::{Note, admin_public_key, decrypt_note, encrypt_note},
+        keypair::{derive_public_key, sign},
+        merkle_tree::PrefixTree,
+        sparse_merkle_tree::{SMTProof, prepare_smt_proof_with_overrides},
+        transaction::{commitment, nullifier, prepopulated_prefix},
+        transaction_case::{
+            InputNote, OutputNote, TransactionWitness, TxCase, build_base_inputs,
+            prepare_transaction_witness,
+        },
+    };
+    use anyhow::{Context, Result, ensure};
+    use ark_bn254::Fr as Scalar;
+    use ark_ff::{BigInteger, Field, PrimeField, Zero};
+    use num_bigint::{BigInt, Sign};
+    use std::{
+        panic::{self, AssertUnwindSafe},
+        path::PathBuf,
+    };
+
+    /// Depth of the pool commitment tree.
+    const LEVELS: usize = 20;
+    /// Depth of the ASP membership (allowlist) tree.
+    const ASP_LEVELS: usize = 10;
+    /// Depth of the ASP non-membership (blocklist) sparse tree.
+    const SMT_LEVELS: usize = 32;
+    const N_MEM_PROOFS: usize = 1;
+    const N_NON_PROOFS: usize = 1;
+
+    /// Leaves seeded into the pool and ASP membership trees before a case runs.
+    ///
+    /// Every `leaf_index` a case picks must stay inside it.
+    const LEAF_PREFIX: usize = 64;
+
+    pub struct MembershipTree {
+        pub leaves: Vec<Scalar>,
+        pub index: usize,
+        pub blinding: Scalar,
+    }
+
+    pub struct NonMembership {
+        pub key_non_inclusion: BigInt,
+    }
+
+    fn build_membership_trees<F>(case: &TxCase, seed_fn: F) -> Vec<MembershipTree>
+    where
+        F: Fn(usize) -> u64,
+    {
+        let n_inputs = case.inputs.len();
+        let mut membership_trees = Vec::with_capacity(n_inputs * N_MEM_PROOFS);
+
+        for j in 0..N_MEM_PROOFS {
+            let seed_j = seed_fn(j);
+            let base_mem_leaves_j = prepopulated_prefix(seed_j, &[], LEAF_PREFIX);
+
+            for input in &case.inputs {
+                membership_trees.push(MembershipTree {
+                    leaves: base_mem_leaves_j.clone(),
+                    index: input.leaf_index,
+                    blinding: Scalar::zero(),
+                });
+            }
+        }
+
+        membership_trees
+    }
+
+    fn default_membership_trees(case: &TxCase, suffix: u64) -> Vec<MembershipTree> {
+        build_membership_trees(case, |j| 0xFEED_FACEu64 ^ ((j as u64) << 40) ^ suffix)
+    }
+
+    fn default_non_membership_keys(case: &TxCase) -> Vec<NonMembership> {
+        case.inputs
+            .iter()
+            .map(|input| NonMembership {
+                key_non_inclusion: scalar_to_bigint(derive_public_key(input.priv_key)),
+            })
+            .collect()
+    }
+
+    fn non_membership_overrides_from_pubs(pubs: &[Scalar]) -> Vec<(BigInt, BigInt)> {
+        pubs.iter()
+            .enumerate()
+            .map(|(i, pk)| {
+                // Make the +1 explicit and checked
+                let idx = u64::try_from(i)
+                    .expect("Failed to cast i")
+                    .checked_add(1)
+                    .expect("idx overflow");
+
+                // Make the mul + add explicit and checked
+                let override_factor: u64 = 100_000;
+                let override_idx = idx
+                    .checked_mul(override_factor)
+                    .and_then(|v| v.checked_add(idx))
+                    .expect("override_idx overflow");
+
+                let override_key = Scalar::from(override_idx);
+
+                let leaf = poseidon2_hash2(*pk, Scalar::zero(), Some(Scalar::from(1u64)));
+                (scalar_to_bigint(override_key), scalar_to_bigint(leaf))
+            })
+            .collect()
+    }
+
+    fn default_non_membership_proof_builder(key: &BigInt, pubs: &[Scalar]) -> SMTProof {
+        let overrides = non_membership_overrides_from_pubs(pubs);
+        prepare_smt_proof_with_overrides(key, &overrides, SMT_LEVELS)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_case<F>(
+        wasm: &PathBuf,
+        r1cs: &PathBuf,
+        case: &TxCase,
+        leaves: Vec<Scalar>,
+        public_amount: Scalar,
+        membership_trees: &[MembershipTree],
+        non_membership: &[NonMembership],
+        asp: PolicyAspWitness,
+        mutate_inputs: Option<F>,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Inputs),
+    {
+        run_case_with_non_membership_builder(
+            wasm,
+            r1cs,
+            case,
+            leaves,
+            public_amount,
+            membership_trees,
+            non_membership,
+            default_non_membership_proof_builder,
+            asp,
+            mutate_inputs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_case_with_non_membership_builder<F, G>(
+        wasm: &PathBuf,
+        r1cs: &PathBuf,
+        case: &TxCase,
+        leaves: Vec<Scalar>,
+        public_amount: Scalar,
+        membership_trees: &[MembershipTree],
+        non_membership: &[NonMembership],
+        build_non_membership_proof: G,
+        asp: PolicyAspWitness,
+        mutate_inputs: Option<F>,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Inputs),
+        G: Fn(&BigInt, &[Scalar]) -> SMTProof,
+    {
+        let witness = prepare_transaction_witness(case, leaves, LEVELS)?;
+        let mut inputs = build_base_inputs(case, &witness, public_amount);
+        apply_policy_asp_witness(
+            &mut inputs,
+            case,
+            &witness.public_keys,
+            membership_trees,
+            non_membership,
+            build_non_membership_proof,
+            asp,
+        )?;
+
+        // Add inputs from test
+        if let Some(f) = mutate_inputs {
+            f(&mut inputs);
+        }
+
+        // --- Prove & verify ---
+        prove_and_expect_verify(wasm, r1cs, &inputs)
+    }
+
+    fn prove_and_expect_verify(wasm: &PathBuf, r1cs: &PathBuf, inputs: &Inputs) -> Result<()> {
+        let prove_result =
+            panic::catch_unwind(AssertUnwindSafe(|| prove_and_verify(wasm, r1cs, inputs)));
+        match prove_result {
+            Ok(Ok(res)) if res.verified => Ok(()),
+            Ok(Ok(_)) => Err(anyhow::anyhow!(
+                "Proof failed to verify (res.verified=false)"
+            )),
+            Ok(Err(e)) => Err(anyhow::anyhow!("Prover error: {e:?}")),
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic".to_string()
+                };
+                Err(anyhow::anyhow!(
+                    "Prover panicked (expected on invalid proof): {msg}"
+                ))
+            }
+        }
+    }
+
+    fn apply_membership_proofs(
+        inputs: &mut Inputs,
+        case: &TxCase,
+        pubs: &[Scalar],
+        membership_trees: &[MembershipTree],
+    ) -> Result<()> {
+        let n_inputs = case.inputs.len();
+        // === MEMBERSHIP PROOF ===
+        let mut mp_leaf: Vec<Vec<BigInt>> = Vec::with_capacity(n_inputs);
+        let mut mp_blinding: Vec<Vec<BigInt>> = Vec::with_capacity(n_inputs);
+        let mut mp_path_indices: Vec<Vec<BigInt>> = Vec::with_capacity(n_inputs);
+        let mut mp_path_elements: Vec<Vec<Vec<BigInt>>> = Vec::with_capacity(n_inputs);
+        let mut membership_roots: Vec<BigInt> = Vec::with_capacity(n_inputs * N_MEM_PROOFS);
+
+        for _ in 0..n_inputs {
+            mp_leaf.push(Vec::with_capacity(N_MEM_PROOFS));
+            mp_blinding.push(Vec::with_capacity(N_MEM_PROOFS));
+            mp_path_indices.push(Vec::with_capacity(N_MEM_PROOFS));
+            mp_path_elements.push(Vec::with_capacity(N_MEM_PROOFS));
+        }
+
+        ensure!(
+            membership_trees.len() == n_inputs * N_MEM_PROOFS,
+            "expected {} membership trees, found {}",
+            n_inputs * N_MEM_PROOFS,
+            membership_trees.len()
+        );
+
+        for j in 0..N_MEM_PROOFS {
+            let base_idx = j
+                .checked_mul(n_inputs)
+                .ok_or_else(|| anyhow::anyhow!("index overflow in membership_trees"))?;
+            let mut frozen_leaves = membership_trees[base_idx].leaves.clone();
+
+            for (k, &pk_scalar) in pubs.iter().enumerate() {
+                let index = k
+                    .checked_mul(N_MEM_PROOFS)
+                    .and_then(|v| v.checked_add(j))
+                    .ok_or_else(|| anyhow::anyhow!("index overflow in membership_trees"))?;
+
+                let tree = membership_trees.get(index).ok_or_else(|| {
+                    anyhow::anyhow!("missing membership tree for input {k}, proof {j}")
+                })?;
+                let leaf = poseidon2_hash2(pk_scalar, tree.blinding, Some(Scalar::from(1u64))); // H(pk_k, blinding_{k,j})
+                frozen_leaves[tree.index] = leaf;
+            }
+
+            let membership_tree = PrefixTree::new(&frozen_leaves, ASP_LEVELS);
+            let root_scalar = membership_tree.root();
+
+            for i in 0..n_inputs {
+                let idx = i
+                    .checked_mul(N_MEM_PROOFS)
+                    .and_then(|v| v.checked_add(j))
+                    .ok_or_else(|| anyhow::anyhow!("index overflow in membership_trees"))?;
+
+                let t = &membership_trees[idx];
+                let pk_scalar = pubs[i];
+                let leaf_scalar = poseidon2_hash2(pk_scalar, t.blinding, Some(Scalar::from(1u64)));
+
+                let (siblings, path_idx_u64) = membership_tree.proof(t.index);
+
+                mp_leaf[i].push(scalar_to_bigint(leaf_scalar));
+                mp_blinding[i].push(scalar_to_bigint(t.blinding));
+                mp_path_indices[i].push(scalar_to_bigint(Scalar::from(path_idx_u64)));
+                mp_path_elements[i].push(siblings.into_iter().map(scalar_to_bigint).collect());
+
+                membership_roots.push(scalar_to_bigint(root_scalar));
+            }
+        }
+
+        for i in 0..n_inputs {
+            for j in 0..N_MEM_PROOFS {
+                let key = |field: &str| {
+                    SignalKey::new("membershipProofs")
+                        .idx(i)
+                        .idx(j)
+                        .field(field)
+                };
+                inputs.set_key(&key("leaf"), mp_leaf[i][j].clone());
+                inputs.set_key(&key("blinding"), mp_blinding[i][j].clone());
+                inputs.set_key(&key("pathIndices"), mp_path_indices[i][j].clone());
+                inputs.set_key(&key("pathElements"), mp_path_elements[i][j].clone());
+            }
+        }
+        inputs.set("membershipRoots", membership_roots);
+        Ok(())
+    }
+
+    fn apply_non_membership_proofs<G>(
+        inputs: &mut Inputs,
+        case: &TxCase,
+        pubs: &[Scalar],
+        non_membership: &[NonMembership],
+        build_non_membership_proof: G,
+    ) -> Result<()>
+    where
+        G: Fn(&BigInt, &[Scalar]) -> SMTProof,
+    {
+        let n_inputs = case.inputs.len();
+        ensure!(
+            n_inputs == non_membership.len(),
+            "non-membership entries ({}) must match number of inputs ({n_inputs})",
+            non_membership.len()
+        );
+
+        // === NON MEMBERSHIP PROOF ===
+        let mut nmp_key: Vec<Vec<BigInt>> = Vec::with_capacity(n_inputs);
+        let mut nmp_old_key: Vec<Vec<BigInt>> = Vec::with_capacity(n_inputs);
+        let mut nmp_old_value: Vec<Vec<BigInt>> = Vec::with_capacity(n_inputs);
+        let mut nmp_is_old0: Vec<Vec<BigInt>> = Vec::with_capacity(n_inputs);
+        let mut nmp_siblings: Vec<Vec<Vec<BigInt>>> = Vec::with_capacity(n_inputs);
+        let mut non_membership_roots: Vec<BigInt> = Vec::with_capacity(n_inputs * N_NON_PROOFS);
+
+        for _ in 0..n_inputs {
+            nmp_key.push(Vec::with_capacity(N_NON_PROOFS));
+            nmp_old_key.push(Vec::with_capacity(N_NON_PROOFS));
+            nmp_old_value.push(Vec::with_capacity(N_NON_PROOFS));
+            nmp_is_old0.push(Vec::with_capacity(N_NON_PROOFS));
+            nmp_siblings.push(Vec::with_capacity(N_NON_PROOFS));
+        }
+
+        for _ in 0..N_NON_PROOFS {
+            for i in 0..n_inputs {
+                let proof = build_non_membership_proof(&non_membership[i].key_non_inclusion, pubs);
+
+                nmp_key[i].push(scalar_to_bigint(pubs[i]));
+
+                if proof.is_old0 {
+                    nmp_old_key[i].push(BigInt::from(0u32));
+                    nmp_old_value[i].push(BigInt::from(0u32));
+                    nmp_is_old0[i].push(BigInt::from(1u32));
+                } else {
+                    nmp_old_key[i].push(proof.not_found_key.clone());
+                    nmp_old_value[i].push(proof.not_found_value.clone());
+                    nmp_is_old0[i].push(BigInt::from(0u32));
+                }
+
+                nmp_siblings[i].push(proof.siblings.clone());
+                non_membership_roots.push(proof.root.clone());
+            }
+        }
+
+        for i in 0..n_inputs {
+            for j in 0..N_NON_PROOFS {
+                let key = |field: &str| {
+                    SignalKey::new("nonMembershipProofs")
+                        .idx(i)
+                        .idx(j)
+                        .field(field)
+                };
+
+                inputs.set_key(&key("key"), nmp_key[i][j].clone());
+                inputs.set_key(&key("oldKey"), nmp_old_key[i][j].clone());
+                inputs.set_key(&key("oldValue"), nmp_old_value[i][j].clone());
+                inputs.set_key(&key("isOld0"), nmp_is_old0[i][j].clone());
+                inputs.set_key(&key("siblings"), nmp_siblings[i][j].clone());
+            }
+        }
+        inputs.set("nonMembershipRoots", non_membership_roots);
+        Ok(())
+    }
+
+    fn apply_policy_asp_witness<G>(
+        inputs: &mut Inputs,
+        case: &TxCase,
+        public_keys: &[Scalar],
+        membership_trees: &[MembershipTree],
+        non_membership: &[NonMembership],
+        build_non_membership_proof: G,
+        asp: PolicyAspWitness,
+    ) -> Result<()>
+    where
+        G: Fn(&BigInt, &[Scalar]) -> SMTProof,
+    {
+        match asp {
+            PolicyAspWitness::None => Ok(()),
+            PolicyAspWitness::Membership => {
+                apply_membership_proofs(inputs, case, public_keys, membership_trees)
+            }
+            PolicyAspWitness::NonMembership => apply_non_membership_proofs(
+                inputs,
+                case,
+                public_keys,
+                non_membership,
+                build_non_membership_proof,
+            ),
+            PolicyAspWitness::Both => {
+                apply_membership_proofs(inputs, case, public_keys, membership_trees)?;
+                apply_non_membership_proofs(
+                    inputs,
+                    case,
+                    public_keys,
+                    non_membership,
+                    build_non_membership_proof,
+                )
+            }
+        }
+    }
+
+    fn expect_proof_rejected(result: Result<()>, context: &str) -> Result<()> {
+        if result.is_ok() {
+            anyhow::bail!("{context}: expected proof rejection, but verification succeeded");
+        }
+        Ok(())
+    }
+
+    /// ASP witness layout required by a policy transact circuit entry point.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PolicyAspWitness {
+        /// `policy_tx_2_2`
+        None,
+        /// `policy_tx_2_2_A`
+        Membership,
+        /// `policy_tx_2_2_B`
+        NonMembership,
+        /// `policy_tx_2_2_AB`
+        Both,
+    }
+
+    #[derive(Clone, Copy)]
+    struct PolicyCircuit {
+        stem: &'static str,
+        asp: PolicyAspWitness,
+    }
+
+    /// All policy transact circuit entry points exercised by these tests.
+    const POLICY_CIRCUITS: &[PolicyCircuit] = &[
+        PolicyCircuit {
+            stem: "policy_tx_2_2",
+            asp: PolicyAspWitness::None,
+        },
+        PolicyCircuit {
+            stem: "policy_tx_2_2_A",
+            asp: PolicyAspWitness::Membership,
+        },
+        PolicyCircuit {
+            stem: "policy_tx_2_2_B",
+            asp: PolicyAspWitness::NonMembership,
+        },
+        PolicyCircuit {
+            stem: "policy_tx_2_2_AB",
+            asp: PolicyAspWitness::Both,
+        },
+    ];
+
+    /// Subset selector for [`for_each_policy`].
+    #[derive(Clone, Copy)]
+    enum PolicyCircuitSet {
+        All,
+        /// Circuits that include ASP allowlist (membership) constraints.
+        Membership,
+        /// Circuits that include ASP blocklist (non-membership) constraints.
+        NonMembership,
+    }
+
+    impl PolicyCircuitSet {
+        fn includes(self, asp: PolicyAspWitness) -> bool {
+            match self {
+                Self::All => true,
+                Self::Membership => {
+                    matches!(asp, PolicyAspWitness::Membership | PolicyAspWitness::Both)
+                }
+                Self::NonMembership => {
+                    matches!(
+                        asp,
+                        PolicyAspWitness::NonMembership | PolicyAspWitness::Both
+                    )
+                }
+            }
+        }
+    }
+
+    /// Run a proving case against each selected policy circuit (Groth16 prove +
+    /// verify).
+    fn for_each_policy<F>(set: PolicyCircuitSet, mut body: F) -> Result<()>
+    where
+        F: FnMut(PolicyAspWitness, &PathBuf, &PathBuf) -> Result<()>,
+    {
+        for circuit in POLICY_CIRCUITS {
+            if !set.includes(circuit.asp) {
+                continue;
+            }
+            let (wasm, r1cs) = load_artifacts(circuit.stem)
+                .with_context(|| format!("load policy circuit {}", circuit.stem))?;
+            body(circuit.asp, &wasm, &r1cs).with_context(|| {
+                format!(
+                    "policy transact proof failed for {} ({:?})",
+                    circuit.stem, circuit.asp
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_1in_1out() -> Result<()> {
+        // One real input (in1), one dummy input (in0.amount = 0).
+        // One real output (out0 = in1.amount), one dummy output (out1.amount =
+        // 0).
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(101u64),
+                        blinding: Scalar::from(201u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    InputNote {
+                        leaf_index: 7,
+                        priv_key: Scalar::from(102u64),
+                        blinding: Scalar::from(211u64),
+                        amount: Scalar::from(13u64),
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(501u64),
+                        blinding: Scalar::from(601u64),
+                        amount: Scalar::from(13u64),
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(502u64),
+                        blinding: Scalar::from(602u64),
+                        amount: Scalar::from(0u64),
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xDEAD_BEEFu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+
+            let membership_trees = default_membership_trees(&case, 0x1234_5678u64);
+            let keys = default_non_membership_keys(&case);
+
+            run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                Scalar::from(0u64),
+                &membership_trees,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_2in_1out() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            let a = Scalar::from(9u64);
+            let b = Scalar::from(4u64);
+            let sum = a + b;
+
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(201u64),
+                        blinding: Scalar::from(301u64),
+                        amount: a,
+                    },
+                    InputNote {
+                        leaf_index: 19,
+                        priv_key: Scalar::from(211u64),
+                        blinding: Scalar::from(311u64),
+                        amount: b,
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(701u64),
+                        blinding: Scalar::from(801u64),
+                        amount: sum,
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(702u64),
+                        blinding: Scalar::from(802u64),
+                        amount: Scalar::from(0u64),
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xFACEu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+
+            let membership_trees = default_membership_trees(&case, 0x1234_5678u64);
+
+            let keys = default_non_membership_keys(&case);
+
+            run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                Scalar::from(0u64),
+                &membership_trees,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_1in_2out_split() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            let total = Scalar::from(20u64);
+            let a0 = Scalar::from(6u64);
+            let a1 = total - a0;
+
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(301u64),
+                        blinding: Scalar::from(401u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    InputNote {
+                        leaf_index: 23,
+                        priv_key: Scalar::from(311u64),
+                        blinding: Scalar::from(411u64),
+                        amount: total,
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(901u64),
+                        blinding: Scalar::from(1001u64),
+                        amount: a0,
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(902u64),
+                        blinding: Scalar::from(1002u64),
+                        amount: a1,
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xC0FFEEu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+
+            let membership_trees = default_membership_trees(&case, 0x1234_5678u64);
+
+            let keys = default_non_membership_keys(&case);
+
+            run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                Scalar::from(0u64),
+                &membership_trees,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_2in_2out_split() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            let a = Scalar::from(15u64);
+            let b = Scalar::from(8u64);
+            let sum = a + b;
+
+            let out_a = Scalar::from(10u64);
+            let out_b = sum - out_a;
+
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(401u64),
+                        blinding: Scalar::from(501u64),
+                        amount: a,
+                    },
+                    InputNote {
+                        leaf_index: 30,
+                        priv_key: Scalar::from(411u64),
+                        blinding: Scalar::from(511u64),
+                        amount: b,
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(1101u64),
+                        blinding: Scalar::from(1201u64),
+                        amount: out_a,
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(1102u64),
+                        blinding: Scalar::from(1202u64),
+                        amount: out_b,
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xBEEFu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+
+            let membership_trees = default_membership_trees(&case, 0x1234_5678u64);
+
+            let keys = default_non_membership_keys(&case);
+
+            run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                Scalar::from(0u64),
+                &membership_trees,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_chained_spend() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            // Tx1 produces an output that Tx2 spends
+            let chain_priv = Scalar::from(777u64);
+            let chain_pub = derive_public_key(chain_priv);
+            let chain_blind = Scalar::from(2024u64);
+            let chain_amount = Scalar::from(17u64);
+
+            let tx1_real_idx = 9usize;
+            let chain_idx = 13usize;
+
+            let mut leaves =
+                prepopulated_prefix(0xC0DEC0DEu64, &[0, tx1_real_idx, chain_idx], LEAF_PREFIX);
+
+            // --- TX1 ---
+            let tx1_input_real = InputNote {
+                leaf_index: tx1_real_idx,
+                priv_key: Scalar::from(4242u64),
+                blinding: Scalar::from(5151u64),
+                amount: Scalar::from(25u64),
+            };
+            let tx1_out0 = OutputNote {
+                pub_key: chain_pub,
+                blinding: chain_blind,
+                amount: chain_amount,
+            };
+            let tx1_out1 = OutputNote {
+                pub_key: Scalar::from(3333u64),
+                blinding: Scalar::from(4444u64),
+                amount: tx1_input_real.amount - chain_amount,
+            };
+            let tx1_in0_dummy = InputNote {
+                leaf_index: 0,
+                priv_key: Scalar::from(11u64),
+                blinding: Scalar::from(22u64),
+                amount: Scalar::from(0u64),
+            };
+
+            let tx1 = TxCase::new(
+                vec![tx1_in0_dummy, tx1_input_real.clone()],
+                vec![tx1_out0.clone(), tx1_out1.clone()],
+            );
+
+            // membership trees for TX1 (distinct baseline per j)
+            let mt1 = build_membership_trees(&tx1, |j| {
+                0xFEED_FACEu64 ^ ((j as u64) << 40) ^ 0xA11C_3EAFu64
+            });
+
+            let keys = default_non_membership_keys(&tx1);
+
+            run_case(
+                wasm,
+                r1cs,
+                &tx1,
+                prepopulated_prefix(0xC0DEC0DEu64, &[0, tx1_real_idx, chain_idx], LEAF_PREFIX),
+                Scalar::from(0u64),
+                &mt1,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )?;
+
+            // append Tx1.out0 commitment at chain_idx
+            let out0_commit = commitment(tx1_out0.amount, tx1_out0.pub_key, tx1_out0.blinding);
+            leaves[chain_idx] = out0_commit;
+
+            // --- TX2 ---
+            let tx2_in1 = InputNote {
+                leaf_index: chain_idx,
+                priv_key: chain_priv,
+                blinding: chain_blind,
+                amount: chain_amount,
+            };
+            let tx2_in0_dummy = InputNote {
+                leaf_index: 0,
+                priv_key: Scalar::from(99u64),
+                blinding: Scalar::from(100u64),
+                amount: Scalar::from(0u64),
+            };
+            let tx2_out_real = OutputNote {
+                pub_key: Scalar::from(8080u64),
+                blinding: Scalar::from(9090u64),
+                amount: chain_amount,
+            };
+            let tx2_out_dummy = OutputNote {
+                pub_key: Scalar::from(0u64),
+                blinding: Scalar::from(0u64),
+                amount: Scalar::from(0u64),
+            };
+
+            let tx2 = TxCase::new(
+                vec![tx2_in0_dummy, tx2_in1],
+                vec![tx2_out_real, tx2_out_dummy],
+            );
+
+            let mt2 = build_membership_trees(&tx2, |j| {
+                0xFEED_FACEu64 ^ ((j as u64) << 40) ^ 0xB16B_00B5u64
+            });
+
+            let keys = default_non_membership_keys(&tx2);
+
+            run_case(
+                wasm,
+                r1cs,
+                &tx2,
+                leaves,
+                Scalar::from(0u64),
+                &mt2,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_only_adds_notes_deposit() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            // both inputs dummy -> Merkle checks gated off by amount=0
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(11u64),
+                        blinding: Scalar::from(21u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    InputNote {
+                        leaf_index: 5,
+                        priv_key: Scalar::from(12u64),
+                        blinding: Scalar::from(22u64),
+                        amount: Scalar::from(0u64),
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(101u64),
+                        blinding: Scalar::from(201u64),
+                        amount: Scalar::from(7u64),
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(102u64),
+                        blinding: Scalar::from(202u64),
+                        amount: Scalar::from(5u64),
+                    },
+                ],
+            );
+
+            let deposit = Scalar::from(12u64);
+            let leaves = prepopulated_prefix(
+                0xD3AD0517u64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+
+            let membership_trees = default_membership_trees(&case, 0x5555_AAAAu64);
+
+            let keys = default_non_membership_keys(&case);
+
+            run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                deposit,
+                &membership_trees,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_only_spends_notes_withdraw_one_real() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            let spend = Scalar::from(9u64);
+
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(1u64),
+                        blinding: Scalar::from(2u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    InputNote {
+                        leaf_index: 7,
+                        priv_key: Scalar::from(111u64),
+                        blinding: Scalar::from(211u64),
+                        amount: spend,
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(0u64),
+                        blinding: Scalar::from(0u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(0u64),
+                        blinding: Scalar::from(0u64),
+                        amount: Scalar::from(0u64),
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xC0FFEEu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+            let neg_spend = Scalar::zero() - spend;
+
+            let membership_trees = default_membership_trees(&case, 0xDEAD_BEEFu64);
+
+            let keys = default_non_membership_keys(&case);
+
+            run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                neg_spend,
+                &membership_trees,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_only_spends_notes_withdraw_two_real() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            let a = Scalar::from(5u64);
+            let b = Scalar::from(11u64);
+            let sum_in = a + b;
+
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(401u64),
+                        blinding: Scalar::from(501u64),
+                        amount: a,
+                    },
+                    InputNote {
+                        leaf_index: 13,
+                        priv_key: Scalar::from(411u64),
+                        blinding: Scalar::from(511u64),
+                        amount: b,
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(0u64),
+                        blinding: Scalar::from(0u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(0u64),
+                        blinding: Scalar::from(0u64),
+                        amount: Scalar::from(0u64),
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xC0FFEEu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+            let neg_sum = Scalar::zero() - sum_in;
+
+            let membership_trees = default_membership_trees(&case, 0xABCD_EF01u64);
+
+            let keys = default_non_membership_keys(&case);
+
+            run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                neg_sum,
+                &membership_trees,
+                &keys,
+                asp,
+                None::<fn(&mut Inputs)>,
+            )
+        })
+    }
+
+    /// Spends one note twice at one index, after two distinct notes verify.
+    /// The note is in the tree and the amounts balance, so only
+    /// `sameNullifiers` refuses it.
+    #[test]
+    #[ignore]
+    fn test_tx_same_nullifier_should_fail() -> Result<()> {
+        let (wasm, r1cs) = load_artifacts("policy_tx_2_2")?;
+
+        let note = InputNote {
+            leaf_index: 5,
+            priv_key: Scalar::from(7777u64),
+            blinding: Scalar::from(4242u64),
+            amount: Scalar::from(33u64),
+        };
+        let other = InputNote {
+            leaf_index: 13,
+            priv_key: Scalar::from(7778u64),
+            blinding: Scalar::from(4243u64),
+            ..note.clone()
+        };
+        let outputs = vec![
+            OutputNote {
+                pub_key: Scalar::from(9001u64),
+                blinding: Scalar::from(8001u64),
+                amount: Scalar::from(66u64),
+            },
+            OutputNote {
+                pub_key: Scalar::from(0u64),
+                blinding: Scalar::from(0u64),
+                amount: Scalar::from(0u64),
+            },
+        ];
+        let leaves = prepopulated_prefix(
+            0xC0FFEEu64,
+            &[note.leaf_index, other.leaf_index],
+            LEAF_PREFIX,
+        );
+        let prove = |inputs| {
+            run_case(
+                &wasm,
+                &r1cs,
+                &TxCase::new(inputs, outputs.clone()),
+                leaves.clone(),
+                Scalar::zero(),
+                &[],
+                &[],
+                PolicyAspWitness::None,
+                None::<fn(&mut Inputs)>,
+            )
+        };
+
+        prove(vec![note.clone(), other])?;
+        expect_proof_rejected(
+            prove(vec![note.clone(), note]),
+            "one note spent twice must not verify",
+        )
+    }
+
+    /// Returns the pool tree's leaves for [`amounts_case`], with its input
+    /// slots 0 and 7 left empty.
+    fn amounts_leaves() -> Vec<Scalar> {
+        prepopulated_prefix(0xDEAD_BEEFu64, &[0, 7], LEAF_PREFIX)
+    }
+
+    /// Returns notes of the given amounts at fixed keys and leaves.
+    fn amounts_case([in0, in1]: [Scalar; 2], [out0, out1]: [Scalar; 2]) -> TxCase {
+        TxCase::new(
+            vec![
+                InputNote {
+                    leaf_index: 0,
+                    priv_key: Scalar::from(101u64),
+                    blinding: Scalar::from(201u64),
+                    amount: in0,
+                },
+                InputNote {
+                    leaf_index: 7,
+                    priv_key: Scalar::from(102u64),
+                    blinding: Scalar::from(211u64),
+                    amount: in1,
+                },
+            ],
+            vec![
+                OutputNote {
+                    pub_key: Scalar::from(501u64),
+                    blinding: Scalar::from(601u64),
+                    amount: out0,
+                },
+                OutputNote {
+                    pub_key: Scalar::from(502u64),
+                    blinding: Scalar::from(602u64),
+                    amount: out1,
+                },
+            ],
+        )
+    }
+
+    /// Proves `policy_tx_2_2` for [`amounts_case`], with `root` in place of
+    /// the tree's root when given.
+    fn prove_amounts(
+        ins: [Scalar; 2],
+        outs: [Scalar; 2],
+        public_amount: Scalar,
+        root: Option<Scalar>,
+    ) -> Result<()> {
+        let (wasm, r1cs) = load_artifacts("policy_tx_2_2")?;
+        run_case(
+            &wasm,
+            &r1cs,
+            &amounts_case(ins, outs),
+            amounts_leaves(),
+            public_amount,
+            &[],
+            &[],
+            PolicyAspWitness::None,
+            root.map(|root| move |inputs: &mut Inputs| inputs.set("root", root)),
+        )
+    }
+
+    /// Proves a transfer of 13, then the same notes with a public amount of
+    /// 1. Only the balance constraint ties the public amount to the notes.
+    #[test]
+    #[ignore]
+    fn test_public_amount_off_by_one_should_fail() -> Result<()> {
+        let ins = [Scalar::zero(), Scalar::from(13u64)];
+        let outs = [Scalar::from(13u64), Scalar::zero()];
+
+        prove_amounts(ins, outs, Scalar::zero(), None)?;
+        expect_proof_rejected(
+            prove_amounts(ins, outs, Scalar::from(1u64), None),
+            "a public amount off by one must not verify",
+        )
+    }
+
+    /// Proves a transfer of 13, then outputs of 14 and `p - 1`, which balance
+    /// it in the field. Only the 248-bit range check on outputs refuses
+    /// `p - 1`.
+    #[test]
+    #[ignore]
+    fn test_output_wrapping_the_field_should_fail() -> Result<()> {
+        let a = Scalar::from(13u64);
+        let ins = [Scalar::zero(), a];
+
+        prove_amounts(ins, [a, Scalar::zero()], Scalar::zero(), None)?;
+        expect_proof_rejected(
+            prove_amounts(
+                ins,
+                [a + Scalar::from(1u64), -Scalar::from(1u64)],
+                Scalar::zero(),
+                None,
+            ),
+            "an output wrapping the field must not verify",
+        )
+    }
+
+    /// Deposits an output of `2^248 - 1`, then one of `2^248`. Only the
+    /// 248-bit range check on outputs refuses the second.
+    #[test]
+    #[ignore]
+    fn test_output_at_two_to_the_248_should_fail() -> Result<()> {
+        let bound = Scalar::from(2u64).pow([248]);
+        let deposit =
+            |amount| prove_amounts([Scalar::zero(); 2], [amount, Scalar::zero()], amount, None);
+
+        deposit(bound - Scalar::from(1u64))?;
+        expect_proof_rejected(deposit(bound), "an output of 2^248 must not verify")
+    }
+
+    /// Proves a transfer of 13, then the same notes against the root of the
+    /// tree without them. Only the root check on nonzero inputs refuses it.
+    #[test]
+    #[ignore]
+    fn test_nonzero_input_against_an_earlier_root_should_fail() -> Result<()> {
+        let ins = [Scalar::zero(), Scalar::from(13u64)];
+        let outs = [Scalar::from(13u64), Scalar::zero()];
+        let earlier_root = PrefixTree::new(&amounts_leaves(), LEVELS).root();
+
+        prove_amounts(ins, outs, Scalar::zero(), None)?;
+        expect_proof_rejected(
+            prove_amounts(ins, outs, Scalar::zero(), Some(earlier_root)),
+            "a nonzero input against an earlier root must not verify",
+        )
+    }
+
+    /// Deposits 12 against a root no tree has. The root check skips
+    /// zero-amount inputs, and deposits rely on it.
+    #[test]
+    #[ignore]
+    fn test_zero_amount_inputs_ignore_the_root() -> Result<()> {
+        let deposit = Scalar::from(12u64);
+        prove_amounts(
+            [Scalar::zero(); 2],
+            [deposit, Scalar::zero()],
+            deposit,
+            Some(Scalar::from(123u64)),
+        )
+    }
+
+    /// Proves a transfer of 13, then the same spend at its leaf index plus
+    /// `2^20`, which walks the same path and gives the note a fresh nullifier.
+    /// Only the index's range check refuses it.
+    #[test]
+    #[ignore]
+    fn test_leaf_index_aliased_past_the_depth_should_fail() -> Result<()> {
+        let (wasm, r1cs) = load_artifacts("policy_tx_2_2")?;
+        let amount = Scalar::from(13u64);
+        let case = amounts_case([amount, Scalar::zero()], [amount, Scalar::zero()]);
+        let mut witness = prepare_transaction_witness(&case, amounts_leaves(), LEVELS)?;
+        let prove = |witness: &TransactionWitness| {
+            let inputs = build_base_inputs(&case, witness, Scalar::zero());
+            prove_and_expect_verify(&wasm, &r1cs, &inputs)
+        };
+
+        prove(&witness)?;
+        let note = &case.inputs[0];
+        let cm = commitment(note.amount, witness.public_keys[0], note.blinding);
+        let index = witness.path_indices[0] + Scalar::from(1u64 << LEVELS);
+        witness.path_indices[0] = index;
+        witness.nullifiers[0] = nullifier(cm, index, sign(note.priv_key, cm, index));
+        expect_proof_rejected(
+            prove(&witness),
+            "a leaf index past the tree depth must not verify",
+        )
+    }
+
+    /// Proves a transfer of 13, then the same transfer by a key outside the
+    /// allowlist that presents an allowlisted key's leaf and path. Only the
+    /// check that the leaf hashes the input key refuses it.
+    #[test]
+    #[ignore]
+    fn test_membership_should_fail_wrong_privkey() -> Result<()> {
+        let (wasm, r1cs) = load_artifacts("policy_tx_2_2_A")?;
+        let amount = Scalar::from(13u64);
+        let case = amounts_case([amount, Scalar::zero()], [amount, Scalar::zero()]);
+        let trees = default_membership_trees(&case, 0x1111_2222u64);
+        let allowed: Vec<Scalar> = case
+            .inputs
+            .iter()
+            .map(|note| derive_public_key(note.priv_key))
+            .collect();
+        let prove = |case: &TxCase| {
+            let witness = prepare_transaction_witness(case, amounts_leaves(), LEVELS)?;
+            let mut inputs = build_base_inputs(case, &witness, Scalar::zero());
+            apply_membership_proofs(&mut inputs, case, &allowed, &trees)?;
+            prove_and_expect_verify(&wasm, &r1cs, &inputs)
+        };
+
+        prove(&case)?;
+        let mut outsider = case.clone();
+        outsider.inputs[0].priv_key = Scalar::from(999u64);
+        expect_proof_rejected(
+            prove(&outsider),
+            "a key outside the allowlist must not verify",
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn test_membership_should_fail_wrong_path() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::Membership, |asp, wasm, r1cs| {
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(101u64),
+                        blinding: Scalar::from(201u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    InputNote {
+                        leaf_index: 7,
+                        priv_key: Scalar::from(111u64),
+                        blinding: Scalar::from(211u64),
+                        amount: Scalar::from(13u64),
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(501u64),
+                        blinding: Scalar::from(601u64),
+                        amount: Scalar::from(13u64),
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(502u64),
+                        blinding: Scalar::from(602u64),
+                        amount: Scalar::from(0u64),
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xFACE_FEEDu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+
+            let membership_trees = default_membership_trees(&case, 0x3333_4444u64);
+
+            let keys = default_non_membership_keys(&case);
+
+            // Tamper: zero out the pathElements for input 1, proof 0
+            let res = run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                Scalar::from(0u64),
+                &membership_trees,
+                &keys,
+                asp,
+                Some(|inputs: &mut Inputs| {
+                    let key = |field: &str| {
+                        SignalKey::new("membershipProofs")
+                            .idx(1)
+                            .idx(0)
+                            .field(field)
+                    };
+                    let zeros: Vec<BigInt> = (0..ASP_LEVELS).map(|_| BigInt::from(0u32)).collect();
+                    inputs.set_key(&key("pathElements"), zeros);
+                }),
+            );
+
+            expect_proof_rejected(res, "wrong membership path must not verify")
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_membership_should_fail_wrong_root() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::Membership, |asp, wasm, r1cs| {
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(101u64),
+                        blinding: Scalar::from(201u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    InputNote {
+                        leaf_index: 7,
+                        priv_key: Scalar::from(111u64),
+                        blinding: Scalar::from(211u64),
+                        amount: Scalar::from(13u64),
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(501u64),
+                        blinding: Scalar::from(601u64),
+                        amount: Scalar::from(13u64),
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(502u64),
+                        blinding: Scalar::from(602u64),
+                        amount: Scalar::from(0u64),
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xDEAD_BEEFu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+
+            let membership_trees = default_membership_trees(&case, 0x5555_6666u64);
+
+            let keys = default_non_membership_keys(&case);
+
+            // Tamper: replace membershipRoots with bogus constants
+            let res = run_case(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                Scalar::from(0u64),
+                &membership_trees,
+                &keys,
+                asp,
+                Some(|inputs: &mut Inputs| {
+                    let bogus: Vec<BigInt> = (0..(case.inputs.len() * N_MEM_PROOFS))
+                        .map(|_| scalar_to_bigint(Scalar::from(123u64)))
+                        .collect();
+                    inputs.set("membershipRoots", bogus);
+                }),
+            );
+
+            expect_proof_rejected(res, "wrong membership root must not verify")
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_non_membership_fails() -> Result<()> {
+        // One real input (in1), one dummy input (in0.amount = 0).
+        // One real output (out0 = in1.amount), one dummy output (out1.amount =
+        // 0).
+        for_each_policy(PolicyCircuitSet::NonMembership, |asp, wasm, r1cs| {
+            let case = TxCase::new(
+                vec![
+                    InputNote {
+                        leaf_index: 0,
+                        priv_key: Scalar::from(101u64),
+                        blinding: Scalar::from(201u64),
+                        amount: Scalar::from(0u64),
+                    },
+                    InputNote {
+                        leaf_index: 7,
+                        priv_key: Scalar::from(102u64),
+                        blinding: Scalar::from(211u64),
+                        amount: Scalar::from(13u64),
+                    },
+                ],
+                vec![
+                    OutputNote {
+                        pub_key: Scalar::from(501u64),
+                        blinding: Scalar::from(601u64),
+                        amount: Scalar::from(13u64),
+                    },
+                    OutputNote {
+                        pub_key: Scalar::from(502u64),
+                        blinding: Scalar::from(602u64),
+                        amount: Scalar::from(0u64),
+                    },
+                ],
+            );
+
+            let leaves = prepopulated_prefix(
+                0xDEAD_BEEFu64,
+                &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+                LEAF_PREFIX,
+            );
+
+            let membership_trees = default_membership_trees(&case, 0x1234_5678u64);
+            let keys = vec![
+                NonMembership {
+                    key_non_inclusion: BigInt::from(100001u64), /* This will make the proof of
+                                                                 * non-membership fail */
+                },
+                NonMembership {
+                    key_non_inclusion: scalar_to_bigint(derive_public_key(case.inputs[1].priv_key)),
+                },
+            ];
+
+            let res = run_case_with_non_membership_builder(
+                wasm,
+                r1cs,
+                &case,
+                leaves,
+                Scalar::from(0u64),
+                &membership_trees,
+                &keys,
+                |key, pubs| {
+                    assert!(
+                        pubs.len() >= 2,
+                        "non-membership failure test expects two input notes"
+                    );
+                    let leaf_exist_0 =
+                        poseidon2_hash2(pubs[0], Scalar::zero(), Some(Scalar::from(1u64)));
+                    let leaf_exist_1 =
+                        poseidon2_hash2(pubs[1], Scalar::zero(), Some(Scalar::from(1u64)));
+                    let overrides: Vec<(BigInt, BigInt)> = vec![
+                        (
+                            scalar_to_bigint(Scalar::from(100001u64)),
+                            scalar_to_bigint(leaf_exist_0),
+                        ),
+                        (
+                            scalar_to_bigint(Scalar::from(200002u64)),
+                            scalar_to_bigint(leaf_exist_1),
+                        ),
+                    ];
+
+                    prepare_smt_proof_with_overrides(key, &overrides, SMT_LEVELS)
+                },
+                asp,
+                None::<fn(&mut Inputs)>,
+            );
+
+            expect_proof_rejected(res, "invalid non-membership proof must not verify")
+        })
+    }
+
+    /// Non-membership proof for `key` against a tree holding two blocked keys
+    /// that share its lowest `shared_bits` bits and differ from it at bit
+    /// `shared_bits`, so the path of `key` ends at an empty slot after
+    /// `shared_bits + 1` siblings.
+    fn non_membership_proof_at_depth(key: &BigInt, shared_bits: u64) -> SMTProof {
+        let next_bit = shared_bits.checked_add(1).expect("bit index overflow");
+        let mut a = key.clone();
+        a.set_bit(shared_bits, !key.bit(shared_bits));
+        let mut b = a.clone();
+        b.set_bit(next_bit, !a.bit(next_bit));
+
+        let modulus = BigInt::from_bytes_be(Sign::Plus, &Scalar::MODULUS.to_bytes_be());
+        assert!(
+            a < modulus && b < modulus,
+            "blocked keys must be field elements"
+        );
+
+        let overrides = vec![(a.clone(), a), (b.clone(), b)];
+        let proof = prepare_smt_proof_with_overrides(key, &overrides, SMT_LEVELS);
+
+        let zero = BigInt::from(0u32);
+        let last_sibling = proof.siblings.iter().rposition(|s| *s != zero);
+        assert_eq!(
+            last_sibling,
+            Some(usize::try_from(shared_bits).expect("bit index fits usize")),
+            "path must end right after the shared prefix"
+        );
+        proof
+    }
+
+    fn run_non_membership_depth_case(
+        asp: PolicyAspWitness,
+        wasm: &PathBuf,
+        r1cs: &PathBuf,
+        shared_bits: u64,
+    ) -> Result<()> {
+        let case = TxCase::new(
+            vec![
+                InputNote {
+                    leaf_index: 0,
+                    priv_key: Scalar::from(101u64),
+                    blinding: Scalar::from(201u64),
+                    amount: Scalar::from(0u64),
+                },
+                InputNote {
+                    leaf_index: 7,
+                    priv_key: Scalar::from(102u64),
+                    blinding: Scalar::from(211u64),
+                    amount: Scalar::from(13u64),
+                },
+            ],
+            vec![
+                OutputNote {
+                    pub_key: Scalar::from(501u64),
+                    blinding: Scalar::from(601u64),
+                    amount: Scalar::from(13u64),
+                },
+                OutputNote {
+                    pub_key: Scalar::from(502u64),
+                    blinding: Scalar::from(602u64),
+                    amount: Scalar::from(0u64),
+                },
+            ],
+        );
+
+        let leaves = prepopulated_prefix(
+            0xDEAD_BEEFu64,
+            &[case.inputs[0].leaf_index, case.inputs[1].leaf_index],
+            LEAF_PREFIX,
+        );
+
+        let membership_trees = default_membership_trees(&case, 0x1234_5678u64);
+        let keys = default_non_membership_keys(&case);
+
+        run_case_with_non_membership_builder(
+            wasm,
+            r1cs,
+            &case,
+            leaves,
+            Scalar::from(0u64),
+            &membership_trees,
+            &keys,
+            |key, _pubs| non_membership_proof_at_depth(key, shared_bits),
+            asp,
+            None::<fn(&mut Inputs)>,
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn test_non_membership_deepest_provable_path() -> Result<()> {
+        // A path of SMT_LEVELS - 1 siblings leaves the last slot zero.
+        let shared_bits = u64::try_from(SMT_LEVELS - 2)?;
+        for_each_policy(PolicyCircuitSet::NonMembership, |asp, wasm, r1cs| {
+            run_non_membership_depth_case(asp, wasm, r1cs, shared_bits)
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn test_non_membership_path_beyond_depth_fails() -> Result<()> {
+        // A path of SMT_LEVELS siblings fills the last slot, which the circuit
+        // requires to be zero.
+        let shared_bits = u64::try_from(SMT_LEVELS - 1)?;
+        for_each_policy(PolicyCircuitSet::NonMembership, |asp, wasm, r1cs| {
+            let res = run_non_membership_depth_case(asp, wasm, r1cs, shared_bits);
+            expect_proof_rejected(res, "path filling every sibling slot must not verify")
+        })
+    }
+
+    /// Proves a transfer of 13 on `policy_tx_2_2_B`, then blocks the spender's
+    /// key `pk` as leaf `(pk, pk)` and expects a rejection once `forge(pk)`
+    /// replaces the `oldKey`, `oldValue`, and `isOld0` of its witness.
+    fn expect_blocked_key_rejected(
+        forge: impl FnOnce(Scalar) -> [Scalar; 3],
+        context: &str,
+    ) -> Result<()> {
+        let (wasm, r1cs) = load_artifacts("policy_tx_2_2_B")?;
+        let amount = Scalar::from(13u64);
+        let case = amounts_case([amount, Scalar::zero()], [amount, Scalar::zero()]);
+        let keys = default_non_membership_keys(&case);
+        let pk = derive_public_key(case.inputs[0].priv_key);
+
+        run_case(
+            &wasm,
+            &r1cs,
+            &case,
+            amounts_leaves(),
+            Scalar::zero(),
+            &[],
+            &keys,
+            PolicyAspWitness::NonMembership,
+            None::<fn(&mut Inputs)>,
+        )?;
+        let blocked = (scalar_to_bigint(pk), scalar_to_bigint(pk));
+        let forged = forge(pk);
+        let field = |name| {
+            SignalKey::new("nonMembershipProofs")
+                .idx(0)
+                .idx(0)
+                .field(name)
+        };
+        expect_proof_rejected(
+            run_case_with_non_membership_builder(
+                &wasm,
+                &r1cs,
+                &case,
+                amounts_leaves(),
+                Scalar::zero(),
+                &[],
+                &keys,
+                |key, pubs| {
+                    let mut leaves = non_membership_overrides_from_pubs(pubs);
+                    leaves.push(blocked.clone());
+                    prepare_smt_proof_with_overrides(key, &leaves, SMT_LEVELS)
+                },
+                PolicyAspWitness::NonMembership,
+                Some(|inputs: &mut Inputs| {
+                    for (name, value) in ["oldKey", "oldValue", "isOld0"].into_iter().zip(forged) {
+                        inputs.set_key(&field(name), value);
+                    }
+                }),
+            ),
+            context,
+        )
+    }
+
+    /// Spends from a blocked key whose witness names the key's own leaf as the
+    /// leaf it collides with. Only the check that `oldKey` differs from the key
+    /// refuses it.
+    #[test]
+    #[ignore]
+    fn test_blocked_key_with_its_own_leaf_as_old_should_fail() -> Result<()> {
+        expect_blocked_key_rejected(
+            |pk| [pk, pk, Scalar::zero()],
+            "a blocked key naming its own leaf must not verify",
+        )
+    }
+
+    /// Spends from a blocked key with leaf `(1, 0)` as `oldKey` and `oldValue`,
+    /// and an `isOld0` that scales that leaf's hash into the blocked leaf's.
+    /// Only the bit check on `isOld0` refuses it.
+    #[test]
+    #[ignore]
+    fn test_blocked_key_with_a_non_boolean_is_old0_should_fail() -> Result<()> {
+        let one = Scalar::from(1u64);
+        let leaf = |key, value| poseidon2_hash2(key, value, Some(one));
+        expect_blocked_key_rejected(
+            |pk| {
+                [
+                    one,
+                    Scalar::zero(),
+                    one - leaf(pk, pk) / leaf(one, Scalar::zero()),
+                ]
+            },
+            "a non-boolean isOld0 must not verify",
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tx_randomized_stress() -> Result<()> {
+        for_each_policy(PolicyCircuitSet::All, |asp, wasm, r1cs| {
+            #[inline]
+            fn next_u64(state: &mut u128) -> u64 {
+                *state = (*state)
+                    .wrapping_mul(6364136223846793005u128)
+                    .wrapping_add(1442695040888963407u128);
+                (*state >> 64) as u64
+            }
+
+            #[inline]
+            fn rand_scalar(state: &mut u128) -> Scalar {
+                Scalar::from(next_u64(state))
+            }
+            #[inline]
+            fn nonzero_amount_u64(state: &mut u128, max: u64) -> u64 {
+                1 + (next_u64(state) % max.max(1))
+            }
+
+            const N_ITERS: usize = 20;
+
+            let mut rng: u128 = 0xA9_5EED_1337_D3AD_B33Fu128;
+
+            for _ in 0..N_ITERS {
+                let scenario = (next_u64(&mut rng) % 4) as u8;
+
+                // pick real index != 0
+                let real_idx = {
+                    let mut idx = usize::try_from(next_u64(&mut rng))? % LEAF_PREFIX;
+                    if idx == 0 {
+                        idx = 1;
+                    }
+                    idx
+                };
+
+                let leaves_seed = next_u64(&mut rng);
+                let leaves = prepopulated_prefix(leaves_seed, &[0, real_idx], LEAF_PREFIX);
+
+                let in0_dummy = InputNote {
+                    leaf_index: 0,
+                    priv_key: rand_scalar(&mut rng),
+                    blinding: rand_scalar(&mut rng),
+                    amount: Scalar::from(0u64),
+                };
+                let in1_amt_u64 = nonzero_amount_u64(&mut rng, 1_000);
+                let in1_real = InputNote {
+                    leaf_index: real_idx,
+                    priv_key: rand_scalar(&mut rng),
+                    blinding: rand_scalar(&mut rng),
+                    amount: Scalar::from(in1_amt_u64),
+                };
+
+                let in0_alt_amt_u64 = nonzero_amount_u64(&mut rng, 1_000);
+                let in0_real_alt = InputNote {
+                    leaf_index: 0,
+                    priv_key: rand_scalar(&mut rng),
+                    blinding: rand_scalar(&mut rng),
+                    amount: Scalar::from(in0_alt_amt_u64),
+                };
+
+                let (in0_used, in1_used, out0_amt_u64, out1_amt_u64) = match scenario {
+                    0 => (in0_dummy.clone(), in1_real.clone(), in1_amt_u64, 0u64),
+                    1 => {
+                        let x = next_u64(&mut rng) % (in1_amt_u64 + 1);
+                        let y = in1_amt_u64 - x;
+                        (in0_dummy.clone(), in1_real.clone(), x, y)
+                    }
+                    2 => {
+                        let sum = in0_alt_amt_u64 + in1_amt_u64;
+                        (in0_real_alt.clone(), in1_real.clone(), sum, 0u64)
+                    }
+                    _ => {
+                        let sum = in0_alt_amt_u64 + in1_amt_u64;
+                        let x = next_u64(&mut rng) % (sum + 1);
+                        let y = sum - x;
+                        (in0_real_alt.clone(), in1_real.clone(), x, y)
+                    }
+                };
+
+                let out0 = OutputNote {
+                    pub_key: rand_scalar(&mut rng),
+                    blinding: rand_scalar(&mut rng),
+                    amount: Scalar::from(out0_amt_u64),
+                };
+                let out1 = OutputNote {
+                    pub_key: rand_scalar(&mut rng),
+                    blinding: rand_scalar(&mut rng),
+                    amount: Scalar::from(out1_amt_u64),
+                };
+
+                let case = TxCase::new(vec![in0_used, in1_used], vec![out0, out1]);
+
+                // membership trees: distinct baseline per j
+                let membership_trees = build_membership_trees(&case, |j| {
+                    0xFEED_FACEu64 ^ ((j as u64) << 40) ^ leaves_seed
+                });
+
+                let keys = default_non_membership_keys(&case);
+
+                run_case(wasm, r1cs, &case, leaves, Scalar::from(0u64), &membership_trees, &keys, asp, None::<fn(&mut Inputs)>).with_context(|| {
+            format!(
+                "randomized iteration failed (seed=0x{leaves_seed:x}, scenario={scenario}, real_idx={real_idx}, \
+                                  keys=[{}, {}])",
+                keys[0].key_non_inclusion, keys[1].key_non_inclusion
+            )
+        })?;
+            }
+
+            Ok(())
+        })
+    }
+
+    // Policy transaction + Global View Key
+    /// One policy + GVK entry point and the witness layout it expects.
+    #[derive(Clone, Copy)]
+    struct PolicyGvkCircuit {
+        stem: &'static str,
+        asp: PolicyAspWitness,
+        encrypt_inputs: bool,
+    }
+
+    /// A test run (verified) for `policy_tx_2_2*_gvk_*`, shared by every test
+    /// below that needs its public signals.
+    /// 2 inputs (50 + 30) and 2 outputs (60 + 20)
+    struct PolicyGvkProof {
+        stem: &'static str,
+        encrypt_inputs: bool,
+        d: (Scalar, Scalar),
+        d_priv: Scalar,
+        nonce: Scalar,
+        in_notes: Vec<InputNote>,
+        out_notes: Vec<OutputNote>,
+        in_salts: Vec<Scalar>,
+        out_salts: Vec<Scalar>,
+        witness: TransactionWitness,
+        public_amount: Scalar,
+        publics: Vec<Scalar>,
+    }
+
+    /// Prove a `policy_tx_2_2*_gvk_*` circuit for the fixed scenario described
+    /// on [`PolicyGvkProof`] and assert it verifies.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn prove_policy_gvk_case(circuit: PolicyGvkCircuit) -> Result<PolicyGvkProof> {
+        let (wasm, r1cs) = load_artifacts(circuit.stem)
+            .with_context(|| format!("load policy+gvk circuit {}", circuit.stem))?;
+        let keys = generate_keys(&wasm, &r1cs)?;
+
+        let d_priv = Scalar::from(0x5EEDu64);
+        let d = admin_public_key(d_priv);
+        let nonce = Scalar::from(0xFEED_FACEu64);
+
+        // 2 inputs (50 + 30) and 2 outputs (60 + 20) balance with publicAmount
+        // 0.
+        let in_notes = vec![
+            InputNote {
+                leaf_index: 3,
+                priv_key: Scalar::from(111u64),
+                blinding: Scalar::from(11u64),
+                amount: Scalar::from(50u64),
+            },
+            InputNote {
+                leaf_index: 8,
+                priv_key: Scalar::from(222u64),
+                blinding: Scalar::from(22u64),
+                amount: Scalar::from(30u64),
+            },
+        ];
+        let out_notes = vec![
+            OutputNote {
+                pub_key: derive_public_key(Scalar::from(333u64)),
+                blinding: Scalar::from(33u64),
+                amount: Scalar::from(60u64),
+            },
+            OutputNote {
+                pub_key: derive_public_key(Scalar::from(444u64)),
+                blinding: Scalar::from(44u64),
+                amount: Scalar::from(20u64),
+            },
+        ];
+        let n_ins = in_notes.len();
+
+        // Fresh per-note salts seeding the GVK encryption.
+        let in_salts: Vec<Scalar> = (0..n_ins)
+            .map(|i| Scalar::from(0xDEADBEEFu64 + u64::try_from(i).expect("idx")))
+            .collect();
+        let out_salts: Vec<Scalar> = (0..out_notes.len())
+            .map(|i| Scalar::from(0xC0FFEu64 + u64::try_from(i).expect("idx")))
+            .collect();
+
+        let case = TxCase::new(in_notes.clone(), out_notes.clone());
+        let leaves = prepopulated_prefix(0xABCDu64, &[3, 8], LEAF_PREFIX);
+        let membership_trees = default_membership_trees(&case, 0x1234_5678u64);
+        let non_membership = default_non_membership_keys(&case);
+
+        let witness = prepare_transaction_witness(&case, leaves, LEVELS)?;
+        let public_amount = Scalar::from(0u64);
+        let mut inputs = build_base_inputs(&case, &witness, public_amount);
+        apply_policy_asp_witness(
+            &mut inputs,
+            &case,
+            &witness.public_keys,
+            &membership_trees,
+            &non_membership,
+            default_non_membership_proof_builder,
+            circuit.asp,
+        )?;
+        inputs.set("D", vec![d.0, d.1]);
+        inputs.set("nonce", nonce);
+        inputs.set("inSalt", in_salts.clone());
+        inputs.set("outSalt", out_salts.clone());
+
+        let res = prove_and_verify_with_keys(&wasm, &r1cs, &inputs, &keys)?;
+        assert!(res.verified, "{} proof did not verify", circuit.stem);
+
+        let publics: Vec<Scalar> = res.public_inputs.clone();
+
+        Ok(PolicyGvkProof {
+            stem: circuit.stem,
+            encrypt_inputs: circuit.encrypt_inputs,
+            d,
+            d_priv,
+            nonce,
+            in_notes,
+            out_notes,
+            in_salts,
+            out_salts,
+            witness,
+            public_amount,
+            publics,
+        })
+    }
+
+    /// Confirm the encrypted notes appear among the public signals and
+    /// decrypt back to their plaintext. View-only encrypts outputs only,
+    /// traceable also encrypts inputs.
+    /// Checks the public signals as a multiset only. See
+    /// `run_policy_gvk_public_input_order` below for the exact-order pin.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn run_policy_gvk(circuit: PolicyGvkCircuit) -> Result<()> {
+        let proof = prove_policy_gvk_case(circuit)?;
+        let n_ins = proof.in_notes.len();
+
+        // The admin decrypts each emitted ciphertext back to its note. Outputs
+        // are encrypted at idx nIns+k; inputs (traceable only) at idx
+        // k.
+        let check = |note: Note, idx: usize| {
+            let ct = encrypt_note(
+                &note,
+                proof.d,
+                proof.nonce,
+                Scalar::from(u64::try_from(idx).expect("idx")),
+            );
+            assert_eq!(
+                decrypt_note(&ct, proof.d_priv),
+                note.recovered(),
+                "admin must recover the note"
+            );
+            for v in [ct.r.0, ct.r.1, ct.c1, ct.c2, ct.c3] {
+                assert!(
+                    proof.publics.contains(&v),
+                    "ciphertext value missing from public signals for {}",
+                    proof.stem
+                );
+            }
+        };
+
+        for (k, out) in proof.out_notes.iter().enumerate() {
+            check(
+                Note {
+                    pk: out.pub_key,
+                    amount: out.amount,
+                    blinding: out.blinding,
+                    salt: proof.out_salts[k],
+                },
+                n_ins + k,
+            );
+        }
+        if proof.encrypt_inputs {
+            for (k, inp) in proof.in_notes.iter().enumerate() {
+                check(
+                    Note {
+                        pk: derive_public_key(inp.priv_key),
+                        amount: inp.amount,
+                        blinding: inp.blinding,
+                        salt: proof.in_salts[k],
+                    },
+                    k,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_gvk_open_viewonly() -> Result<()> {
+        run_policy_gvk(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_gvk_V",
+            asp: PolicyAspWitness::None,
+            encrypt_inputs: false,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_gvk_open_traceable() -> Result<()> {
+        run_policy_gvk(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_gvk_T",
+            asp: PolicyAspWitness::None,
+            encrypt_inputs: true,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_gvk_allowlist_viewonly() -> Result<()> {
+        run_policy_gvk(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_A_gvk_V",
+            asp: PolicyAspWitness::Membership,
+            encrypt_inputs: false,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_gvk_allowlist_traceable() -> Result<()> {
+        run_policy_gvk(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_A_gvk_T",
+            asp: PolicyAspWitness::Membership,
+            encrypt_inputs: true,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_gvk_blocklist_viewonly() -> Result<()> {
+        run_policy_gvk(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_B_gvk_V",
+            asp: PolicyAspWitness::NonMembership,
+            encrypt_inputs: false,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_gvk_blocklist_traceable() -> Result<()> {
+        run_policy_gvk(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_B_gvk_T",
+            asp: PolicyAspWitness::NonMembership,
+            encrypt_inputs: true,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_gvk_both_viewonly() -> Result<()> {
+        run_policy_gvk(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_AB_gvk_V",
+            asp: PolicyAspWitness::Both,
+            encrypt_inputs: false,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_gvk_both_traceable() -> Result<()> {
+        run_policy_gvk(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_AB_gvk_T",
+            asp: PolicyAspWitness::Both,
+            encrypt_inputs: true,
+        })
+    }
+
+    /// Pins the exact order in which `policy_tx_2_2_gvk_V`/`_T`
+    /// expose their public signals.
+    /// INPUT signals (`D`, `nonce`, `root`, `publicAmount`, `extDataHash`,
+    /// `inputNullifier[]`, `outputCommitment[]`). Unlike `run_policy_gvk`
+    /// above (which only checks the public signals as a sorted multiset),
+    /// this is the load-bearing fact the pool-gvk contract's `verify_proof`
+    /// public-input assembly will depend on.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn run_policy_gvk_public_input_order(circuit: PolicyGvkCircuit) -> Result<()> {
+        let proof = prove_policy_gvk_case(circuit)?;
+        let n_ins = proof.in_notes.len();
+        // build_base_inputs always sets extDataHash to 0 in these tests.
+        let ext_data_hash = Scalar::from(0u64);
+
+        let idx = |i: usize| Scalar::from(u64::try_from(i).expect("small note index"));
+        let mut ciphertexts = Vec::new();
+        if proof.encrypt_inputs {
+            for (k, inp) in proof.in_notes.iter().enumerate() {
+                let note = Note {
+                    pk: derive_public_key(inp.priv_key),
+                    amount: inp.amount,
+                    blinding: inp.blinding,
+                    salt: proof.in_salts[k],
+                };
+                ciphertexts.push(encrypt_note(&note, proof.d, proof.nonce, idx(k)));
+            }
+        }
+        for (k, out) in proof.out_notes.iter().enumerate() {
+            let note = Note {
+                pk: out.pub_key,
+                amount: out.amount,
+                blinding: out.blinding,
+                salt: proof.out_salts[k],
+            };
+            ciphertexts.push(encrypt_note(&note, proof.d, proof.nonce, idx(n_ins + k)));
+        }
+
+        let mut expected: Vec<Scalar> = Vec::new();
+        for ct in &ciphertexts {
+            expected.push(ct.r.0);
+            expected.push(ct.r.1);
+        }
+        for ct in &ciphertexts {
+            expected.push(ct.c1);
+        }
+        for ct in &ciphertexts {
+            expected.push(ct.c2);
+        }
+        for ct in &ciphertexts {
+            expected.push(ct.c3);
+        }
+
+        // component main {public [D, nonce, root, publicAmount, extDataHash,
+        // inputNullifier, outputCommitment]}
+        expected.extend([
+            proof.d.0,
+            proof.d.1,
+            proof.nonce,
+            proof.witness.root,
+            proof.public_amount,
+            ext_data_hash,
+        ]);
+        expected.extend(proof.witness.nullifiers.iter().copied());
+        expected.extend(
+            proof
+                .out_notes
+                .iter()
+                .map(|out| commitment(out.amount, out.pub_key, out.blinding)),
+        );
+
+        assert_eq!(
+            proof.publics, expected,
+            "{}: public signal order must match the measured output-signals-then-public-inputs order",
+            proof.stem
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_tx_2_2_gvk_viewonly_public_input_order() -> Result<()> {
+        run_policy_gvk_public_input_order(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_gvk_V",
+            asp: PolicyAspWitness::None,
+            encrypt_inputs: false,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn policy_tx_2_2_gvk_traceable_public_input_order() -> Result<()> {
+        run_policy_gvk_public_input_order(PolicyGvkCircuit {
+            stem: "policy_tx_2_2_gvk_T",
+            asp: PolicyAspWitness::None,
+            encrypt_inputs: true,
+        })
+    }
+}

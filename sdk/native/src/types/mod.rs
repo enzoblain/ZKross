@@ -1,0 +1,815 @@
+mod address;
+mod amounts;
+mod chain_data;
+mod circuit_stem;
+mod client;
+mod correlation;
+mod disclosure;
+mod ext_data;
+mod gvk;
+mod logging;
+mod policy_tx;
+pub use address::*;
+pub use amounts::*;
+use anyhow::{Result, anyhow};
+pub use chain_data::*;
+pub use circuit_stem::{CircuitStem, KEY_OWNERSHIP_CIRCUIT};
+pub use client::*;
+pub use correlation::*;
+pub use disclosure::*;
+pub use ext_data::*;
+pub use gvk::*;
+pub use logging::*;
+pub use policy_tx::*;
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Sibling count of the ASP non-membership circuit. The last sibling must be
+/// zero, so paths of at most `SMT_DEPTH - 1` levels are provable.
+pub const SMT_DEPTH: u32 = 32;
+
+// deployments/<network>/deployments.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Default))]
+pub struct ContractConfig {
+    pub network: String,
+    #[serde(
+        default,
+        rename = "networkPassphrase",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub network_passphrase: Option<String>,
+    #[serde(default, rename = "rpcUrl", skip_serializing_if = "Option::is_none")]
+    pub rpc_url: Option<String>,
+    /// Privacy key derivation domain.
+    pub kdf_domain: String,
+    pub deployer: String,
+    pub admin: String,
+    /// Address of ASP membership deployed contract
+    pub asp_membership: String,
+    /// ASP membership contracts added after `asp_membership`, with their
+    /// deployment ledgers.
+    #[serde(default)]
+    pub added_asp_memberships: Vec<TreeConfigEntry>,
+    /// Address of ASP nonmembership deployed contract
+    pub asp_non_membership: String,
+    /// Groth16 verifier contracts keyed by policy circuit suffix (`""`, `A`,
+    /// `B`, `AB`).
+    pub verifiers: BTreeMap<String, String>,
+    /// Address of public key registry deployed contract
+    pub public_key_registry: String,
+    /// Pool deployments (one per supported asset/token).
+    pub pools: Vec<PoolConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolConfigEntry {
+    pub pool_contract_id: String,
+    pub token_contract_id: String,
+    /// Ledger sequence at (or immediately before) pool deployment.
+    ///
+    /// Used as a stable cold-start anchor for fresh local DBs so the indexer
+    /// can reconstruct the pool tree from events.
+    pub deployment_ledger: u32,
+    pub enabled: bool,
+    pub asset: AssetDescriptor,
+    /// ASP policy flags for transact proofs.
+    pub policy_flags: PolicyFlags,
+    /// Global View Key mode for this pool. Defaults to [`GvkMode::Off`] for
+    /// backwards compatibility
+    #[serde(default)]
+    pub gvk_mode: GvkMode,
+    /// Pool admin's Baby JubJub public key `D`, informational only
+    /// not verified. `None` when `gvk_mode` is [`GvkMode::Off`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gvk_authority_pub_key: Option<BabyJubJubPoint>,
+}
+
+/// A tree contract and the ledger it was deployed at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeConfigEntry {
+    /// Address of the deployed tree contract.
+    pub contract_id: String,
+    /// Ledger at or just before the tree's deployment; the indexer replays from
+    /// here.
+    pub deployment_ledger: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum AssetDescriptor {
+    Native,
+    /// Classic Stellar asset (CODE:ISSUER).
+    // `rename_all` on the enum only renames the variant tags, not the fields
+    // inside struct variants, so it must be repeated per variant to keep the
+    // JSON camelCase (e.g. `contractId`) consistent with deployments.json and
+    // the frontend.
+    #[serde(rename_all = "camelCase")]
+    Classic {
+        code: String,
+        issuer: String,
+    },
+    /// Token contract address (Soroban contract id).
+    #[serde(rename_all = "camelCase")]
+    Contract {
+        contract_id: String,
+        /// Token `symbol()` captured at deployment time and stored in the
+        /// config.
+        symbol: String,
+    },
+}
+
+/// ASP membership proof data needed by the circuit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AspMembershipProof {
+    /// Membership leaf (BN254 scalar field element).
+    pub leaf: Field,
+    /// Membership blinding used when the leaf was added (BN254 scalar field
+    /// element).
+    pub blinding: Field,
+    /// Membership Merkle path sibling hashes (BN254 scalar field elements).
+    pub path_elements: Vec<Field>,
+    /// Membership Merkle path indices packed into a field element.
+    pub path_indices: Field,
+    /// Membership tree root (BN254 scalar field element).
+    pub root: Field,
+}
+
+/// User note (UTXO).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserNote {
+    /// Commitment hash (hex, primary key).
+    pub id: String,
+    /// Owner Stellar address.
+    pub owner: String,
+    /// Note private key (hex).
+    pub private_key: String,
+    /// Blinding factor (hex).
+    pub blinding: String,
+    /// Amount as decimal string.
+    pub amount: String,
+    /// Leaf index; `None` until mined.
+    pub leaf_index: Option<u32>,
+    /// ISO-8601 creation timestamp.
+    pub created_at: String,
+    /// Ledger sequence when created.
+    pub created_at_ledger: u32,
+    /// Whether the note has been spent.
+    pub spent: bool,
+    /// Ledger sequence when spent; `None` if unspent.
+    pub spent_at_ledger: Option<u32>,
+    /// `true` if received via transfer.
+    pub is_received: bool,
+}
+
+/// Registered public key entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicKeyEntry {
+    /// Stellar address (primary key).
+    pub address: String,
+    /// X25519 encryption public key (hex).
+    pub encryption_key: EncryptionPublicKey,
+    /// BN254 note public key (hex).
+    pub note_key: NotePublicKey,
+    /// Ledger sequence when registered.
+    pub ledger: u32,
+}
+
+/// A compact note view for UI rendering and spending selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserNoteSummary {
+    /// Pool commitment (hex).
+    pub id: Field,
+    /// Pool contract id that owns the commitment.
+    pub pool_contract_id: String,
+    /// Amount in stroops.
+    pub amount: NoteAmount,
+    /// Commitment leaf index in the pool Merkle tree.
+    pub leaf_index: u32,
+    /// Ledger sequence when the commitment event was observed.
+    pub created_at_ledger: u32,
+    /// Whether the note has been spent (nullifier observed).
+    pub spent: bool,
+    /// Admin audit ciphertext from the commitment event, if the pool emits GVK
+    /// data.
+    pub gvk_ciphertext: Option<GlobalViewKeyCiphertext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BootnodeSetting {
+    pub enabled: bool,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortfolioBalance {
+    pub pool_contract_id: String,
+    pub token_contract_id: String,
+    pub token_label: String,
+    pub amount: NoteAmount,
+    pub note_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortfolioPoolEntry {
+    pub pool_contract_id: String,
+    pub token_contract_id: String,
+    pub token_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipientLookup {
+    pub entry: Option<PublicKeyEntry>,
+    pub registry_fully_synced: bool,
+    pub network_tip_ledger: u32,
+    pub registry_last_fully_indexed_ledger: u32,
+}
+
+/// A high-level operation the user performed in a pool (deposit / sent /
+/// withdraw / advanced), persisted in `user_operations` and shown as pool
+/// history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserOperation {
+    pub op_type: String,
+    /// Amount in stroops (absolute), as a decimal string.
+    pub amount: String,
+    /// "in" | "out" | "none" — used to sign/colour the amount in the UI.
+    pub direction: String,
+    pub counterparty: Option<String>,
+    pub tx_hash: Option<String>,
+    /// Unix milliseconds when the operation was recorded (client clock).
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalFeedItem {
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub ledger: u32,
+    pub contract_id: Option<String>,
+    pub pool_contract_id: Option<String>,
+    pub tx_type: Option<String>,
+}
+
+/// Wallet signature used to derive both privacy keypairs
+#[derive(Clone, Serialize, Deserialize)]
+pub struct KeyDerivationSignature(pub Vec<u8>);
+
+impl std::fmt::Debug for KeyDerivationSignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeyDerivationSignature(<redacted>)")
+    }
+}
+
+impl Drop for KeyDerivationSignature {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// Encryption private key
+#[derive(Clone)]
+pub struct EncryptionPrivateKey(pub [u8; 32]);
+
+impl std::fmt::Debug for EncryptionPrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EncryptionPrivateKey(<redacted>)")
+    }
+}
+
+impl Drop for EncryptionPrivateKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// Encryption public key
+#[derive(Debug, Clone)]
+pub struct EncryptionPublicKey(pub [u8; 32]);
+
+/// Encryption key pair
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionKeyPair {
+    /// Encryption private key
+    pub private: EncryptionPrivateKey,
+    /// Encryption public key
+    pub public: EncryptionPublicKey,
+}
+
+/// Note ownership private key
+#[derive(Clone)]
+pub struct NotePrivateKey(pub [u8; 32]);
+
+impl std::fmt::Debug for NotePrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NotePrivateKey(<redacted>)")
+    }
+}
+
+impl Drop for NotePrivateKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// Note ownership public key
+#[derive(Debug, Clone)]
+pub struct NotePublicKey(pub [u8; 32]);
+
+pub fn encode_0x_hex(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(2 + 64);
+    out.push_str("0x");
+    out.push_str(&hex::encode(bytes));
+    out
+}
+
+pub fn parse_0x_hex_32(s: &str) -> Result<[u8; 32]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 64 {
+        return Err(anyhow!("expected 64 hex chars, got {}", s.len()));
+    }
+
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(s, &mut out)
+        .map_err(|e| anyhow!("cannot decode hex `{s}` to 32 bytes: {e}"))?;
+    Ok(out)
+}
+
+impl PoolConfigEntry {
+    pub fn token_label(&self) -> String {
+        match &self.asset {
+            AssetDescriptor::Native => "XLM".to_string(),
+            AssetDescriptor::Classic { code, .. } => code.clone(),
+            AssetDescriptor::Contract { symbol, .. } => symbol.clone(),
+        }
+    }
+
+    pub fn circuit_stem(&self) -> CircuitStem {
+        CircuitStem::transact(self.policy_flags, self.gvk_mode)
+    }
+}
+
+impl From<&PoolConfigEntry> for PortfolioPoolEntry {
+    fn from(pool: &PoolConfigEntry) -> Self {
+        Self {
+            pool_contract_id: pool.pool_contract_id.clone(),
+            token_contract_id: pool.token_contract_id.clone(),
+            token_label: pool.token_label(),
+        }
+    }
+}
+
+impl ContractConfig {
+    /// Reject missing identity metadata and connections to another network.
+    pub fn validate_network(&self, passphrase: &str) -> Result<()> {
+        let expected = self
+            .network_passphrase
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("deployment config is missing networkPassphrase"))?;
+        if expected != passphrase {
+            return Err(anyhow!("network passphrase mismatch for {}", self.network));
+        }
+        Ok(())
+    }
+
+    pub fn enabled_pools(&self) -> impl Iterator<Item = &PoolConfigEntry> {
+        self.pools.iter().filter(|p| p.enabled)
+    }
+
+    /// Enabled pool metadata for portfolio rendering.
+    pub fn portfolio_pools(&self) -> Vec<PortfolioPoolEntry> {
+        self.enabled_pools().map(PortfolioPoolEntry::from).collect()
+    }
+
+    /// Returns the contracts the indexer reads, with the deployment ledger of
+    /// enabled pools and added allowlists, and `None` for `asp_membership` and
+    /// the public key registry.
+    pub(crate) fn indexed_contracts(&self) -> impl Iterator<Item = (&str, Option<u32>)> {
+        self.enabled_pools()
+            .map(|p| (p.pool_contract_id.as_str(), Some(p.deployment_ledger)))
+            .chain([(self.asp_membership.as_str(), None)])
+            .chain(
+                self.added_asp_memberships
+                    .iter()
+                    .map(|tree| (tree.contract_id.as_str(), Some(tree.deployment_ledger))),
+            )
+            .chain([(self.public_key_registry.as_str(), None)])
+    }
+
+    /// Returns the contract IDs of enabled pools, every ASP membership
+    /// contract, and the public key registry.
+    pub fn all_contract_ids(&self) -> Vec<String> {
+        self.indexed_contracts()
+            .map(|(contract_id, _)| contract_id.to_owned())
+            .collect()
+    }
+
+    /// Returns the earliest deployment ledger among enabled pools and added ASP
+    /// membership contracts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no pool is enabled and no ASP membership contract
+    /// was added.
+    pub fn min_deployment_ledger(&self) -> Result<u32> {
+        self.indexed_contracts()
+            .filter_map(|(_, deployment_ledger)| deployment_ledger)
+            .min()
+            .ok_or_else(|| anyhow!("at least one pool should be enabled"))
+    }
+
+    /// Pool entry from `deployments.json`.
+    pub fn pool(&self, pool_contract_id: &str) -> Result<&PoolConfigEntry> {
+        self.pools
+            .iter()
+            .find(|p| p.pool_contract_id == pool_contract_id)
+            .ok_or_else(|| anyhow!("pool {pool_contract_id} not found in deployment config"))
+    }
+
+    /// Verifier contract for a policy flag set.
+    pub fn verifier_for(&self, flags: PolicyFlags) -> Result<&str> {
+        let key = flags.circuit_suffix();
+        self.verifiers
+            .get(&key)
+            .map(String::as_str)
+            .ok_or_else(|| anyhow!("no verifier configured for policy flags {key:?}"))
+    }
+}
+
+impl EncryptionPublicKey {
+    /// Parse a `0x`-prefixed (or raw) 32-byte hex string.
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(Self(parse_0x_hex_32(s)?))
+    }
+}
+
+impl EncryptionPrivateKey {
+    /// Parse a `0x`-prefixed (or raw) 32-byte hex string.
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(Self(parse_0x_hex_32(s)?))
+    }
+}
+
+impl NotePublicKey {
+    /// Parse a `0x`-prefixed (or raw) 32-byte hex string.
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(Self(parse_0x_hex_32(s)?))
+    }
+}
+
+impl NotePrivateKey {
+    /// Parse a `0x`-prefixed (or raw) 32-byte hex string.
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(Self(parse_0x_hex_32(s)?))
+    }
+}
+
+macro_rules! impl_key_serde_hex {
+    ($ty:ident) => {
+        impl Serialize for $ty {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> core::result::Result<S::Ok, S::Error> {
+                chain_data::serde_0x_hex_32::serialize(&self.0, serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> core::result::Result<Self, D::Error> {
+                chain_data::serde_0x_hex_32::deserialize(deserializer).map($ty)
+            }
+        }
+    };
+}
+
+impl_key_serde_hex!(EncryptionPrivateKey);
+impl_key_serde_hex!(EncryptionPublicKey);
+impl_key_serde_hex!(NotePrivateKey);
+impl_key_serde_hex!(NotePublicKey);
+
+mod rusqlite_key_impls {
+    use super::{EncryptionPrivateKey, EncryptionPublicKey, NotePrivateKey, NotePublicKey};
+    use rusqlite::types::{
+        FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, Value, ValueRef,
+    };
+
+    macro_rules! impl_key_rusqlite_blob_32 {
+        ($ty:ident) => {
+            impl ToSql for $ty {
+                fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+                    Ok(ToSqlOutput::Owned(Value::Blob(self.0.to_vec())))
+                }
+            }
+
+            impl FromSql for $ty {
+                fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+                    match value {
+                        ValueRef::Blob(b) => {
+                            if b.len() != 32 {
+                                return Err(FromSqlError::InvalidBlobSize {
+                                    expected_size: 32,
+                                    blob_size: b.len(),
+                                });
+                            }
+                            let mut out = [0u8; 32];
+                            out.copy_from_slice(b);
+                            Ok($ty(out))
+                        }
+                        _ => Err(FromSqlError::InvalidType),
+                    }
+                }
+            }
+        };
+    }
+
+    impl_key_rusqlite_blob_32!(EncryptionPrivateKey);
+    impl_key_rusqlite_blob_32!(EncryptionPublicKey);
+    impl_key_rusqlite_blob_32!(NotePrivateKey);
+    impl_key_rusqlite_blob_32!(NotePublicKey);
+}
+
+#[cfg(test)]
+mod key_serde_tests {
+    use super::*;
+    use anyhow::Result;
+
+    fn pattern_bytes() -> Result<[u8; 32]> {
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::try_from(i).map_err(|_| anyhow::anyhow!("index out of range"))?;
+        }
+        Ok(out)
+    }
+
+    macro_rules! hex_key_tests {
+        ($ty:ident, $mod_name:ident) => {
+            mod $mod_name {
+                use super::*;
+
+                #[test]
+                fn serde_zero_is_0x_64hex() -> Result<()> {
+                    let k = $ty([0u8; 32]);
+                    let s = serde_json::to_string(&k)?;
+                    assert_eq!(
+                        s,
+                        "\"0x0000000000000000000000000000000000000000000000000000000000000000\""
+                    );
+                    let parsed: $ty = serde_json::from_str(&s)?;
+                    assert_eq!(parsed.0, k.0);
+                    Ok(())
+                }
+
+                #[test]
+                fn serde_roundtrip_pattern() -> Result<()> {
+                    let k = $ty(pattern_bytes()?);
+                    let s = serde_json::to_string(&k)?;
+                    let parsed: $ty = serde_json::from_str(&s)?;
+                    assert_eq!(parsed.0, k.0);
+                    Ok(())
+                }
+
+                #[test]
+                fn serde_accepts_missing_0x_prefix() -> Result<()> {
+                    let s = "\"0000000000000000000000000000000000000000000000000000000000000000\"";
+                    let parsed: $ty = serde_json::from_str(s)?;
+                    let roundtrip = serde_json::to_string(&parsed)?;
+                    assert_eq!(
+                        roundtrip,
+                        "\"0x0000000000000000000000000000000000000000000000000000000000000000\""
+                    );
+                    Ok(())
+                }
+
+                #[test]
+                fn serde_rejects_wrong_length() -> Result<()> {
+                    let s = "\"0x00\"";
+                    assert!(serde_json::from_str::<$ty>(s).is_err());
+                    Ok(())
+                }
+
+                #[test]
+                fn serde_rejects_invalid_hex() -> Result<()> {
+                    let s =
+                        "\"0xgg00000000000000000000000000000000000000000000000000000000000000\"";
+                    assert!(serde_json::from_str::<$ty>(s).is_err());
+                    Ok(())
+                }
+
+                #[test]
+                fn serde_rejects_legacy_byte_array() -> Result<()> {
+                    let s = "[0,1,2,3]";
+                    assert!(serde_json::from_str::<$ty>(s).is_err());
+                    Ok(())
+                }
+            }
+        };
+    }
+
+    hex_key_tests!(EncryptionPrivateKey, encryption_private_key);
+    hex_key_tests!(EncryptionPublicKey, encryption_public_key);
+    hex_key_tests!(NotePrivateKey, note_private_key);
+    hex_key_tests!(NotePublicKey, note_public_key);
+
+    #[test]
+    fn note_public_key_deserialize_from_plain_str_deserializer() -> Result<()> {
+        let raw = "18c7f3bd72cb3170d476aa09ef5e706c33e6b578369a95368bd0f09c82314321";
+        let d = serde::de::value::BorrowedStrDeserializer::<serde::de::value::Error>::new(raw);
+        let parsed: NotePublicKey = <NotePublicKey as serde::Deserialize>::deserialize(d)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let roundtrip = serde_json::to_string(&parsed)?;
+        assert_eq!(roundtrip, format!("\"0x{raw}\""));
+        Ok(())
+    }
+}
+
+/// Note ownership key pair
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteKeyPair {
+    /// Note ownership private key
+    pub private: NotePrivateKey,
+    /// Note ownership public key
+    pub public: NotePublicKey,
+}
+
+macro_rules! impl_byte_wrapper {
+    ($name:ident) => {
+        impl std::convert::TryFrom<Vec<u8>> for $name {
+            type Error = anyhow::Error;
+
+            fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+                let len = value.len();
+                if len != 32 {
+                    return Err(anyhow!(
+                        "{}: Invalid length. Expected 32, got {}",
+                        stringify!($name),
+                        len
+                    ));
+                }
+                let array: [u8; 32] = value.try_into().map_err(|_| anyhow!("Conversion failed"))?;
+                Ok($name(array))
+            }
+        }
+
+        impl From<[u8; 32]> for $name {
+            fn from(bytes: [u8; 32]) -> Self {
+                $name(bytes)
+            }
+        }
+
+        impl AsRef<[u8; 32]> for $name {
+            fn as_ref(&self) -> &[u8; 32] {
+                &self.0
+            }
+        }
+    };
+}
+
+// Apply the macro to your types
+impl_byte_wrapper!(EncryptionPrivateKey);
+impl_byte_wrapper!(EncryptionPublicKey);
+impl_byte_wrapper!(NotePrivateKey);
+impl_byte_wrapper!(NotePublicKey);
+
+#[cfg(test)]
+mod pool_config_gvk_tests {
+    use super::*;
+
+    #[test]
+    fn pool_config_entry_round_trips_with_gvk_fields_set() -> Result<()> {
+        let json = r#"{
+            "poolContractId": "CPOOL",
+            "tokenContractId": "CTOKEN",
+            "deploymentLedger": 1,
+            "enabled": true,
+            "asset": {"kind": "native"},
+            "policyFlags": [],
+            "gvkMode": "traceable",
+            "gvkAuthorityPubKey": {
+                "x": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "y": "0x0000000000000000000000000000000000000000000000000000000000000002"
+            }
+        }"#;
+
+        let pool: PoolConfigEntry = serde_json::from_str(json)?;
+        assert_eq!(pool.gvk_mode, GvkMode::Traceable);
+        assert_eq!(
+            pool.gvk_authority_pub_key,
+            Some(BabyJubJubPoint {
+                x: Field(U256::from(1)),
+                y: Field(U256::from(2)),
+            })
+        );
+
+        let round_tripped = serde_json::to_string(&pool)?;
+        let parsed: PoolConfigEntry = serde_json::from_str(&round_tripped)?;
+        assert_eq!(parsed.gvk_mode, pool.gvk_mode);
+        assert_eq!(parsed.gvk_authority_pub_key, pool.gvk_authority_pub_key);
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod network_config_tests {
+    use super::ContractConfig;
+    fn legacy() -> ContractConfig {
+        serde_json::from_str(r#"{"network":"custom","kdf_domain":"tests","deployer":"","admin":"","asp_membership":"","asp_non_membership":"","verifiers":{},"public_key_registry":"","pools":[]}"#).expect("valid config fixture")
+    }
+    #[test]
+    fn old_schema_loads_but_cannot_skip_network_validation() {
+        let config = legacy();
+        assert!(config.network_passphrase.is_none());
+        assert!(config.validate_network("anything").is_err());
+    }
+    #[test]
+    fn network_identity_uses_passphrase_not_name() {
+        let mut config = legacy();
+        config.network_passphrase = Some("custom passphrase".into());
+        config.rpc_url = Some("http://localhost:8000/rpc".into());
+        assert!(config.validate_network("custom passphrase").is_ok());
+        assert!(config.validate_network("different").is_err());
+        let value = serde_json::to_value(&config).expect("valid config fixture");
+        assert_eq!(value["networkPassphrase"], "custom passphrase");
+        let parsed: ContractConfig = serde_json::from_value(value).expect("valid config fixture");
+        assert_eq!(parsed.rpc_url, config.rpc_url);
+    }
+}
+
+#[cfg(test)]
+mod contract_config_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A pool deployed at ledger 100, and ASP membership contracts added at
+    /// ledgers 300 and 80.
+    fn config() -> Result<ContractConfig> {
+        Ok(serde_json::from_value(json!({
+            "network": "test",
+            "kdf_domain": "tests",
+            "deployer": "GDEPLOYER",
+            "admin": "GADMIN",
+            "asp_membership": "CMEMBERSHIP",
+            "added_asp_memberships": [
+                {"contractId": "CADDED_A", "deploymentLedger": 300},
+                {"contractId": "CADDED_B", "deploymentLedger": 80},
+            ],
+            "asp_non_membership": "CNONMEMBERSHIP",
+            "verifiers": {},
+            "public_key_registry": "CREGISTRY",
+            "pools": [{
+                "poolContractId": "CPOOL",
+                "tokenContractId": "CTOKEN",
+                "deploymentLedger": 100,
+                "enabled": true,
+                "asset": {"kind": "native"},
+                "policyFlags": ["allowlist"],
+            }],
+        }))?)
+    }
+
+    #[test]
+    fn all_contract_ids_names_every_added_allowlist() -> Result<()> {
+        assert_eq!(
+            config()?.all_contract_ids(),
+            ["CPOOL", "CMEMBERSHIP", "CADDED_A", "CADDED_B", "CREGISTRY"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn min_deployment_ledger_counts_added_allowlists() -> Result<()> {
+        assert_eq!(config()?.min_deployment_ledger()?, 80);
+        Ok(())
+    }
+
+    #[test]
+    fn a_manifest_without_added_allowlists_still_parses() -> Result<()> {
+        let mut manifest = serde_json::to_value(config()?)?;
+        let object = manifest
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("ContractConfig serializes as an object"))?;
+        assert!(object.remove("added_asp_memberships").is_some());
+
+        let config: ContractConfig = serde_json::from_value(manifest)?;
+        assert!(config.added_asp_memberships.is_empty());
+        Ok(())
+    }
+}

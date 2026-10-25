@@ -1,0 +1,1004 @@
+use super::{
+    conversions::{
+        field_to_scval_u256, scval_to_address_string, scval_to_baby_jub_jub_point, scval_to_bool,
+        scval_to_policy_flags, scval_to_string, scval_to_tree_state, scval_to_u32, scval_to_u64,
+        scval_to_u256,
+    },
+    rpc::{Client, ContractDataBulkRequest},
+};
+use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use stellar_xdr as xdr;
+
+use crate::types::{
+    AspMembership, AspNonMembership, AspNonMembershipProof, BabyJubJubPoint, ContractConfig,
+    ContractsStateData, ExtAmount, Field, GlobalViewKeyCiphertext, GvkMode, NotePublicKey,
+    PoolInfo, SMT_DEPTH, TransactChainContext, transact_chain_context_from_state,
+};
+
+macro_rules! get_state {
+    ($map:expr, $key:expr, $source:expr) => {
+        $map.get($key).ok_or_else(|| {
+            anyhow::anyhow!("missing {} state key in the contract {:?}", $key, $source)
+        })
+    };
+}
+
+/// Returns the root history slot holding the root produced by the insertion
+/// that set the leaf counter to `next_index`, in a ring of `ring_len` slots.
+///
+/// The pool derives the slot rather than storing it, so the SDK derives the
+/// same slot to address the root it wants.
+///
+/// # Errors
+///
+/// Returns an error if the ring is empty or the slot does not fit in a `u32`.
+fn root_slot(next_index: u64, ring_len: usize) -> Result<u32> {
+    let slot = (next_index / 2)
+        .checked_rem(u64::try_from(ring_len)?)
+        .ok_or_else(|| anyhow!("pool root history is empty"))?;
+    Ok(u32::try_from(slot)?)
+}
+
+pub struct StateFetcher {
+    pub(crate) client: Client,
+    config: ContractConfig,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedFindResult {
+    found: bool,
+    siblings: Vec<Field>,
+    not_found_key: Field,
+    not_found_value: Field,
+    is_old0: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OnchainProofPublicInputs {
+    pub root: Field,
+    pub input_nullifiers: [Field; 2],
+    pub output_commitment0: Field,
+    pub output_commitment1: Field,
+    pub public_amount: Field,
+    pub ext_data_hash_be: [u8; 32],
+    pub asp_membership_root: Field,
+    pub asp_non_membership_root: Field,
+    pub output_gvk_ciphertexts: Option<[GlobalViewKeyCiphertext; 2]>,
+    pub input_gvk_ciphertexts: Option<Vec<GlobalViewKeyCiphertext>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedSorobanTx {
+    pub tx_xdr: String,
+    /// Base64-encoded XDR `SorobanAuthorizationEntry` list from simulation.
+    pub auth_entries: Vec<String>,
+    /// Ledger number from `simulateTransaction` (`latestLedger`), for auth
+    /// expiration.
+    pub latest_ledger: u32,
+}
+
+impl StateFetcher {
+    /// Reads a pool's deposit cap, saturated at `i128::MAX`.
+    ///
+    /// The pool checks a deposit against the stored `U256` cap and then
+    /// converts the deposit to `i128`, so no cap above `i128::MAX` admits a
+    /// larger deposit.
+    fn maximum_deposit_from_pool_state(
+        pool_state: &HashMap<String, xdr::ScVal>,
+        pool_id: &str,
+    ) -> Result<ExtAmount> {
+        let cap = scval_to_u256(get_state!(pool_state, "MaximumDepositAmount", pool_id)?)?;
+        Ok(ExtAmount::from(i128::try_from(cap).unwrap_or(i128::MAX)))
+    }
+
+    /// Reads the Global View Key storage keys out of a pool's fetched state,
+    /// treating both as optional: `AdminViewKey`/`GvkMode` only exist on
+    /// `contracts/pool-gvk` deployments, never on `contracts/pool` ones.
+    fn gvk_fields_from_pool_state(
+        pool_state: &HashMap<String, xdr::ScVal>,
+    ) -> Result<(Option<BabyJubJubPoint>, Option<u32>)> {
+        let admin_view_key = pool_state
+            .get("AdminViewKey")
+            .map(scval_to_baby_jub_jub_point)
+            .transpose()?;
+        let gvk_mode = pool_state.get("GvkMode").map(scval_to_u32).transpose()?;
+        Ok((admin_view_key, gvk_mode))
+    }
+
+    /// Reads a pool's deposit flag from its fetched state.
+    ///
+    /// Pools deployed before the flag cannot be paused, so a missing key reads
+    /// as `false`.
+    fn deposits_paused_from_state(pool_state: &HashMap<String, xdr::ScVal>) -> Result<bool> {
+        Ok(pool_state
+            .get("DepositsPaused")
+            .map(scval_to_bool)
+            .transpose()?
+            .unwrap_or(false))
+    }
+
+    /// Cross-checks a pool's configured GVK settings against what the chain
+    /// actually stores.
+    ///
+    /// `PoolConfigEntry`'s GVK fields were previously documented as
+    /// "informational only, not verified". They are the discriminator an
+    /// indexer needs in order to know a pool's event schema before decoding
+    /// its events — available at ingest time and replayable for historical
+    /// events, unlike a live read of an archivable storage entry. Verifying
+    /// them here is what makes them trustworthy enough to dispatch on.
+    ///
+    /// A mismatch means the deployment and the config disagree, which would
+    /// otherwise surface much later as audit data nobody can decrypt.
+    fn verify_gvk_config(
+        pool: &crate::types::PoolConfigEntry,
+        chain_admin_view_key: Option<&BabyJubJubPoint>,
+        chain_gvk_mode: Option<u32>,
+    ) -> Result<()> {
+        let pool_id = &pool.pool_contract_id;
+
+        // A pool-gvk deployment writes both keys at construction; one without
+        // the other is a partial or corrupted deployment, not a valid state.
+        match (chain_admin_view_key.as_ref(), chain_gvk_mode) {
+            (Some(_), None) => {
+                return Err(anyhow!(
+                    "pool {pool_id} has an on-chain AdminViewKey but no GvkMode"
+                ));
+            }
+            (None, Some(mode)) => {
+                return Err(anyhow!(
+                    "pool {pool_id} has an on-chain GvkMode {mode} but no AdminViewKey"
+                ));
+            }
+            _ => {}
+        }
+
+        let chain_mode = GvkMode::from_on_chain_value(chain_gvk_mode)
+            .map_err(|e| anyhow!("pool {pool_id}: {e}"))?;
+        if chain_mode != pool.gvk_mode {
+            return Err(anyhow!(
+                "pool {pool_id} GVK mode mismatch: config says {:?}, chain says {chain_mode:?}",
+                pool.gvk_mode
+            ));
+        }
+
+        // The authority key is optional in config even for a GVK pool; verify
+        // it only when it is declared, since an absent one pins nothing.
+        if let Some(configured) = pool.gvk_authority_pub_key.as_ref()
+            && Some(configured) != chain_admin_view_key
+        {
+            return Err(anyhow!(
+                "pool {pool_id} GVK authority key mismatch: config says {configured:?}, chain says {chain_admin_view_key:?}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn new(client: Client, config: ContractConfig) -> Result<Self> {
+        Ok(Self { client, config })
+    }
+
+    pub fn contract_config(&self) -> &ContractConfig {
+        &self.config
+    }
+
+    pub fn rpc(&self) -> &Client {
+        &self.client
+    }
+
+    pub fn enabled_pool_for(
+        &self,
+        pool_contract_id: &str,
+    ) -> Result<&crate::types::PoolConfigEntry> {
+        self.config
+            .pools
+            .iter()
+            .find(|p| p.enabled && p.pool_contract_id == pool_contract_id)
+            .ok_or_else(|| {
+                anyhow!("enabled pool not found in deployments config: {pool_contract_id}")
+            })
+    }
+
+    pub async fn all_contracts_data(&self) -> Result<ContractsStateData> {
+        let enabled_pools: Vec<&crate::types::PoolConfigEntry> =
+            self.config.pools.iter().filter(|p| p.enabled).collect();
+        self.contracts_data(
+            &enabled_pools,
+            &self.config.asp_membership,
+            &self.config.asp_non_membership,
+        )
+        .await
+    }
+
+    /// Returns the state of an enabled pool and of the two trees it reads.
+    ///
+    /// Reads the tree IDs from the pool, not the manifest, since the admin can
+    /// re-point it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pool is not an enabled deployment, an RPC read
+    /// fails, or a stored value does not decode.
+    pub async fn contracts_data_for_pool(
+        &self,
+        pool_contract_id: &str,
+    ) -> Result<ContractsStateData> {
+        let enabled_pool = self.enabled_pool_for(pool_contract_id)?;
+        let (bulk_state, ledger) = self
+            .client
+            .get_contract_data_bulk(&[Self::pool_request(enabled_pool)])
+            .await?;
+        let pool_state = bulk_state
+            .get(pool_contract_id)
+            .ok_or_else(|| anyhow!("missing pool state for {pool_contract_id}"))?;
+        let pool = Self::pool_info(enabled_pool, pool_state, ledger)?;
+        let mut data = self
+            .contracts_data(&[], &pool.asp_membership, &pool.asp_non_membership)
+            .await?;
+        data.pools.push(pool);
+        Ok(data)
+    }
+
+    pub async fn asp_state(&self) -> Result<ContractsStateData> {
+        self.contracts_data(
+            &[],
+            &self.config.asp_membership,
+            &self.config.asp_non_membership,
+        )
+        .await
+    }
+
+    async fn contracts_data(
+        &self,
+        enabled_pools: &[&crate::types::PoolConfigEntry],
+        asp_membership_id: &str,
+        asp_non_membership_id: &str,
+    ) -> Result<ContractsStateData> {
+        let mut requests = Vec::with_capacity(enabled_pools.len().wrapping_add(2));
+        for pool in enabled_pools.iter() {
+            requests.push(Self::pool_request(pool));
+        }
+
+        requests.push(ContractDataBulkRequest {
+            contract_id: asp_membership_id,
+            enum_keys: vec!["Admin", "NextIndex"],
+        });
+
+        requests.push(ContractDataBulkRequest {
+            contract_id: asp_non_membership_id,
+            enum_keys: vec!["Admin"],
+        });
+
+        let (bulk_state, base_latest_ledger) =
+            self.client.get_contract_data_bulk(&requests).await?;
+
+        let mut out = Vec::with_capacity(enabled_pools.len());
+        for pool in enabled_pools.iter() {
+            let pool_state = bulk_state
+                .get(&pool.pool_contract_id)
+                .ok_or_else(|| anyhow!("missing pool state for {}", pool.pool_contract_id))?;
+            out.push(Self::pool_info(pool, pool_state, base_latest_ledger)?);
+        }
+
+        let asp_membership_state = bulk_state
+            .get(asp_membership_id)
+            .ok_or_else(|| anyhow!("missing asp membership state for {asp_membership_id}"))?;
+        let asp_mem_next_index = scval_to_u64(get_state!(
+            asp_membership_state,
+            "NextIndex",
+            asp_membership_id
+        )?)?;
+        let asp_mem_levels = scval_to_u32(get_state!(
+            asp_membership_state,
+            "Levels",
+            asp_membership_id
+        )?)?;
+        let asp_mem_capacity = 2u64.pow(asp_mem_levels);
+        let root_u256 =
+            scval_to_u256(get_state!(asp_membership_state, "Root", asp_membership_id)?)?;
+        let asp_membership = AspMembership {
+            ledger: base_latest_ledger,
+            contract_id: asp_membership_id.to_string(),
+            contract_type: "ASP Membership".to_string(),
+            root: Field::try_from_u256(root_u256)?,
+            levels: asp_mem_levels,
+            next_index: asp_mem_next_index.to_string(),
+            admin: scval_to_address_string(get_state!(
+                asp_membership_state,
+                "Admin",
+                asp_membership_id
+            )?)?,
+            capacity: asp_mem_capacity,
+            used_slots: asp_mem_next_index.to_string(),
+        };
+
+        let asp_non_membership_state = bulk_state.get(asp_non_membership_id).ok_or_else(|| {
+            anyhow!("missing asp non-membership state for {asp_non_membership_id}")
+        })?;
+        let asp_nonmem_root_u256 = scval_to_u256(get_state!(
+            asp_non_membership_state,
+            "Root",
+            asp_non_membership_id
+        )?)?;
+        let asp_nonmem_root = Field::try_from_u256(asp_nonmem_root_u256)?;
+        let asp_non_membership = AspNonMembership {
+            ledger: base_latest_ledger,
+            contract_id: asp_non_membership_id.to_string(),
+            contract_type: "ASP Non-Membership (Sparse Merkle Tree)".to_string(),
+            root: asp_nonmem_root,
+            is_empty: asp_nonmem_root.is_zero(),
+            admin: scval_to_address_string(get_state!(
+                asp_non_membership_state,
+                "Admin",
+                asp_non_membership_id
+            )?)?,
+        };
+
+        Ok(ContractsStateData {
+            pools: out,
+            asp_membership,
+            asp_non_membership,
+        })
+    }
+
+    /// Returns the request for the entries of `pool` that
+    /// [`Self::pool_info`] decodes.
+    fn pool_request(pool: &crate::types::PoolConfigEntry) -> ContractDataBulkRequest<'_> {
+        ContractDataBulkRequest {
+            contract_id: &pool.pool_contract_id,
+            // Only the admin and the tree state have their own ledger keys.
+            // Everything else, `pool-gvk`'s keys included, rides the instance.
+            enum_keys: vec!["Admin", "State"],
+        }
+    }
+
+    /// Decodes the state of `pool` from its entries, read at `ledger`.
+    fn pool_info(
+        pool: &crate::types::PoolConfigEntry,
+        pool_state: &HashMap<String, xdr::ScVal>,
+        ledger: u32,
+    ) -> Result<PoolInfo> {
+        // The counter and the ring share one entry, so the root read here
+        // is the one the counter names.
+        let tree = scval_to_tree_state(get_state!(pool_state, "State", pool.pool_contract_id)?)?;
+        let merkle_current_root_index = root_slot(tree.next_index, tree.roots.len())?;
+        let merkle_root = tree
+            .roots
+            .get(usize::try_from(merkle_current_root_index)?)
+            .cloned()
+            .map(Field::try_from_u256)
+            .transpose()?;
+
+        let merkle_levels = scval_to_u32(get_state!(pool_state, "Levels", pool.pool_contract_id)?)?;
+        let merkle_capacity = 2u64.pow(merkle_levels);
+        let merkle_next_index = tree.next_index;
+        let maximum_deposit_amount =
+            Self::maximum_deposit_from_pool_state(pool_state, &pool.pool_contract_id)?;
+        let (gvk_admin_view_key, gvk_mode) = Self::gvk_fields_from_pool_state(pool_state)?;
+        Self::verify_gvk_config(pool, gvk_admin_view_key.as_ref(), gvk_mode)?;
+
+        Ok(PoolInfo {
+            ledger,
+            contract_id: pool.pool_contract_id.clone(),
+            contract_type: "Privacy Pool".to_string(),
+            admin: scval_to_address_string(get_state!(
+                pool_state,
+                "Admin",
+                pool.pool_contract_id
+            )?)?,
+            token: scval_to_address_string(get_state!(
+                pool_state,
+                "Token",
+                pool.pool_contract_id
+            )?)?,
+            verifier: scval_to_address_string(get_state!(
+                pool_state,
+                "Verifier",
+                pool.pool_contract_id
+            )?)?,
+            asp_membership: scval_to_address_string(get_state!(
+                pool_state,
+                "ASPMembership",
+                pool.pool_contract_id
+            )?)?,
+            asp_non_membership: scval_to_address_string(get_state!(
+                pool_state,
+                "ASPNonMembership",
+                pool.pool_contract_id
+            )?)?,
+            merkle_levels,
+            merkle_current_root_index: Some(merkle_current_root_index),
+            merkle_next_index: merkle_next_index.to_string(),
+            maximum_deposit_amount,
+            deposits_paused: Self::deposits_paused_from_state(pool_state)?,
+            merkle_root,
+            merkle_capacity,
+            total_commitments: merkle_next_index.to_string(),
+            policy_flags: scval_to_policy_flags(get_state!(
+                pool_state,
+                "PolicyFlags",
+                pool.pool_contract_id
+            )?)?,
+            admin_view_key: gvk_admin_view_key,
+            gvk_mode,
+        })
+    }
+
+    /// Builds ASP SMT non-membership proof data by querying the on-chain SMT
+    /// via `simulateTransaction`.
+    ///
+    /// `asp_non_membership` is the blocklist the pool reads, as
+    /// [`PoolInfo::asp_non_membership`] reports it.
+    ///
+    /// - if `non_membership_root == 0`, returns a dummy "empty tree" proof
+    ///   padded to `smt_depth`
+    /// - otherwise calls `asp_non_membership.find_key(key)`, pads shorter
+    ///   sibling paths to `smt_depth`, and rejects paths of `smt_depth` or more
+    ///   siblings, which the circuit cannot prove
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `smt_depth` is 0, the note key is not a field
+    /// element, the `find_key` simulation fails or returns a result that does
+    /// not decode, the note key is in the tree, or the returned path has
+    /// `smt_depth` or more siblings.
+    pub async fn get_nonmembership_proof(
+        &self,
+        asp_non_membership: &str,
+        note_pubkey: &NotePublicKey,
+        non_membership_root: Field,
+        smt_depth: usize,
+    ) -> Result<AspNonMembershipProof> {
+        if smt_depth == 0 {
+            return Err(anyhow!("smt_depth must be > 0"));
+        }
+
+        // NotePublicKey bytes are little-endian field bytes (see
+        // prover::serialization).
+        let key = Field::try_from_le_bytes(*note_pubkey.as_ref())?;
+
+        // Empty tree case (root = 0): non-membership is trivially provable.
+        if non_membership_root.is_zero() {
+            return Ok(AspNonMembershipProof {
+                key,
+                old_key: Field::ZERO,
+                old_value: Field::ZERO,
+                is_old0: true,
+                siblings: vec![Field::ZERO; smt_depth],
+                root: Field::ZERO,
+            });
+        }
+
+        let retval = self
+            .client
+            .read_contract(
+                asp_non_membership,
+                &self.config.deployer,
+                "find_key",
+                vec![field_to_scval_u256(key)],
+            )
+            .await?;
+        Self::nonmembership_proof_from_find_result(&retval, key, non_membership_root, smt_depth)
+    }
+
+    fn nonmembership_proof_from_find_result(
+        retval: &xdr::ScVal,
+        key: Field,
+        non_membership_root: Field,
+        smt_depth: usize,
+    ) -> Result<AspNonMembershipProof> {
+        let parsed = Self::parse_find_result(retval)?;
+
+        if parsed.found {
+            return Err(anyhow!(
+                "User note key exists in non-membership tree (user is blocklisted)"
+            ));
+        }
+
+        // The circuit requires the last sibling slot to be zero.
+        let mut siblings = parsed.siblings;
+        if siblings.len() >= smt_depth {
+            return Err(anyhow!(
+                "ASP non-membership proof has {} sibling(s), but the policy SMT depth {} proves at most {}",
+                siblings.len(),
+                smt_depth,
+                smt_depth.saturating_sub(1)
+            ));
+        }
+
+        let padding = smt_depth.saturating_sub(siblings.len());
+        siblings.extend(core::iter::repeat_n(Field::ZERO, padding));
+
+        Ok(AspNonMembershipProof {
+            key,
+            old_key: parsed.not_found_key,
+            old_value: parsed.not_found_value,
+            is_old0: parsed.is_old0,
+            siblings,
+            root: non_membership_root,
+        })
+    }
+
+    /// Pool + ASP chain anchors for a single `transact` prove step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Self::contracts_data_for_pool`] fails, the pool
+    /// needs membership proofs and the manifest does not name its allowlist,
+    /// the blocklist simulation fails or finds the note key, or the pool's
+    /// state has no Merkle root or an unknown GVK mode.
+    pub async fn transact_chain_context(
+        &self,
+        pool_contract_id: &str,
+        note_pubkey: &NotePublicKey,
+    ) -> Result<TransactChainContext> {
+        let data = self.contracts_data_for_pool(pool_contract_id).await?;
+        let policy_flags = data
+            .pools
+            .first()
+            .map(|pool| pool.policy_flags)
+            .ok_or_else(|| anyhow!("pool data not fetched for {pool_contract_id}"))?;
+        let asp_membership = &data.asp_membership.contract_id;
+        if policy_flags.requires_membership_proofs()
+            && !self
+                .config
+                .indexed_contracts()
+                .any(|(contract_id, _)| contract_id == asp_membership)
+        {
+            return Err(anyhow!(
+                "pool {pool_contract_id} reads the allowlist {asp_membership}, which the deployment manifest does not name: add it to added_asp_memberships with its deployment ledger"
+            ));
+        }
+        let non_membership_proof = if policy_flags.requires_non_membership_proofs() {
+            Some(
+                self.get_nonmembership_proof(
+                    &data.asp_non_membership.contract_id,
+                    note_pubkey,
+                    data.asp_non_membership.root,
+                    SMT_DEPTH as usize,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        transact_chain_context_from_state(data, pool_contract_id, non_membership_proof)
+    }
+
+    /// Checks whether a pool Merkle root is still known by the deployed pool.
+    ///
+    /// # Arguments
+    /// * `pool_contract_id` - Contract id of the enabled pool to query.
+    /// * `root` - Pool Merkle root to check.
+    ///
+    /// # Returns
+    /// Returns `true` when the root is in the pool root-history window.
+    ///
+    /// # Errors
+    /// Returns an error if the pool is not an enabled deployment, the
+    /// simulation fails, or the contract returns a non-boolean value.
+    pub async fn is_pool_known_root(&self, pool_contract_id: &str, root: Field) -> Result<bool> {
+        let pool = self.enabled_pool_for(pool_contract_id)?;
+        let retval = self
+            .client
+            .read_contract(
+                &pool.pool_contract_id,
+                &self.config.deployer,
+                "is_known_root",
+                vec![field_to_scval_u256(root)],
+            )
+            .await?;
+        Ok(scval_to_bool(&retval)?)
+    }
+
+    /// Checks whether a note nullifier has been spent in the pool.
+    ///
+    /// Simulates the pool's public `is_spent` entrypoint via the Soroban RPC
+    /// `simulateTransaction` endpoint. Unlike scanning `NewNullifierEvent`
+    /// contract events, this reads current contract state, so it is bounded
+    /// neither by the RPC's event retention window nor by per-request ledger
+    /// scan limits. Archived nullifier entries still read as spent.
+    ///
+    /// # Arguments
+    /// * `pool_contract_id` - Contract id of the enabled pool to query.
+    /// * `nullifier` - Note nullifier to check.
+    ///
+    /// # Returns
+    /// Returns `true` when the pool reports the nullifier as spent.
+    ///
+    /// # Errors
+    /// Returns an error if the pool is not an enabled deployment, the
+    /// simulation fails, or the contract returns a non-boolean value.
+    pub async fn is_nullifier_spent(
+        &self,
+        pool_contract_id: &str,
+        nullifier: Field,
+    ) -> Result<bool> {
+        let pool = self.enabled_pool_for(pool_contract_id)?;
+        let retval = self
+            .client
+            .read_contract(
+                &pool.pool_contract_id,
+                &self.config.deployer,
+                "is_spent",
+                vec![field_to_scval_u256(nullifier)],
+            )
+            .await?;
+        Ok(scval_to_bool(&retval)?)
+    }
+
+    /// Reads the key derivation domain the public key registry was deployed
+    /// with.
+    pub async fn registry_kdf_domain(&self) -> Result<String> {
+        let retval = self
+            .client
+            .read_contract(
+                &self.config.public_key_registry,
+                &self.config.deployer,
+                "get_kdf_domain",
+                Vec::new(),
+            )
+            .await?;
+        Ok(scval_to_string(&retval)?)
+    }
+
+    fn parse_find_result(val: &xdr::ScVal) -> Result<ParsedFindResult> {
+        let xdr::ScVal::Map(Some(map)) = val else {
+            return Err(anyhow!("FindResult: expected ScVal::Map, got {val:?}"));
+        };
+
+        let mut fields = std::collections::HashMap::<String, xdr::ScVal>::new();
+        for xdr::ScMapEntry { key, val } in map.iter() {
+            let name = match key {
+                xdr::ScVal::Symbol(sym) => sym.to_utf8_string()?,
+                _ => {
+                    return Err(anyhow!(
+                        "FindResult: field name should be a symbol: {key:?}"
+                    ));
+                }
+            };
+            fields.insert(name, val.clone());
+        }
+
+        let found = scval_to_bool(
+            fields
+                .get("found")
+                .ok_or_else(|| anyhow!("FindResult missing field: found"))?,
+        )?;
+
+        let mut siblings = Vec::new();
+        if let Some(v) = fields.get("siblings") {
+            match v {
+                xdr::ScVal::Vec(Some(sc_vec)) => {
+                    for inner in sc_vec.0.iter() {
+                        let u = scval_to_u256(inner)?;
+                        siblings.push(Field::try_from_u256(u)?);
+                    }
+                }
+                xdr::ScVal::Vec(None) => {}
+                other => return Err(anyhow!("FindResult.siblings: unexpected ScVal: {other:?}")),
+            }
+        }
+
+        let not_found_key = fields
+            .get("not_found_key")
+            .or_else(|| fields.get("notFoundKey"))
+            .map(scval_to_u256)
+            .transpose()?
+            .map(Field::try_from_u256)
+            .transpose()?
+            .unwrap_or(Field::ZERO);
+
+        let not_found_value = fields
+            .get("not_found_value")
+            .or_else(|| fields.get("notFoundValue"))
+            .map(scval_to_u256)
+            .transpose()?
+            .map(Field::try_from_u256)
+            .transpose()?
+            .unwrap_or(Field::ZERO);
+
+        let is_old0 = fields
+            .get("is_old0")
+            .or_else(|| fields.get("isOld0"))
+            .map(scval_to_bool)
+            .transpose()?
+            .unwrap_or(false);
+
+        Ok(ParsedFindResult {
+            found,
+            siblings,
+            not_found_key,
+            not_found_value,
+            is_old0,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::U256;
+
+    /// A pool inserts two leaves per call, so the ring advances one slot every
+    /// two leaves and wraps after as many calls as the ring has slots. The
+    /// cases are the empty tree, the first call, the last slot before the
+    /// wrap, the first call after it, and a ring with no slots at all.
+    #[test]
+    fn root_slot_follows_the_leaf_count() {
+        assert_eq!(root_slot(0, 90).expect("slot for an empty tree"), 0);
+        assert_eq!(root_slot(2, 90).expect("slot after one call"), 1);
+        assert_eq!(root_slot(178, 90).expect("slot at the end of the ring"), 89);
+        assert_eq!(root_slot(180, 90).expect("slot after the ring wraps"), 0);
+        assert!(root_slot(2, 0).is_err());
+    }
+
+    fn field(v: u64) -> Field {
+        Field(U256::from(v))
+    }
+
+    fn sc_symbol(name: &str) -> xdr::ScVal {
+        xdr::ScVal::Symbol(xdr::ScSymbol(name.try_into().expect("symbol")))
+    }
+
+    fn sc_map_entry(name: &str, val: xdr::ScVal) -> xdr::ScMapEntry {
+        xdr::ScMapEntry {
+            key: sc_symbol(name),
+            val,
+        }
+    }
+
+    fn find_result_scval(found: bool, siblings: Vec<Field>) -> xdr::ScVal {
+        let siblings = xdr::ScVec::try_from(
+            siblings
+                .into_iter()
+                .map(field_to_scval_u256)
+                .collect::<Vec<_>>(),
+        )
+        .expect("siblings");
+        let entries = xdr::ScMap(
+            vec![
+                sc_map_entry("found", xdr::ScVal::Bool(found)),
+                sc_map_entry("siblings", xdr::ScVal::Vec(Some(siblings))),
+            ]
+            .try_into()
+            .expect("find result map"),
+        );
+
+        xdr::ScVal::Map(Some(entries))
+    }
+
+    #[test]
+    fn non_membership_proof_rejects_over_depth_find_result() {
+        let retval = find_result_scval(false, vec![field(1), field(2), field(3)]);
+        let err =
+            StateFetcher::nonmembership_proof_from_find_result(&retval, field(9), field(10), 2)
+                .expect_err("over-depth parsed FindResult must be rejected");
+
+        assert!(
+            err.to_string().contains(
+                "ASP non-membership proof has 3 sibling(s), but the policy SMT depth 2 proves at most 1"
+            ),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn non_membership_proof_requires_empty_last_sibling_slot() {
+        let full = find_result_scval(false, vec![field(1), field(2), field(3)]);
+        StateFetcher::nonmembership_proof_from_find_result(&full, field(9), field(10), 3)
+            .expect_err("a path filling every sibling slot must be rejected");
+
+        let deepest = find_result_scval(false, vec![field(1), field(2)]);
+        let proof =
+            StateFetcher::nonmembership_proof_from_find_result(&deepest, field(9), field(10), 3)
+                .expect("a path one level short of the depth must be accepted");
+        assert_eq!(proof.siblings, vec![field(1), field(2), Field::ZERO]);
+    }
+
+    fn baby_jub_jub_point_scval(x: Field, y: Field) -> xdr::ScVal {
+        let entries = xdr::ScMap(
+            vec![
+                sc_map_entry("x", field_to_scval_u256(x)),
+                sc_map_entry("y", field_to_scval_u256(y)),
+            ]
+            .try_into()
+            .expect("point map"),
+        );
+        xdr::ScVal::Map(Some(entries))
+    }
+
+    #[test]
+    fn gvk_fields_are_none_for_a_pool_deployment() {
+        // `contracts/pool` never writes `AdminViewKey`/`GvkMode`, so a
+        // pool's fetched state simply lacks those keys.
+        let pool_state: HashMap<String, xdr::ScVal> = HashMap::new();
+
+        let (admin_view_key, gvk_mode) =
+            StateFetcher::gvk_fields_from_pool_state(&pool_state).expect("no GVK keys present");
+
+        assert!(admin_view_key.is_none());
+        assert!(gvk_mode.is_none());
+    }
+
+    #[test]
+    fn gvk_fields_are_some_for_a_pool_gvk_deployment() {
+        let mut pool_state: HashMap<String, xdr::ScVal> = HashMap::new();
+        pool_state.insert(
+            "AdminViewKey".to_string(),
+            baby_jub_jub_point_scval(field(7), field(11)),
+        );
+        pool_state.insert("GvkMode".to_string(), xdr::ScVal::U32(2));
+
+        let (admin_view_key, gvk_mode) =
+            StateFetcher::gvk_fields_from_pool_state(&pool_state).expect("GVK keys present");
+
+        assert_eq!(
+            admin_view_key,
+            Some(BabyJubJubPoint {
+                x: field(7),
+                y: field(11)
+            })
+        );
+        assert_eq!(gvk_mode, Some(2));
+    }
+
+    #[test]
+    fn deposits_paused_is_false_for_a_pool_deployed_before_the_flag() {
+        let pool_state: HashMap<String, xdr::ScVal> = HashMap::new();
+
+        let paused = StateFetcher::deposits_paused_from_state(&pool_state)
+            .expect("no DepositsPaused key present");
+
+        assert!(!paused);
+    }
+
+    #[test]
+    fn deposits_paused_is_read_from_a_pool_that_stores_it() {
+        let pool_state = HashMap::from([("DepositsPaused".to_string(), xdr::ScVal::Bool(true))]);
+
+        let paused = StateFetcher::deposits_paused_from_state(&pool_state)
+            .expect("DepositsPaused key present");
+
+        assert!(paused);
+    }
+
+    #[test]
+    fn a_deposits_paused_entry_that_is_not_a_bool_is_rejected() {
+        let pool_state = HashMap::from([("DepositsPaused".to_string(), xdr::ScVal::U32(1))]);
+
+        let err = StateFetcher::deposits_paused_from_state(&pool_state)
+            .expect_err("DepositsPaused must be a bool");
+
+        assert!(err.to_string().contains("Unexpected ScVal"), "{err}");
+    }
+
+    /// The pool never takes a deposit above `i128::MAX`, so a larger cap reads
+    /// as `i128::MAX` instead of failing the whole pool read. A smaller cap
+    /// reads unchanged.
+    #[test]
+    fn maximum_deposit_saturates_at_i128_max() {
+        let read = |cap: U256| {
+            let pool_state = HashMap::from([(
+                "MaximumDepositAmount".to_string(),
+                field_to_scval_u256(Field(cap)),
+            )]);
+            StateFetcher::maximum_deposit_from_pool_state(&pool_state, "CPOOL").expect("cap reads")
+        };
+
+        assert_eq!(read(U256::from(1u128 << 127)), ExtAmount::MAX);
+        assert_eq!(read(U256::MAX), ExtAmount::MAX);
+        assert_eq!(
+            read(U256::from(i128::MAX - 1)),
+            ExtAmount::from(i128::MAX - 1)
+        );
+    }
+
+    fn pool_entry(
+        gvk_mode: GvkMode,
+        key: Option<BabyJubJubPoint>,
+    ) -> crate::types::PoolConfigEntry {
+        crate::types::PoolConfigEntry {
+            pool_contract_id: "CPOOL".to_string(),
+            token_contract_id: "CTOKEN".to_string(),
+            deployment_ledger: 1,
+            enabled: true,
+            asset: crate::types::AssetDescriptor::Native,
+            policy_flags: crate::types::PolicyFlags::EMPTY,
+            gvk_mode,
+            gvk_authority_pub_key: key,
+        }
+    }
+
+    fn point(x: u64, y: u64) -> BabyJubJubPoint {
+        BabyJubJubPoint {
+            x: field(x),
+            y: field(y),
+        }
+    }
+
+    #[test]
+    fn gvk_config_accepts_a_matching_pool_deployment() {
+        let pool = pool_entry(GvkMode::Off, None);
+        StateFetcher::verify_gvk_config(&pool, None, None).expect("pool deployment agrees");
+    }
+
+    #[test]
+    fn gvk_config_accepts_a_matching_pool_gvk_deployment() {
+        let pool = pool_entry(GvkMode::Traceable, Some(point(7, 11)));
+        StateFetcher::verify_gvk_config(&pool, Some(&point(7, 11)), Some(2))
+            .expect("pool-gvk deployment agrees");
+    }
+
+    /// A GVK pool may omit the authority key from config; the mode still has
+    /// to agree, but an undeclared key pins nothing and must not error.
+    #[test]
+    fn gvk_config_accepts_a_gvk_pool_without_a_configured_authority_key() {
+        let pool = pool_entry(GvkMode::ViewOnly, None);
+        StateFetcher::verify_gvk_config(&pool, Some(&point(7, 11)), Some(1))
+            .expect("undeclared authority key is not verified");
+    }
+
+    #[test]
+    fn gvk_config_rejects_config_gvk_against_a_pool_deployment() {
+        let pool = pool_entry(GvkMode::ViewOnly, Some(point(7, 11)));
+        let err = StateFetcher::verify_gvk_config(&pool, None, None)
+            .expect_err("config claims GVK, chain has none");
+        assert!(format!("{err:#}").contains("GVK mode mismatch"), "{err:#}");
+    }
+
+    #[test]
+    fn gvk_config_rejects_config_off_against_a_pool_gvk_deployment() {
+        let pool = pool_entry(GvkMode::Off, None);
+        let err = StateFetcher::verify_gvk_config(&pool, Some(&point(7, 11)), Some(1))
+            .expect_err("config says Off, chain is GVK");
+        assert!(format!("{err:#}").contains("GVK mode mismatch"), "{err:#}");
+    }
+
+    #[test]
+    fn gvk_config_rejects_a_mode_disagreement() {
+        let pool = pool_entry(GvkMode::ViewOnly, Some(point(7, 11)));
+        let err = StateFetcher::verify_gvk_config(&pool, Some(&point(7, 11)), Some(2))
+            .expect_err("view-only config against a traceable pool");
+        assert!(format!("{err:#}").contains("GVK mode mismatch"), "{err:#}");
+    }
+
+    #[test]
+    fn gvk_config_rejects_an_authority_key_disagreement() {
+        let pool = pool_entry(GvkMode::Traceable, Some(point(7, 11)));
+        let err = StateFetcher::verify_gvk_config(&pool, Some(&point(7, 12)), Some(2))
+            .expect_err("configured key differs from the deployed one");
+        assert!(
+            format!("{err:#}").contains("GVK authority key mismatch"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn gvk_config_rejects_partial_on_chain_state() {
+        let pool = pool_entry(GvkMode::Traceable, Some(point(7, 11)));
+
+        let err = StateFetcher::verify_gvk_config(&pool, Some(&point(7, 11)), None)
+            .expect_err("AdminViewKey without GvkMode");
+        assert!(format!("{err:#}").contains("no GvkMode"), "{err:#}");
+
+        let err = StateFetcher::verify_gvk_config(&pool, None, Some(2))
+            .expect_err("GvkMode without AdminViewKey");
+        assert!(format!("{err:#}").contains("no AdminViewKey"), "{err:#}");
+    }
+
+    #[test]
+    fn gvk_config_rejects_an_unknown_on_chain_mode() {
+        let pool = pool_entry(GvkMode::Traceable, Some(point(7, 11)));
+        let err = StateFetcher::verify_gvk_config(&pool, Some(&point(7, 11)), Some(99))
+            .expect_err("unknown mode value");
+        assert!(
+            format!("{err:#}").contains("unknown on-chain GVK mode"),
+            "{err:#}"
+        );
+    }
+}

@@ -1,0 +1,166 @@
+use std::str::FromStr;
+
+use stellar_private_payments::{
+    planner::Transact,
+    types::{EncryptionPublicKey, ExtAmount, Field, NoteAmount, NotePublicKey},
+    zk::flows::N_OUTPUTS,
+};
+use wasm_bindgen::prelude::*;
+
+use super::config::contract_config_from_js;
+
+pub(crate) struct TransactConfig {
+    ext_recipient: String,
+    ext_amount: i128,
+    input_note_ids: Vec<String>,
+    output_amounts: Vec<u128>,
+    out_recipient_note_keys_hex: Vec<Option<String>>,
+    out_recipient_enc_keys_hex: Vec<Option<String>>,
+}
+
+impl TransactConfig {
+    fn from_value(value: JsValue) -> Result<TransactConfig, JsError> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            ext_recipient: String,
+            ext_amount: i128,
+            input_note_ids: Vec<String>,
+            output_amounts: Vec<u128>,
+            out_recipient_note_keys_hex: Vec<Option<String>>,
+            out_recipient_enc_keys_hex: Vec<Option<String>>,
+        }
+        let raw: Raw = serde_wasm_bindgen::from_value(value)
+            .map_err(|e| JsError::new(&format!("invalid transact config: {e}")))?;
+        Ok(Self {
+            ext_recipient: raw.ext_recipient,
+            ext_amount: raw.ext_amount,
+            input_note_ids: raw.input_note_ids,
+            output_amounts: raw.output_amounts,
+            out_recipient_note_keys_hex: raw.out_recipient_note_keys_hex,
+            out_recipient_enc_keys_hex: raw.out_recipient_enc_keys_hex,
+        })
+    }
+
+    fn into_transact(self) -> Result<Transact, JsError> {
+        if self.input_note_ids.len() > 2 {
+            return Err(JsError::new("inputNoteIds must have length 0..=2"));
+        }
+        if self.output_amounts.len() != N_OUTPUTS {
+            return Err(JsError::new(&format!(
+                "outputAmounts must have length {N_OUTPUTS}"
+            )));
+        }
+        if self.out_recipient_note_keys_hex.len() != N_OUTPUTS {
+            return Err(JsError::new(&format!(
+                "outRecipientNoteKeysHex must have length {N_OUTPUTS}"
+            )));
+        }
+        if self.out_recipient_enc_keys_hex.len() != N_OUTPUTS {
+            return Err(JsError::new(&format!(
+                "outRecipientEncKeysHex must have length {N_OUTPUTS}"
+            )));
+        }
+
+        let ext_amount = ExtAmount::from(self.ext_amount);
+        let input_commitments = self
+            .input_note_ids
+            .iter()
+            .map(|s| Field::from_str(s.trim()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        let mut output_amounts = [NoteAmount::ZERO; N_OUTPUTS];
+        for (out, stroops) in output_amounts.iter_mut().zip(self.output_amounts) {
+            *out = NoteAmount::from(stroops);
+        }
+
+        let mut out_recipient_note_pubkeys: [Option<NotePublicKey>; N_OUTPUTS] = [None, None];
+        let mut out_recipient_encryption_pubkeys: [Option<EncryptionPublicKey>; N_OUTPUTS] =
+            [None, None];
+        for i in 0..N_OUTPUTS {
+            if let Some(hex) = &self.out_recipient_note_keys_hex[i] {
+                out_recipient_note_pubkeys[i] =
+                    Some(NotePublicKey::parse(hex).map_err(|e| JsError::new(&e.to_string()))?);
+            }
+            if let Some(hex) = &self.out_recipient_enc_keys_hex[i] {
+                out_recipient_encryption_pubkeys[i] = Some(
+                    EncryptionPublicKey::parse(hex).map_err(|e| JsError::new(&e.to_string()))?,
+                );
+            }
+        }
+
+        Ok(Transact::new(
+            input_commitments,
+            output_amounts,
+            ext_amount,
+            self.ext_recipient,
+            out_recipient_note_pubkeys,
+            out_recipient_encryption_pubkeys,
+        ))
+    }
+}
+
+pub(crate) fn transact_from_js(value: JsValue) -> Result<Transact, JsError> {
+    TransactConfig::from_value(value)?.into_transact()
+}
+
+#[wasm_bindgen]
+pub struct PoolOptions {
+    pool_contract: String,
+}
+
+#[wasm_bindgen]
+impl PoolOptions {
+    #[wasm_bindgen(constructor)]
+    pub fn new(pool_contract: String) -> Self {
+        Self { pool_contract }
+    }
+
+    #[wasm_bindgen(js_name = fromValue)]
+    pub fn from_value(value: JsValue) -> Result<PoolOptions, JsError> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            pool_contract: String,
+        }
+        let raw: Raw = serde_wasm_bindgen::from_value(value)
+            .map_err(|e| JsError::new(&format!("invalid pool options: {e}")))?;
+        Ok(Self {
+            pool_contract: raw.pool_contract,
+        })
+    }
+
+    #[wasm_bindgen(getter, js_name = poolContract)]
+    pub fn pool_contract(&self) -> String {
+        self.pool_contract.clone()
+    }
+}
+
+#[wasm_bindgen]
+pub struct VerifyDisclosureOptions {
+    contract_config: super::config::ContractConfig,
+}
+
+#[wasm_bindgen]
+impl VerifyDisclosureOptions {
+    #[wasm_bindgen(js_name = fromValue)]
+    pub fn from_value(value: JsValue) -> Result<VerifyDisclosureOptions, JsError> {
+        if value.is_null() || value.is_undefined() {
+            return Err(JsError::new(
+                "verifySelectiveDisclosure options with contractConfig are required",
+            ));
+        }
+        let contract_config = js_sys::Reflect::get(&value, &JsValue::from_str("contractConfig"))
+            .map_err(|_| {
+                JsError::new("verifySelectiveDisclosure options: contractConfig is required")
+            })?;
+        Ok(Self {
+            contract_config: contract_config_from_js(contract_config)?,
+        })
+    }
+
+    pub(crate) fn contract_config(&self) -> &super::config::ContractConfig {
+        &self.contract_config
+    }
+}

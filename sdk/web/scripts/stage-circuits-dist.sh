@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Stage compiled circuits + LGPL corresponding source into sdk/web/dist/.
+set -euo pipefail
+
+case "${SPP_NETWORK:-testnet}" in
+  *[!a-zA-Z0-9_-]*) echo "invalid SPP_NETWORK" >&2; exit 1 ;;
+esac
+
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+WEB="$ROOT/sdk/web"
+CIRCUITS_OUT="$ROOT/target/circuits-artifacts"
+KEYS_DIR="$ROOT/deployments/${SPP_NETWORK:-testnet}/circuit_keys"
+DIST="$WEB/dist"
+
+CIRCUIT_ARTIFACTS=(
+  policy_tx_2_2.graph.bin
+  policy_tx_2_2.r1cs
+  policy_tx_2_2_A.graph.bin
+  policy_tx_2_2_A.r1cs
+  policy_tx_2_2_B.graph.bin
+  policy_tx_2_2_B.r1cs
+  policy_tx_2_2_AB.graph.bin
+  policy_tx_2_2_AB.r1cs
+  policy_tx_2_2_gvk_V.graph.bin
+  policy_tx_2_2_gvk_V.r1cs
+  policy_tx_2_2_gvk_T.graph.bin
+  policy_tx_2_2_gvk_T.r1cs
+  policy_tx_2_2_A_gvk_V.graph.bin
+  policy_tx_2_2_A_gvk_V.r1cs
+  policy_tx_2_2_A_gvk_T.graph.bin
+  policy_tx_2_2_A_gvk_T.r1cs
+  policy_tx_2_2_B_gvk_V.graph.bin
+  policy_tx_2_2_B_gvk_V.r1cs
+  policy_tx_2_2_B_gvk_T.graph.bin
+  policy_tx_2_2_B_gvk_T.r1cs
+  policy_tx_2_2_AB_gvk_V.graph.bin
+  policy_tx_2_2_AB_gvk_V.r1cs
+  policy_tx_2_2_AB_gvk_T.graph.bin
+  policy_tx_2_2_AB_gvk_T.r1cs
+  selectiveDisclosure_1.graph.bin
+  selectiveDisclosure_1.r1cs
+  selectiveDisclosure_2.graph.bin
+  selectiveDisclosure_2.r1cs
+  selectiveDisclosure_3.graph.bin
+  selectiveDisclosure_3.r1cs
+  selectiveDisclosure_4.graph.bin
+  selectiveDisclosure_4.r1cs
+  keyOwnership.graph.bin
+  keyOwnership.r1cs
+)
+
+# Allow other scripts to source this file just to read the CIRCUIT_ARTIFACTS array.
+if [[ "${STAGE_CIRCUITS_DIST_SOURCE_ONLY:-}" == "1" ]]; then
+  return 0
+fi
+
+if [[ ! -d "$CIRCUITS_OUT" ]]; then
+  echo "error: missing $CIRCUITS_OUT — run make circuits" >&2
+  exit 1
+fi
+
+sh "$ROOT/deployments/scripts/circuit-artifacts.sh" verify
+
+# Start from a clean circuits directory so stale files from earlier builds (e.g.
+# old cache sidecars or renamed circuits) cannot leak into the npm package.
+rm -rf "$DIST/circuits"
+mkdir -p "$DIST/circuits" "$DIST/licenses"
+cp "$ROOT/deployments/${SPP_NETWORK:-testnet}/circuits.json" "$DIST/circuits/circuits.json"
+
+for name in "${CIRCUIT_ARTIFACTS[@]}"; do
+  if [[ "$name" == *.graph.bin ]]; then
+    src="$KEYS_DIR/$name"
+  else
+    src="$CIRCUITS_OUT/$name"
+  fi
+  [[ -f "$src" ]] || { echo "error: missing circuit artifact $src" >&2; exit 1; }
+  cp "$src" "$DIST/circuits/$name"
+done
+
+KEYS=(
+  policy_tx_2_2_proving_key.bin
+  policy_tx_2_2_A_proving_key.bin
+  policy_tx_2_2_B_proving_key.bin
+  policy_tx_2_2_AB_proving_key.bin
+  policy_tx_2_2_gvk_V_proving_key.bin
+  policy_tx_2_2_gvk_T_proving_key.bin
+  policy_tx_2_2_A_gvk_V_proving_key.bin
+  policy_tx_2_2_A_gvk_T_proving_key.bin
+  policy_tx_2_2_B_gvk_V_proving_key.bin
+  policy_tx_2_2_B_gvk_T_proving_key.bin
+  policy_tx_2_2_AB_gvk_V_proving_key.bin
+  policy_tx_2_2_AB_gvk_T_proving_key.bin
+  selectiveDisclosure_1_proving_key.bin
+  selectiveDisclosure_2_proving_key.bin
+  selectiveDisclosure_3_proving_key.bin
+  selectiveDisclosure_4_proving_key.bin
+  keyOwnership_proving_key.bin
+)
+
+for name in "${KEYS[@]}"; do
+  src="$KEYS_DIR/$name"
+  [[ -f "$src" ]] || { echo "error: missing proving key $src" >&2; exit 1; }
+  cp "$src" "$DIST/circuits/$name"
+done
+
+
+echo "==> Packaging circuits source bundle (LGPL corresponding source)..."
+sh "$ROOT/deployments/scripts/package-circuits-source-bundle.sh" \
+  "$DIST/circuits/source-bundle.tar.gz"
+
+cp "$ROOT/LICENSE" "$DIST/LICENSE.txt"
+cp "$ROOT/deployments/legal/licenses/LGPL-3.0.txt" "$DIST/licenses/LGPL-3.0.txt"
+cp "$ROOT/circuits/COPYING" "$DIST/licenses/GPL-3.0.txt"
+
+CIRCOMLIB_COMMIT="$(tr -d ' \n\r' < "$ROOT/circuits/circomlib.lock" 2>/dev/null || true)"
+CIRCOMLIB_COMMIT="${CIRCOMLIB_COMMIT:-unknown}"
+
+REPO_COMMIT="unknown"
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  REPO_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+fi
+
+BUILD_DATE_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+SOURCE_BUNDLE_URL="./source-bundle.tar.gz"
+
+sed \
+  -e "s|@REPO_COMMIT@|$REPO_COMMIT|g" \
+  -e "s|@BUILD_DATE_UTC@|$BUILD_DATE_UTC|g" \
+  -e "s|@CIRCOMLIB_COMMIT@|$CIRCOMLIB_COMMIT|g" \
+  -e "s|@SOURCE_BUNDLE_URL@|$SOURCE_BUNDLE_URL|g" \
+  -e 's|`dist/licenses/|`../licenses/|g' \
+  -e 's|`dist/LICENSE.txt`|`../LICENSE.txt`|g' \
+  "$ROOT/deployments/legal/dist/circuits-NOTICE.txt" > "$DIST/circuits/NOTICE.txt"
+
+echo "==> Staged dist/circuits/ ($(du -sh "$DIST/circuits" | awk '{print $1}'))"

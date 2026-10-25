@@ -1,0 +1,509 @@
+//! Shared bootstrap helpers for the `sdk/native` examples.
+//!
+//! Centralizes env-var handling, deployment/artifact loading, client
+//! construction, and signer setup so each example can focus on the API it
+//! demonstrates.
+//!
+//! # Env-var contract
+//!
+//! | Variable | Default | Required by |
+//! | --- | --- | --- |
+//! | `SPP_RPC_URL` | `https://soroban-testnet.stellar.org` | all examples |
+//! | `SPP_NETWORK_PASSPHRASE` | derived from `network` in deployments.json | account/pool/transact examples |
+//! | `SPP_BOOTNODE_URL` | `https://bootnode.dev-nethermind.xyz` | all examples |
+//! | `SPP_WALLET_PATH` | `./spp-example-wallet.sqlite` | all examples |
+//! | `SPP_STORAGE_ACCOUNT` | unset | optional `stellar keys` alias to unlock `SPP_WALLET_PATH` |
+//! | `SPP_DEPLOYMENT_JSON` | `<CARGO_MANIFEST_DIR>/../../deployments/testnet/deployments.json` | all examples |
+//! | `SPP_POOL_CONTRACT_ID` | first enabled pool from deployment config | account/pool/transact examples |
+//! | `SPP_AMOUNT_STROOPS` | `10000000` token base units | estimate/transact examples |
+//! | `STELLAR_SECRET_KEY` | — | account/pool/transact examples (also unlocks `spp`-created wallets when `SPP_STORAGE_ACCOUNT` is unset) |
+//!
+//! Four prerequisite classes print a skip message and exit with code 0: a
+//! missing `STELLAR_SECRET_KEY` ([`require_env`]), a wallet without privacy
+//! keys ([`require_onboarded`]), an underfunded account
+//! ([`require_funded_for_pool`]), and an RPC retention gap
+//! ([`skip_on_retention_gap`]). Other misconfiguration returns `Err` and
+//! surfaces as a hard failure — an unreadable `SPP_DEPLOYMENT_JSON`, an
+//! unopenable `SPP_WALLET_PATH`, or a `SPP_POOL_CONTRACT_ID` that is not in the
+//! deployment config. Missing circuit artifacts also return `Err`, which the
+//! transact examples convert into a skip by matching the message.
+
+#![allow(dead_code)] // shared module: each helper is used by some example
+
+use std::path::PathBuf;
+
+use stellar_private_payments::{
+    CircuitStore, Error, LocalProver, LocalSigner, LocalStorage, ProverHandle, RetentionGap,
+    SignerHandle,
+    blocking::{Account, Client, PrivatePool},
+    chain::LocalSigner as StellarSigner,
+    types::{
+        AssetDescriptor, ContractConfig, GvkAuthoritySetting, GvkMode, NoteAmount,
+        NoteOwnerAddress, PoolConfigEntry, ProverArtifacts, SignerAddress,
+    },
+};
+
+/// Initialize a `tracing_subscriber` formatter driven by `RUST_LOG`.
+///
+/// Defaults to `info` level when `RUST_LOG` is unset.
+pub fn init_tracing() -> Result<(), String> {
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => tracing_subscriber::EnvFilter::new("info"),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .try_init()
+        .map_err(|e| format!("failed to initialize tracing subscriber: {e}"))?;
+    Ok(())
+}
+
+/// Return `var(name)` if set and non-empty, otherwise `default`.
+pub fn env_or(name: &str, default: impl Into<String>) -> String {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) | Err(_) => default.into(),
+    }
+}
+
+/// Require an environment variable; if missing, print instructions and exit 0.
+pub fn require_env(name: &str, purpose: &str) -> String {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) | Err(_) => {
+            eprintln!("Skipping: {name} is required {purpose}.");
+            eprintln!("Set {name} and re-run this example.");
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Return the Stellar network passphrase to use.
+///
+/// Honors `SPP_NETWORK_PASSPHRASE` if set, otherwise maps the deployment
+/// `network` value from `deployments.json`.
+pub fn network_passphrase(network: &str) -> Option<String> {
+    if let Ok(value) = std::env::var("SPP_NETWORK_PASSPHRASE")
+        && !value.is_empty()
+    {
+        return Some(value);
+    }
+    match network {
+        "testnet" => Some("Test SDF Network ; September 2015".to_string()),
+        "public" => Some("Public Global Stellar Network ; September 2015".to_string()),
+        "futurenet" => Some("Test SDF Future Network ; December 2023".to_string()),
+        _ => None,
+    }
+}
+
+/// Bootnode archive URL for historical event catch-up.
+///
+/// Defaults to the project bootnode used by the web app. Set
+/// `SPP_BOOTNODE_URL` to override, or to an empty string to disable it.
+///
+/// Reads the variable directly rather than through [`env_or`], which treats an
+/// empty value as unset and would make the disable case unreachable.
+pub fn bootnode_url() -> Option<String> {
+    match std::env::var("SPP_BOOTNODE_URL") {
+        // Explicitly set to empty: disable the bootnode fallback.
+        Ok(value) if value.is_empty() => None,
+        Ok(value) => Some(value),
+        Err(_) => Some("https://bootnode.dev-nethermind.xyz".to_string()),
+    }
+}
+
+/// Default path to the SQLite wallet file.
+pub fn default_wallet_path() -> String {
+    "./spp-example-wallet.sqlite".to_string()
+}
+
+/// Directory containing `Cargo.toml` for the `sdk/native` crate.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Default `deployments.json` path (testnet deployment).
+pub fn default_deployment_path() -> PathBuf {
+    manifest_dir().join("../../deployments/testnet/deployments.json")
+}
+
+/// Load the deployment config from `SPP_DEPLOYMENT_JSON` or the default testnet
+/// file.
+pub fn load_contract_config() -> Result<ContractConfig, String> {
+    let path = env_or(
+        "SPP_DEPLOYMENT_JSON",
+        default_deployment_path().to_string_lossy().into_owned(),
+    );
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read deployment config from {path}: {e}"))?;
+    serde_json::from_str(&contents).map_err(|e| format!("parse deployment config from {path}: {e}"))
+}
+
+/// Open the encrypted SQLite wallet from `SPP_WALLET_PATH` or the default file.
+///
+/// Unlocks via `SPP_STORAGE_ACCOUNT` (`stellar keys`) when set, or via
+/// `STELLAR_SECRET_KEY` when present (matching wallets created by `spp
+/// onboard`), falling back to a deterministic example key for secretless
+/// read-only examples.
+pub fn open_storage() -> Result<LocalStorage, String> {
+    use std::path::Path;
+    use stellar_private_payments::{
+        state::{
+            database_key::{DatabaseKey, OpenPurpose},
+            native_wallet,
+        },
+        types::KeyDerivationSignature,
+        zk::encryption::sep53_payload,
+    };
+
+    let path = env_or("SPP_WALLET_PATH", default_wallet_path());
+    let db_path = Path::new(&path);
+    let storage_account = env_or("SPP_STORAGE_ACCOUNT", "");
+    if !storage_account.is_empty() {
+        let key = native_wallet::unlock_with_stellar(db_path, &storage_account, None)
+            .map_err(|e| format!("unlock wallet at {path} with {storage_account}: {e}"))?;
+        return LocalStorage::open_with_key(&path, &key)
+            .map_err(|e| format!("open wallet at {path}: {e}"));
+    }
+
+    let secret = env_or("STELLAR_SECRET_KEY", "");
+    if !secret.is_empty() {
+        let signer = StellarSigner::from_secret(&secret)
+            .map_err(|e| format!("invalid STELLAR_SECRET_KEY: {e}"))?;
+        let address = signer.public_key().to_string();
+        let key = native_wallet::unlock_with(db_path, &address, &mut |message| {
+            let sig = signer.sign(&sep53_payload(message));
+            Ok(KeyDerivationSignature(sig.as_bytes().to_vec()))
+        })
+        .map_err(|e| format!("unlock wallet at {path}: {e}"))?;
+        return LocalStorage::open_with_key(&path, &key)
+            .map_err(|e| format!("open wallet at {path}: {e}"));
+    }
+
+    let exists = std::fs::metadata(db_path).is_ok_and(|m| m.len() > 0);
+    LocalStorage::open_encrypted(
+        &path,
+        DatabaseKey::new([0x45; 32]),
+        if exists {
+            OpenPurpose::OpenExisting
+        } else {
+            OpenPurpose::CreateNew
+        },
+    )
+    .map_err(|e| format!("open wallet at {path}: {e}"))
+}
+
+/// Select the pool to use: `SPP_POOL_CONTRACT_ID`, or the first enabled pool.
+pub fn select_pool(config: &ContractConfig) -> Result<&PoolConfigEntry, String> {
+    let id = env_or("SPP_POOL_CONTRACT_ID", "");
+    if id.is_empty() {
+        config
+            .enabled_pools()
+            .next()
+            .ok_or_else(|| "no enabled pools in deployment config".to_string())
+    } else {
+        config.pool(&id).map_err(|e| e.to_string())
+    }
+}
+
+/// Read proving key, graph, and r1cs for `pool`'s policy flags.
+///
+/// Uses in-repo `target/circuits-artifacts` (same dir as `make circuits`).
+/// Downloads the hashed GitHub release there when needed.
+pub fn read_artifacts_for_pool(pool: &PoolConfigEntry) -> Result<ProverArtifacts, String> {
+    let stem = pool.circuit_stem();
+    let lock = stellar_private_payments::circuit_lock(include_str!("../../circuits.json"))
+        .map_err(|e| e.to_string())?;
+    let store = CircuitStore::open(manifest_dir().join("../../target/circuits-artifacts"), lock);
+    store
+        .ensure_blocking()
+        .map_err(|e| format!("circuit artifacts: {e}"))?;
+    store
+        .artifacts(&stem.to_string())
+        .map_err(|e| format!("circuit artifacts: {e}"))
+}
+
+/// Build a read-only client (sync, balance, notes, portfolio, estimates).
+pub fn build_readonly_client(
+    storage: LocalStorage,
+    config: ContractConfig,
+) -> Result<Client, String> {
+    let rpc_url = env_or("SPP_RPC_URL", "https://soroban-testnet.stellar.org");
+    Client::init_readonly(&rpc_url, storage, config, bootnode_url())
+        .map_err(|e| format!("init readonly client: {e}"))
+}
+
+/// Build a full client with a [`LocalProver`] configured for `pool`.
+pub fn build_client_for_pool(
+    storage: LocalStorage,
+    config: ContractConfig,
+    pool: &PoolConfigEntry,
+) -> Result<Client, String> {
+    let rpc_url = env_or("SPP_RPC_URL", "https://soroban-testnet.stellar.org");
+    let artifacts = read_artifacts_for_pool(pool)?;
+    let prover = ProverHandle::from(
+        LocalProver::from_artifacts(&[(pool.circuit_stem(), artifacts)])
+            .map_err(|e| format!("init local prover: {e}"))?,
+    );
+    Client::init(&rpc_url, storage, prover, config, bootnode_url())
+        .map_err(|e| format!("init client: {e}"))
+}
+
+/// Derive the Stellar address that corresponds to `STELLAR_SECRET_KEY`.
+pub fn user_address_from_secret(secret_key: &str) -> Result<String, String> {
+    Ok(StellarSigner::from_secret(secret_key)
+        .map_err(|e| format!("invalid STELLAR_SECRET_KEY: {e}"))?
+        .public_key()
+        .to_string())
+}
+
+/// Build a signer handle from a raw secret key, network passphrase, and
+/// signing account.
+pub fn build_signer(
+    secret_key: &str,
+    network_passphrase: &str,
+    signer_address: SignerAddress,
+) -> Result<SignerHandle, String> {
+    let signer = LocalSigner::new(secret_key, network_passphrase, signer_address)
+        .map_err(|e| format!("build signer: {e}"))?;
+    Ok(SignerHandle::from(signer))
+}
+
+/// Build an account session from `STELLAR_SECRET_KEY`.
+///
+/// Exits 0 if the secret key is missing.
+pub fn build_account(client: &Client) -> Result<Account, String> {
+    let secret = require_env("STELLAR_SECRET_KEY", "to sign transactions");
+    let user_address = user_address_from_secret(&secret)?;
+    let network = client.contract_config().network.as_str();
+    let passphrase = network_passphrase(network).ok_or_else(|| {
+        format!("unknown network '{network}'; set SPP_NETWORK_PASSPHRASE explicitly")
+    })?;
+    let signer = build_signer(
+        &secret,
+        &passphrase,
+        SignerAddress::new(user_address.as_str()),
+    )?;
+    client
+        .account(NoteOwnerAddress::new(user_address.as_str()), signer)
+        .map_err(|e| format!("open account session: {e}"))
+}
+
+/// Open the pool selected by `SPP_POOL_CONTRACT_ID` for `account`.
+pub fn open_account_pool<'a>(
+    account: &'a Account,
+    config: &'a ContractConfig,
+) -> Result<(PrivatePool, &'a PoolConfigEntry), String> {
+    let pool = select_pool(config)?;
+    let pool_session = account
+        .pool(&pool.pool_contract_id)
+        .map_err(|e| format!("open pool {}: {e}", pool.pool_contract_id))?;
+    Ok((pool_session, pool))
+}
+
+/// Check that the wallet has been onboarded (privacy keys exist in storage).
+///
+/// If not, prints instructions and exits 0.
+pub fn require_onboarded(account: &Account) -> Result<(), String> {
+    match account.privacy_keys() {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let wallet = env_or("SPP_WALLET_PATH", default_wallet_path());
+            eprintln!(
+                "Skipping: wallet at {wallet} does not contain privacy keys for {}: {e}",
+                account.user_address(),
+            );
+            eprintln!("Onboard the wallet first (e.g. with the `spp` CLI) and re-run.");
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Check whether an error is the RPC retention gap reported by the indexer.
+///
+/// The public Soroban RPC retention window can be shorter than the deployment
+/// history, and the default bootnode handoff can be stale. This detector is
+/// used by examples to turn the failure into a graceful skip message.
+pub fn is_retention_gap_error(e: &Error) -> bool {
+    matches!(e, Error::RetentionGap(gap) if !matches!(gap, RetentionGap::BootnodeNotReady(_)))
+}
+
+/// Print the retention-gap skip message and exit 0.
+///
+/// Call this only after [`is_retention_gap_error`] returns true; the function
+/// never returns to the caller.
+pub fn skip_on_retention_gap(e: &Error) -> ! {
+    eprintln!("Skipping: the wallet's required history is older than the RPC retention window.");
+    eprintln!("The configured bootnode's handoff point may also be stale.");
+    eprintln!("Remedies:");
+    eprintln!("  - Set SPP_BOOTNODE_URL to a bootnode with a fresher handoff point,");
+    eprintln!("  - Set SPP_RPC_URL to a full-history RPC endpoint, or");
+    eprintln!("  - Retry later.");
+    eprintln!();
+    eprintln!("Underlying error: {e}");
+    std::process::exit(0);
+}
+
+/// Parse `SPP_AMOUNT_STROOPS` as a [`NoteAmount`] (default: 10000000 token base
+/// units).
+pub fn amount() -> Result<NoteAmount, String> {
+    let raw = env_or("SPP_AMOUNT_STROOPS", "10000000");
+    let stroops: u128 = raw
+        .parse()
+        .map_err(|e| format!("invalid SPP_AMOUNT_STROOPS `{raw}`: {e}"))?;
+    if stroops == 0 {
+        return Err("invalid SPP_AMOUNT_STROOPS `0`: amount must be greater than zero".to_string());
+    }
+    Ok(NoteAmount::from(stroops))
+}
+
+/// Load a full transact-ready client, account, and pool in one call.
+///
+/// Use this from deposit/transfer/withdraw examples.
+pub fn init_transact_session() -> Result<
+    (
+        Client,
+        Account,
+        PrivatePool,
+        ContractConfig,
+        PoolConfigEntry,
+    ),
+    String,
+> {
+    let config = load_contract_config()?;
+    let pool = select_pool(&config)?.clone();
+    let storage = open_storage()?;
+    let client = build_client_for_pool(storage, config.clone(), &pool)?;
+    let account = build_account(&client)?;
+    require_onboarded(&account)?;
+    let pool_session = account
+        .pool(&pool.pool_contract_id)
+        .map_err(|e| format!("open pool {}: {e}", pool.pool_contract_id))?;
+    Ok((client, account, pool_session, config, pool))
+}
+
+/// Verify that the wallet account can cover a deposit of `amount` for `pool`.
+///
+/// Checks the asset balance for `pool.asset`, and, for non-native assets, that
+/// enough XLM remains to pay transaction fees.
+pub fn require_funded_for_pool(account: &Account, pool: &PoolConfigEntry, amount: NoteAmount) {
+    let address = account.user_address();
+
+    let fetch_balance = |asset: &AssetDescriptor, label: &str| -> u128 {
+        match account.balance(asset) {
+            Ok(balance) => balance,
+            Err(Error::AccountNotFound { .. }) => {
+                eprintln!(
+                    "Skipping: account {address} was not found on-chain; fund it with {label} on testnet and re-run this example."
+                );
+                std::process::exit(0);
+            }
+            Err(e) => panic!("could not verify {label} funding for {address}: {e}"),
+        }
+    };
+
+    // A deposit also pays base/resource fees in XLM, regardless of which
+    // asset is deposited; require a margin so an exactly-funded account does
+    // not pass this precheck and then fail on-chain. 0.1 XLM is far above
+    // typical Soroban fees.
+    const FEE_BUFFER_STROOPS: u128 = 1_000_000;
+
+    let is_native = matches!(pool.asset, AssetDescriptor::Native);
+    let amount = u128::from(amount);
+
+    // The native balance must cover the fee buffer, plus the deposit amount
+    // itself when the deposited asset *is* native.
+    let native_needed = if is_native {
+        amount.saturating_add(FEE_BUFFER_STROOPS)
+    } else {
+        FEE_BUFFER_STROOPS
+    };
+    let native_balance = fetch_balance(&AssetDescriptor::Native, "XLM");
+    if native_balance < native_needed {
+        let purpose = if is_native {
+            "to deposit (amount plus a fee buffer)"
+        } else {
+            "to pay transaction fees"
+        };
+        eprintln!(
+            "Skipping: account {address} has {native_balance} stroops but needs at least {native_needed} stroops of XLM {purpose}."
+        );
+        eprintln!("Fund the account with XLM on testnet and re-run this example.");
+        std::process::exit(0);
+    }
+    if is_native {
+        return;
+    }
+
+    let label = pool.token_label();
+    let balance = fetch_balance(&pool.asset, &label);
+    if balance < amount {
+        eprintln!(
+            "Skipping: account {address} has {balance} of {label} but needs at least {amount} to deposit."
+        );
+        eprintln!("Fund the account with {label} on testnet and re-run this example.");
+        std::process::exit(0);
+    }
+}
+
+/// First GVK-enabled pool: `SPP_POOL_CONTRACT_ID` when set, otherwise the first
+/// enabled pool with `gvkMode != off`.
+pub fn select_gvk_pool(config: &ContractConfig) -> Result<&PoolConfigEntry, String> {
+    let id = env_or("SPP_POOL_CONTRACT_ID", "");
+    if !id.is_empty() {
+        let pool = config.pool(&id).map_err(|e| e.to_string())?;
+        if pool.gvk_mode == GvkMode::Off {
+            return Err(format!("pool {id} is not a pool-gvk deployment"));
+        }
+        return Ok(pool);
+    }
+    config
+        .enabled_pools()
+        .find(|pool| pool.gvk_mode != GvkMode::Off)
+        .ok_or_else(|| "no GVK-enabled pool in deployment config".to_string())
+}
+
+/// Load the operator GVK authority key from the wallet, generating and
+/// persisting a new one when missing. Set `SPP_GVK_REGENERATE=1` to replace an
+/// existing key.
+pub fn load_or_create_gvk_authority(storage: &LocalStorage) -> Result<GvkAuthoritySetting, String> {
+    let regenerate = env_or("SPP_GVK_REGENERATE", "") == "1";
+    if !regenerate
+        && let Some(setting) = storage
+            .get_gvk_authority_setting()
+            .map_err(|e| format!("read GVK authority setting: {e}"))?
+    {
+        setting
+            .validate_consistency()
+            .map_err(|e| format!("invalid stored GVK authority key: {e}"))?;
+        return Ok(setting);
+    }
+
+    let setting =
+        GvkAuthoritySetting::generate().map_err(|e| format!("generate GVK authority key: {e}"))?;
+    storage
+        .set_gvk_authority_setting(&setting)
+        .map_err(|e| format!("save GVK authority setting: {e}"))?;
+    Ok(setting)
+}
+
+/// Ensure the wallet's GVK authority public key matches the pool deployment
+/// config.
+pub fn validate_gvk_authority_for_pool(
+    setting: &GvkAuthoritySetting,
+    pool: &PoolConfigEntry,
+) -> Result<(), String> {
+    let configured = pool.gvk_authority_pub_key.as_ref().ok_or_else(|| {
+        format!(
+            "pool {} has no gvkAuthorityPubKey in deployment config",
+            pool.pool_contract_id
+        )
+    })?;
+    if !setting.matches_config(configured) {
+        return Err(format!(
+            "stored GVK authority public key does not match deployment config for pool {}",
+            pool.pool_contract_id
+        ));
+    }
+    Ok(())
+}
