@@ -38,7 +38,7 @@ const demoActivity: DemoActivity[] = [
     from: 'ethereum',
     to: 'stellar',
     asset: 'USDC',
-    amount: '••••••',
+    amount: '24,800.00',
     status: 'UI complete',
     statusDetail: 'Local sequence reached its final UI state',
     verification: 'Not performed',
@@ -50,7 +50,7 @@ const demoActivity: DemoActivity[] = [
     from: 'stellar',
     to: 'ethereum',
     asset: 'USDC',
-    amount: '••••••',
+    amount: '8,000.00',
     status: 'UI complete',
     statusDetail: 'Local sequence reached its final UI state',
     verification: 'Not performed',
@@ -62,7 +62,7 @@ const demoActivity: DemoActivity[] = [
     from: 'ethereum',
     to: 'stellar',
     asset: 'USDC',
-    amount: '••••••',
+    amount: '12,500.00',
     status: 'UI stopped',
     statusDetail: 'Prototype sequence stopped before its final state',
     verification: 'Unavailable',
@@ -99,12 +99,12 @@ function ActivityPage() {
         <div className="max-w-2xl">
           <p className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
             <NetworkRouteMark />
-            Private activity
+            Transfer activity
           </p>
-          <h1 className="mt-4 text-4xl font-medium tracking-[-0.055em] sm:text-5xl">A ledger designed around access.</h1>
+          <h1 className="mt-4 text-4xl font-medium tracking-[-0.055em] sm:text-5xl">Public rails. Private context.</h1>
           <p className="mt-5 max-w-xl text-sm leading-6 text-muted">
-            A transfer index on the left; the selected route, state, and disclosure boundary on the right.
-            Real history still requires owner authentication and server authorization.
+            The owner view can join public deposit and payout records with private note status and
+            authorized context. Real history still requires authentication and server authorization.
           </p>
         </div>
         <span className="flex w-fit items-center gap-2 rounded-full border border-warning/25 bg-warning/[0.055] px-3 py-1.5 text-[10px] font-medium text-warning">
@@ -248,7 +248,7 @@ function ActivityPage() {
                 {[
                   ['Recorded', `${selected.date} · ${selected.time}`],
                   ['Asset', selected.asset],
-                  ['Amount', `${selected.amount} · masked fixture`],
+                  ['Amount', `${selected.amount} USDC · public fixture`],
                   ['Verification', selected.verification],
                 ].map(([label, value]) => (
                   <div key={label} className="bg-surface px-4 py-4">
@@ -298,7 +298,7 @@ function ActivityPage() {
           <ShieldAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
           <div>
             <p className="text-xs font-medium">Public ledgers remain public</p>
-            <p className="mt-1 text-[11px] leading-5 text-muted">The production design must avoid publishing sensitive fields before proofs can protect them.</p>
+            <p className="mt-1 text-[11px] leading-5 text-muted">USDC amounts, wallet addresses, vault actions, and timestamps remain visible on Ethereum or Stellar.</p>
           </div>
         </div>
         <div className="flex items-start gap-3">

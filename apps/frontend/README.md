@@ -7,9 +7,12 @@ Ethereum Sepolia → Stellar Testnet bridge.
 
 - Public product site with an implementation-aware privacy and compliance narrative
 - Focused bridge flow with injected MetaMask and Freighter wallet connections
-- Liquidity-providing workspace with a balanced allocation intent, local positions draft, and editable fee-share model
+- Two independent single-sided USDC vault workspaces for Ethereum and Stellar
+- Chain-specific provide and withdrawal drafts, including destination-capacity checks for cross-chain exits
+- Illustrative fee-share and vault-balancing models with safety buffers and pending payout capacity
 - Review dialog and explicitly simulated proof/bridge progress
-- Privacy-first activity ledger with a searchable transfer index and persistent route inspector
+- Privacy explainer separating public settlement from the protected note, link, and business context
+- Activity ledger with a searchable transfer index and persistent route inspector
 - Unified compliance workspace for transactions, disclosure requests, role separation, and audit-log concepts
 - Transaction-scoped field grants with separate compliance, custodian, auditor, and platform roles
 - Dark and light themes, keyboard focus states, responsive layouts, and reduced-motion support
@@ -58,10 +61,14 @@ Implemented wallet boundary:
 - Optional destination wallet connection to prefill the public recipient address
 - Shared wallet state across Bridge and Liquidity pages
 
-The two-sided Liquidity intent still requires both wallet connections because it models
-allocations on both networks. Bridge transfers do not. The earnings panel is an editable
-illustration based on monthly bridge volume, a 0.05% fee assumption, and the provider's
-modeled share of total pool liquidity. It is not a live quote, APY, or guarantee.
+Liquidity provision is single-sided: the user selects either the Ethereum vault or the
+Stellar vault and connects only that chain's owner wallet. A same-chain withdrawal exits
+the selected vault. A cross-chain withdrawal is modeled as a bridge operation and remains
+subject to available capacity in the destination vault. It can be repriced, queued, or
+paused before the destination safety buffer is consumed.
+
+The earnings panel is an illustration based on mocked chain-specific outflow, route fees,
+and the provider's modeled share of one vault. It is not a live quote, APY, or guarantee.
 
 Wallet signing and blockchain actions are not implemented.
 
@@ -80,9 +87,20 @@ and decrypted-field examples are local fixtures and are labeled as prototype or
 demo data. No private key, seed phrase, secret, signature, transaction, proof,
 decryption key, or asset is requested or created.
 
-Privacy claims must remain aligned with implemented and independently audited
-circuit behavior when production adapters are introduced. Zero-knowledge proofs
-must not be represented as hiding data that is already public on either chain.
+Target privacy boundary:
+
+- Public: source deposit, destination payout, amounts, addresses, vault state,
+  commitments, nullifiers, timestamps, and contract events
+- Protected by the planned protocol: secret note contents, the direct protocol-level
+  deposit-to-payout link, and encrypted business/compliance context
+- Not part of the current MVP: large anonymity sets, delayed/grouped exits,
+  standardized amounts, batching, temporary destinations, fee-paying relayers, and
+  a finalized minimal-event policy
+
+Privacy claims must remain aligned with implemented and independently audited circuit
+behavior when production adapters are introduced. Zero-knowledge proofs must not be
+represented as hiding data that is already public on either chain, and timing or amount
+correlation must not be described as solved before the later hardening layers exist.
 
 Brand asset sources: https://ethereum.org/assets/ and
 https://developers.stellar.org/icon.svg. This is independent software and is not

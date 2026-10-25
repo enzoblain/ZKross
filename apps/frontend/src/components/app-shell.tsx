@@ -3,6 +3,7 @@ import {
   ArrowLeftRight,
   Droplets,
   Moon,
+  ScanEye,
   ShieldCheck,
   Sun,
   WalletCards,
@@ -28,6 +29,7 @@ const appNavigation = [
   { id: 'bridge', label: 'Bridge', icon: ArrowLeftRight },
   { id: 'liquidity', label: 'Liquidity', icon: Droplets },
   { id: 'activity', label: 'Activity', icon: Activity },
+  { id: 'privacy', label: 'Privacy', icon: ScanEye },
   { id: 'compliance', label: 'Compliance', icon: ShieldCheck },
 ] satisfies Array<{
   id: Exclude<PageId, 'landing'>

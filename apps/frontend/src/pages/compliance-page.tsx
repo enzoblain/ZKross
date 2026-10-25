@@ -88,7 +88,7 @@ const transactions: ScopedTransaction[] = [
     date: 'Oct 24, 2026',
     institution: 'Example Financial Authority',
     status: 'Settlement fixture complete',
-    protectedFields: ['Amount', 'Asset'],
+    protectedFields: ['Entity identity', 'Deposit ↔ payout link'],
     requestId: 'DEC-DEMO-021',
   },
   {
@@ -96,7 +96,7 @@ const transactions: ScopedTransaction[] = [
     date: 'Oct 23, 2026',
     institution: 'Example Bank Audit',
     status: 'Review fixture',
-    protectedFields: ['Verification metadata'],
+    protectedFields: ['Verification metadata', 'Business purpose'],
     requestId: 'DEC-DEMO-020',
   },
   {
@@ -104,7 +104,7 @@ const transactions: ScopedTransaction[] = [
     date: 'Oct 21, 2026',
     institution: 'Example Compliance Unit',
     status: 'Settlement fixture stopped',
-    protectedFields: ['Amount', 'Source', 'Destination'],
+    protectedFields: ['Entity identity', 'Business purpose'],
   },
 ]
 
@@ -113,7 +113,7 @@ const requests: DisclosureRequest[] = [
     id: 'DEC-DEMO-021',
     transaction: 'ZK-DEMO-4A81',
     institution: 'Example Financial Authority',
-    fields: ['Amount', 'Asset'],
+    fields: ['Entity identity', 'Deposit ↔ payout link'],
     mandate: 'MANDATE-DEMO-A42',
     expires: 'Oct 26 · 18:00',
     initialApprovals: 2,
@@ -122,7 +122,7 @@ const requests: DisclosureRequest[] = [
     id: 'DEC-DEMO-020',
     transaction: 'ZK-DEMO-3C20',
     institution: 'Example Bank Audit',
-    fields: ['Verification metadata'],
+    fields: ['Verification metadata', 'Business purpose'],
     mandate: 'MANDATE-DEMO-B18',
     expires: 'Oct 27 · 09:30',
     initialApprovals: 1,
@@ -199,15 +199,15 @@ function CompliancePage() {
             One space. Different permissions.
           </h1>
           <p className="mt-5 max-w-lg text-sm leading-6 text-muted">
-            Institutions, custodians, auditors, and platform operators work from the same
-            transaction registry. Each role receives only the actions and fields it needs.
+            Institutions, key custodians, and authorized auditors work from the same encrypted
+            case registry. Each role receives only the actions and fields its mandate allows.
           </p>
 
           <div className="mt-8 grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
             {[
-              ['1', 'See assigned transactions', 'Reference, route, date, and workflow status are visible within scope.'],
-              ['2', 'Request and approve access', 'Protected fields require a named mandate and threshold approval.'],
-              ['3', 'Reveal only granted fields', 'An authorized auditor sees the approved fields for one transaction.'],
+              ['1', 'See assigned cases', 'A case reference, route, date, and workflow status are visible within scope.'],
+              ['2', 'Request a decryption grant', 'Encrypted business context requires a named mandate and threshold approval.'],
+              ['3', 'Reveal only granted fields', 'An authorized auditor sees approved fields for one case and a limited time.'],
             ].map(([number, title, text]) => (
               <div key={number} className="flex gap-3">
                 <span className="grid size-8 shrink-0 place-items-center rounded-xl border border-border bg-surface font-mono text-[10px] text-accent">
@@ -229,7 +229,7 @@ function CompliancePage() {
           <h2 className="mt-7 text-xl font-semibold tracking-[-0.03em]">Open the role-based demo</h2>
           <p className="mt-2 text-sm leading-6 text-muted">
             Choose roles inside the workspace to understand what each participant can see
-            and do.
+            and do. Regulators review when legally authorized; they are not expected to fund bridge vaults.
           </p>
           <Button variant="accent" size="lg" className="mt-7 w-full" onClick={() => setEnteredDemo(true)}>
             Open Compliance workspace
@@ -257,7 +257,8 @@ function CompliancePage() {
             Transactions with explicit access.
           </h1>
           <p className="mt-5 max-w-xl text-sm leading-6 text-muted">
-            Shared workspace for review, approval, scoped disclosure, and access evidence.
+            Shared workspace for encrypted case review, threshold approval, scoped decryption,
+            and access evidence. It is separate from liquidity provision.
           </p>
         </div>
 
@@ -366,8 +367,9 @@ function CompliancePage() {
         {tab === 'transactions' && (
           <div role="tabpanel">
             <div className="border-b border-border bg-background/35 px-5 py-4 text-[11px] leading-5 text-muted sm:px-7">
-              Everyone sees only transactions assigned to their institution or operational scope.
-              Amounts, counterparties, and verification details remain masked until a grant is approved.
+              This workspace masks enriched business records until a grant is approved. Public
+              chain observers may still see USDC amounts and wallet addresses, but not the encrypted
+              entity identity, business purpose, or protocol-level deposit-to-payout mapping.
             </div>
             <div className="hidden overflow-x-auto md:block">
               <table className="w-full border-collapse text-left">
@@ -563,7 +565,13 @@ function CompliancePage() {
                       <span className="text-subtle">{field}</span>
                       {revealed && canReveal ? (
                         <span className="font-mono text-right text-accent">
-                          {field === 'Amount' ? '24,800 USDC · fixture' : field === 'Asset' ? 'USDC · fixture' : 'Authorized fixture value'}
+                          {field === 'Entity identity'
+                            ? 'Orchid Treasury Ltd · fixture'
+                            : field === 'Deposit ↔ payout link'
+                              ? 'ETH-DEMO-A91 ↔ XLM-DEMO-C28 · fixture'
+                              : field === 'Business purpose'
+                                ? 'Intercompany treasury rebalancing · fixture'
+                                : 'Proof policy satisfied · fixture'}
                         </span>
                       ) : (
                         <span className="flex items-center gap-2 font-mono text-subtle"><EyeOff aria-hidden="true" className="size-3" />••••••••</span>

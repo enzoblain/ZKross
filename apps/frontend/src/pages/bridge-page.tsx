@@ -45,6 +45,11 @@ const compactNumber = new Intl.NumberFormat('en-US', {
 
 type RunStatus = 'idle' | 'running' | 'complete'
 
+const routeCapacity: Record<NetworkId, number> = {
+  ethereum: 930000,
+  stellar: 610000,
+}
+
 function BridgePage() {
   const { wallets, connecting } = useWallets()
   const [from, setFrom] = useState<NetworkId>('ethereum')
@@ -137,8 +142,8 @@ function BridgePage() {
           One transfer. Clear boundaries.
         </h1>
         <p className="mx-auto mt-5 max-w-xl text-sm leading-6 text-muted">
-          Connect only the sending wallet. Enter the destination address manually or
-          optionally connect the receiving wallet to fill it automatically.
+          A public source deposit funds a public destination payout. The target protocol
+          protects the link between them — not the on-chain actions themselves.
         </p>
       </div>
 
@@ -264,6 +269,10 @@ function BridgePage() {
                   <span className="text-subtle">Estimated at destination</span>
                   <span className="font-mono">≈ {compactNumber.format(quote.amountOut)} USDC</span>
                 </div>
+                <div className="mt-2 flex items-center justify-between text-[10px]">
+                  <span className="text-subtle">Illustrative {networkMeta[to].shortName} capacity</span>
+                  <span className="font-mono text-muted">{compactNumber.format(routeCapacity[to])} USDC</span>
+                </div>
               </div>
 
               <div className="border-t border-border px-5 py-5 sm:px-7">
@@ -320,17 +329,17 @@ function BridgePage() {
 
             <div className="grid gap-2 text-xs sm:grid-cols-2">
               <div className="rounded-2xl border border-border bg-background/40 p-4">
-                <p className="text-[10px] text-subtle">Privacy status</p>
+                <p className="text-[10px] text-subtle">Settlement visibility</p>
                 <p className="mt-2 flex items-center gap-2 font-medium">
-                  <LockKeyhole aria-hidden="true" className="size-3.5 text-warning" />
-                  Not active · circuit missing
+                  <Info aria-hidden="true" className="size-3.5 text-muted" />
+                  Deposit + payout are public
                 </p>
               </div>
               <div className="rounded-2xl border border-border bg-background/40 p-4">
-                <p className="text-[10px] text-subtle">Network compatibility</p>
+                <p className="text-[10px] text-subtle">Link protection</p>
                 <p className="mt-2 flex items-center gap-2 font-medium">
-                  <CheckCircle2 aria-hidden="true" className="size-3.5 text-success" />
-                  Demo route configured
+                  <LockKeyhole aria-hidden="true" className="size-3.5 text-warning" />
+                  Planned · circuit missing
                 </p>
               </div>
             </div>
@@ -343,6 +352,10 @@ function BridgePage() {
               <div className="mt-2 flex items-center justify-between gap-4">
                 <span className="text-subtle">Illustrative fees</span>
                 <span className="font-mono text-muted">{compactNumber.format(quote.networkFee + quote.protocolFee)} USDC</span>
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-4">
+                <span className="text-subtle">Destination vault capacity</span>
+                <span className="font-mono text-muted">{compactNumber.format(routeCapacity[to])} USDC</span>
               </div>
               <div className="mt-2 flex items-center justify-between gap-4">
                 <span className="text-subtle">Simulation duration</span>
@@ -371,6 +384,10 @@ function BridgePage() {
                 <div className="flex justify-between gap-4">
                   <dt className="text-subtle">Circuit</dt>
                   <dd>Not connected</dd>
+                </div>
+                <div className="flex justify-between gap-4">
+                  <dt className="text-subtle">Public event policy</dt>
+                  <dd>Not implemented</dd>
                 </div>
               </dl>
             </details>
@@ -477,7 +494,8 @@ function BridgePage() {
               <div>
                 <p className="text-xs font-medium">Privacy boundary</p>
                 <p className="mt-1 text-[11px] leading-5 text-muted">
-                  ZK proofs and disclosure controls are not implemented. This screen demonstrates product states only.
+                  Amounts, sender and recipient addresses remain public. The planned proof
+                  protects the note and protocol-level link; timing or amount correlation may remain.
                 </p>
               </div>
             </div>
@@ -517,7 +535,8 @@ function BridgePage() {
             <dl className="space-y-3 text-xs">
               <div className="flex justify-between gap-4"><dt className="text-subtle">Route</dt><dd>{networkMeta[from].name} → {networkMeta[to].name}</dd></div>
               <div className="flex justify-between gap-4"><dt className="text-subtle">Recipient</dt><dd className="max-w-[230px] truncate font-mono">{recipient}</dd></div>
-              <div className="flex justify-between gap-4"><dt className="text-subtle">Privacy</dt><dd className="text-warning">Not active</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">On-chain visibility</dt><dd>Public deposit + payout</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">ZK link protection</dt><dd className="text-warning">Not active</dd></div>
             </dl>
           </div>
 

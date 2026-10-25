@@ -1,167 +1,254 @@
 import {
   ArrowRight,
-  CheckCircle2,
+  Braces,
   CircleDashed,
   Eye,
-  FileCheck2,
+  EyeOff,
+  FileKey2,
   Fingerprint,
+  KeyRound,
   LockKeyhole,
+  Network,
   ShieldCheck,
+  TimerReset,
 } from 'lucide-react'
 
-const stages = [
+import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
+
+const protocolSteps = [
   {
+    index: '01',
+    visibility: 'Public on Ethereum',
+    title: 'Deposit into the source vault',
+    description: 'The sender address, USDC amount, vault, and time remain visible on-chain.',
+    icon: Eye,
+    tone: 'public',
+  },
+  {
+    index: '02',
+    visibility: 'Private user secret',
+    title: 'Create a note commitment',
+    description: 'A Poseidon2 commitment represents the note without publishing its secret contents.',
     icon: Fingerprint,
-    label: 'Commit',
-    description: 'Create a transfer commitment locally.',
+    tone: 'private',
   },
   {
-    icon: LockKeyhole,
-    label: 'Prove',
-    description: 'Generate a circuit proof when the prover is integrated.',
+    index: '03',
+    visibility: 'Verified, not disclosed',
+    title: 'Prove note ownership',
+    description: 'The planned Noir circuit proves the note is valid and unspent without exposing it.',
+    icon: FileKey2,
+    tone: 'private',
   },
   {
-    icon: FileCheck2,
-    label: 'Verify',
-    description: 'Verify constraints before destination release.',
+    index: '04',
+    visibility: 'Public on Stellar',
+    title: 'Release from the destination vault',
+    description: 'The recipient, USDC amount, vault, nullifier, and time remain visible on-chain.',
+    icon: Eye,
+    tone: 'public',
   },
+] as const
+
+const protectedItems = [
+  'The secret note contents used to authorize a release.',
+  'The direct protocol-level link between one deposit and one withdrawal.',
+  'Business and compliance context encrypted for an authorized reviewer.',
+  'Source-chain knowledge of the destination before the payout is submitted.',
+]
+
+const publicItems = [
+  'USDC deposits and sender addresses on the source chain.',
+  'USDC withdrawals and recipient addresses on the destination chain.',
+  'Vault balances, commitments, nullifiers, timestamps, and contract events.',
+  'Patterns an observer may infer from matching amounts or timing.',
+]
+
+const laterLayers = [
+  ['Larger anonymity sets', 'Many users sharing the same commitment set.'],
+  ['Delayed or grouped exits', 'Withdrawals submitted outside a one-to-one timing window.'],
+  ['Standard amounts and batches', 'Less distinctive value patterns across transfers.'],
+  ['Temporary destinations', 'Fresh recipient addresses for individual payouts.'],
+  ['Fee-paying relayers', 'A relayer submits the payout instead of the recipient.'],
+  ['Minimal public events', 'No destination or recognizable transfer identifier in events.'],
 ]
 
 function PrivacyPage() {
   return (
     <div className="page-enter">
-      <div className="max-w-3xl">
-        <div className="mb-4 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
-          <span className="h-px w-6 bg-accent/60" />
-          Privacy
+      <div className="grid gap-10 lg:grid-cols-[1fr_0.75fr] lg:items-end">
+        <div className="max-w-3xl">
+          <p className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
+            <NetworkRouteMark />
+            Privacy model
+          </p>
+          <h1 className="mt-5 text-balance text-4xl font-medium tracking-[-0.055em] sm:text-6xl">
+            Public actions.<br />Private connection.
+          </h1>
+          <p className="mt-6 max-w-2xl text-sm leading-6 text-muted sm:text-base sm:leading-7">
+            Zkross is designed to protect the link between public on-chain actions and encrypt
+            their confidential context. Vault deposits and withdrawals remain public.
+          </p>
         </div>
-        <h1 className="text-[2.4rem] font-medium leading-[1.04] tracking-[-0.055em] text-foreground sm:text-5xl">
-          Precise claims.<br />
-          Verifiable boundaries.
-        </h1>
-        <p className="mt-5 max-w-2xl text-sm leading-6 text-muted sm:text-[15px]">
-          Zkross is being designed around explicit circuit guarantees. Until those circuits
-          are integrated and audited, privacy interactions remain labeled previews.
-        </p>
+
+        <div className="border-l border-accent/35 pl-5">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-accent">MVP boundary</p>
+          <p className="mt-3 text-sm leading-6 text-muted">
+            A zero-knowledge proof can hide the note used for authorization. It cannot erase
+            data already published by Ethereum or Stellar.
+          </p>
+        </div>
       </div>
 
-      <section className="mt-10 overflow-hidden rounded-3xl border border-border bg-surface-raised" aria-labelledby="privacy-model-title">
-        <div className="border-b border-border px-5 py-5 sm:px-7 sm:py-6">
-          <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-subtle">Proposed model</p>
-              <h2 id="privacy-model-title" className="mt-2 text-lg font-semibold tracking-[-0.025em] text-foreground">Commit → prove → verify</h2>
-            </div>
-            <span className="self-start rounded-full border border-warning/25 bg-warning/[0.06] px-3 py-1.5 text-[10px] font-medium text-warning">
-              Architecture preview
-            </span>
+      <section className="mt-14 overflow-hidden border-y border-border" aria-labelledby="privacy-flow-title">
+        <div className="flex flex-col justify-between gap-4 border-b border-border py-6 sm:flex-row sm:items-center">
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-subtle">Transfer anatomy</p>
+            <h2 id="privacy-flow-title" className="mt-2 text-xl font-semibold tracking-[-0.03em]">What the protocol changes — and what it does not</h2>
           </div>
+          <span className="w-fit rounded-full border border-warning/25 bg-warning/[0.055] px-3 py-1.5 text-[9px] font-semibold uppercase tracking-[0.12em] text-warning">
+            Target architecture · not connected
+          </span>
         </div>
 
-        <div className="grid sm:grid-cols-3">
-          {stages.map((stage, index) => {
-            const Icon = stage.icon
+        <ol className="grid lg:grid-cols-4">
+          {protocolSteps.map((step, index) => {
+            const Icon = step.icon
+            const isPrivate = step.tone === 'private'
             return (
-              <article key={stage.label} className="relative border-b border-border p-6 last:border-b-0 sm:border-b-0 sm:border-r sm:last:border-r-0 sm:p-7">
-                <div className="flex items-center justify-between">
-                  <span className="grid size-10 place-items-center rounded-2xl border border-border bg-background/55 text-accent">
+              <li
+                key={step.index}
+                className={`relative py-8 lg:px-6 ${index > 0 ? 'border-t border-border lg:border-l lg:border-t-0' : ''} ${index === 0 ? 'lg:pl-0' : ''} ${index === protocolSteps.length - 1 ? 'lg:pr-0' : ''}`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <span className={`grid size-10 place-items-center rounded-full border ${isPrivate ? 'border-accent/35 bg-accent/[0.08] text-accent' : 'border-border bg-surface text-muted'}`}>
                     <Icon aria-hidden="true" className="size-4" />
                   </span>
-                  <span className="font-mono text-[10px] text-subtle">0{index + 1}</span>
+                  <span className="font-mono text-[9px] text-subtle">{step.index}</span>
                 </div>
-                <h3 className="mt-7 text-sm font-semibold text-foreground">{stage.label}</h3>
-                <p className="mt-2 text-xs leading-5 text-subtle">{stage.description}</p>
-              </article>
+                <p className={`mt-7 text-[9px] font-semibold uppercase tracking-[0.13em] ${isPrivate ? 'text-accent' : 'text-subtle'}`}>
+                  {step.visibility}
+                </p>
+                <h3 className="mt-2 text-sm font-semibold tracking-[-0.02em]">{step.title}</h3>
+                <p className="mt-3 text-xs leading-5 text-muted">{step.description}</p>
+                {index < protocolSteps.length - 1 && (
+                  <ArrowRight aria-hidden="true" className="absolute -right-2.5 top-11 z-10 hidden size-5 rounded-full bg-background p-1 text-subtle lg:block" />
+                )}
+              </li>
             )
           })}
-        </div>
+        </ol>
       </section>
 
-      <div className="mt-5 grid gap-5 xl:grid-cols-[0.9fr_1.1fr]">
-        <section className="rounded-3xl border border-border bg-surface p-5 sm:p-6" aria-labelledby="disclosure-title">
+      <div className="mt-12 grid gap-10 lg:grid-cols-2 lg:gap-16">
+        <section aria-labelledby="public-title">
           <div className="flex items-center gap-3">
-            <span className="grid size-9 place-items-center rounded-xl bg-foreground text-background">
+            <span className="grid size-10 place-items-center rounded-2xl border border-border bg-surface text-muted">
               <Eye aria-hidden="true" className="size-4" />
             </span>
             <div>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">Current disclosure</p>
-              <h2 id="disclosure-title" className="mt-1 text-sm font-semibold text-foreground">What the demo actually does</h2>
+              <p className="text-[9px] font-semibold uppercase tracking-[0.15em] text-subtle">Visible by design</p>
+              <h2 id="public-title" className="mt-1 text-lg font-semibold">The public settlement layer</h2>
             </div>
           </div>
-
-          <ul className="mt-6 space-y-4">
-            {[
-              'Keeps draft inputs inside the browser session.',
-              'Calculates illustrative fees with a local adapter.',
-              'Simulates bridge progress without network calls.',
-            ].map((item) => (
-              <li key={item} className="flex items-start gap-3 text-xs leading-5 text-muted">
-                <CheckCircle2 aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />
-                {item}
-              </li>
-            ))}
-          </ul>
-
-          <div className="my-6 h-px bg-border" />
-
-          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">Not implemented</p>
-          <ul className="mt-4 space-y-4">
-            {[
-              'Zero-knowledge proof generation or verification.',
-              'On-chain confidentiality or metadata protection.',
-              'Audited privacy guarantees of any kind.',
-            ].map((item) => (
-              <li key={item} className="flex items-start gap-3 text-xs leading-5 text-muted">
-                <CircleDashed aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
+          <ul className="mt-7 divide-y divide-border border-y border-border">
+            {publicItems.map((item) => (
+              <li key={item} className="flex gap-3 py-4 text-xs leading-5 text-muted">
+                <Eye aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-subtle" />
                 {item}
               </li>
             ))}
           </ul>
         </section>
 
-        <section className="rounded-3xl border border-border bg-surface p-5 sm:p-6" aria-labelledby="readiness-title">
-          <div className="flex items-center justify-between gap-4">
+        <section aria-labelledby="protected-title">
+          <div className="flex items-center gap-3">
+            <span className="grid size-10 place-items-center rounded-2xl border border-accent/30 bg-accent/[0.08] text-accent">
+              <EyeOff aria-hidden="true" className="size-4" />
+            </span>
             <div>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">Readiness ledger</p>
-              <h2 id="readiness-title" className="mt-2 text-sm font-semibold text-foreground">Privacy integration gates</h2>
+              <p className="text-[9px] font-semibold uppercase tracking-[0.15em] text-accent">Protected by the target protocol</p>
+              <h2 id="protected-title" className="mt-1 text-lg font-semibold">The confidential relationship layer</h2>
             </div>
-            <ShieldCheck aria-hidden="true" className="size-5 text-accent" />
           </div>
-
-          <div className="mt-6 divide-y divide-border rounded-2xl border border-border bg-background/30">
-            {[
-              { item: 'Threat model documented', owner: 'Protocol', status: 'In review' },
-              { item: 'Circuit constraints finalized', owner: 'Circuits', status: 'Pending' },
-              { item: 'Browser prover connected', owner: 'Frontend', status: 'Pending' },
-              { item: 'Independent circuit audit', owner: 'Security', status: 'Required' },
-            ].map((row) => (
-              <div key={row.item} className="grid gap-3 px-4 py-4 sm:grid-cols-[1fr_90px_80px] sm:items-center">
-                <span className="text-xs font-medium text-foreground">{row.item}</span>
-                <span className="text-[11px] text-subtle">{row.owner}</span>
-                <span className="justify-self-start rounded-full border border-border px-2 py-1 text-[9px] font-medium text-muted sm:justify-self-end">
-                  {row.status}
-                </span>
-              </div>
+          <ul className="mt-7 divide-y divide-border border-y border-border">
+            {protectedItems.map((item) => (
+              <li key={item} className="flex gap-3 py-4 text-xs leading-5 text-muted">
+                <ShieldCheck aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-accent" />
+                {item}
+              </li>
             ))}
-          </div>
-
-          <button type="button" className="focus-ring mt-5 flex items-center gap-2 rounded-lg text-xs font-medium text-accent hover:text-accent-strong">
-            Read the architecture notes
-            <ArrowRight aria-hidden="true" className="size-3.5" />
-          </button>
+          </ul>
         </section>
       </div>
 
-      <div className="mt-5 rounded-3xl border border-accent/20 bg-accent/[0.04] p-5 sm:p-6">
-        <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-          <div className="flex items-start gap-3">
-            <ShieldCheck aria-hidden="true" className="mt-0.5 size-5 shrink-0 text-accent" />
-            <div>
-              <p className="text-sm font-medium text-foreground">Privacy copy follows implementation state.</p>
-              <p className="mt-1 text-xs leading-5 text-muted">Production claims must be tied to audited circuit behavior, not product intent.</p>
-            </div>
+      <section className="mt-16 rounded-[2rem] border border-border bg-surface" aria-labelledby="building-blocks-title">
+        <div className="grid gap-8 p-6 sm:p-8 lg:grid-cols-[0.72fr_1.28fr] lg:p-10">
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-accent">MVP building blocks</p>
+            <h2 id="building-blocks-title" className="mt-3 text-2xl font-medium tracking-[-0.04em]">What the team is building now.</h2>
+            <p className="mt-4 text-xs leading-5 text-muted">
+              Every item remains a target until its circuit, contract integration, tests, and review are complete.
+            </p>
           </div>
-          <span className="shrink-0 rounded-full border border-accent/20 px-3 py-1.5 text-[10px] font-medium text-accent">Policy enforced in UI</span>
+          <div className="grid gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-2">
+            {[
+              [Fingerprint, 'Poseidon2 commitment', 'Binds the note fields without publishing their secret values.'],
+              [FileKey2, 'Noir ownership proof', 'Shows that the claimant owns a valid note under the circuit rules.'],
+              [Braces, 'Nullifier', 'Marks a note as spent without revealing the note itself.'],
+              [KeyRound, 'Encrypted audit payload', 'Makes approved context readable only to a scoped authorized party.'],
+            ].map(([Icon, title, description]) => {
+              const ItemIcon = Icon as typeof Fingerprint
+              return (
+                <article key={title as string} className="bg-background/65 p-5">
+                  <ItemIcon aria-hidden="true" className="size-4 text-accent" />
+                  <h3 className="mt-5 text-xs font-semibold">{title as string}</h3>
+                  <p className="mt-2 text-[11px] leading-5 text-muted">{description as string}</p>
+                </article>
+              )
+            })}
+          </div>
+        </div>
+      </section>
+
+      <section className="mt-6 overflow-hidden rounded-[2rem] border border-border bg-background/30" aria-labelledby="later-title">
+        <div className="grid lg:grid-cols-[0.38fr_0.62fr]">
+          <div className="border-b border-border p-6 sm:p-8 lg:border-b-0 lg:border-r">
+            <span className="grid size-11 place-items-center rounded-2xl border border-border bg-surface text-subtle">
+              <TimerReset aria-hidden="true" className="size-4" />
+            </span>
+            <p className="mt-7 text-[10px] font-semibold uppercase tracking-[0.16em] text-subtle">Later hardening</p>
+            <h2 id="later-title" className="mt-3 text-xl font-semibold tracking-[-0.03em]">Stronger anonymity needs more than a circuit.</h2>
+            <p className="mt-4 text-xs leading-5 text-muted">
+              These techniques reduce timing, amount, and address correlation. They are deliberately outside the current MVP.
+            </p>
+          </div>
+          <div className="divide-y divide-border">
+            {laterLayers.map(([title, description], index) => (
+              <div key={title} className="grid gap-2 px-6 py-4 sm:grid-cols-[26px_170px_1fr] sm:items-center sm:px-8">
+                <span className="font-mono text-[9px] text-subtle">{String(index + 1).padStart(2, '0')}</span>
+                <p className="text-xs font-medium">{title}</p>
+                <p className="text-[11px] leading-5 text-muted">{description}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <div className="mt-6 flex flex-col gap-4 rounded-3xl border border-warning/20 bg-warning/[0.045] p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
+        <div className="flex items-start gap-3">
+          <LockKeyhole aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
+          <div>
+            <p className="text-xs font-semibold">Nothing on this page is a live privacy guarantee.</p>
+            <p className="mt-1 text-[11px] leading-5 text-muted">The current frontend uses local fixtures. No proof is generated, verified, or settled on-chain.</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 text-[10px] text-subtle">
+          <Network aria-hidden="true" className="size-3.5" />
+          <NetworkMark network="ethereum" className="size-6" />
+          <ArrowRight aria-hidden="true" className="size-3" />
+          <NetworkMark network="stellar" className="size-6" />
+          <CircleDashed aria-hidden="true" className="ml-1 size-3.5 text-warning" />
         </div>
       </div>
     </div>

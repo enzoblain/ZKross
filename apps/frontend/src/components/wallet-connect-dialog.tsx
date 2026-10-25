@@ -40,7 +40,7 @@ function WalletConnectDialog({
   const purposeCopy = {
     required: 'This is the source wallet for the selected route. Only this wallet is required.',
     optional: 'Optional: connect it to use its public address as the recipient.',
-    liquidity: 'This wallet is required for the two-sided liquidity intent.',
+    liquidity: 'This is the owner wallet for the selected single-chain vault. No second wallet is required.',
   }[purpose]
 
   return (

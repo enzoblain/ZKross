@@ -62,20 +62,20 @@ export const mockBridgeAdapter = {
     return [
       {
         id: 'intent',
-        label: 'Preparing transaction',
-        description: 'Local intent; no wallet approval',
+        label: 'Register public deposit',
+        description: 'Simulated only · no wallet approval or contract call',
         status: 'idle',
       },
       {
         id: 'proof',
-        label: 'Generating privacy proof',
-        description: 'No ZK circuit is connected',
+        label: 'Prove note ownership',
+        description: 'Simulated only · no Noir circuit is connected',
         status: 'idle',
       },
       {
         id: 'settlement',
-        label: 'Verifying and completing',
-        description: 'No verification or asset movement',
+        label: 'Release public payout',
+        description: 'Simulated only · no proof verification or asset movement',
         status: 'idle',
       },
     ]

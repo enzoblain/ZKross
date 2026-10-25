@@ -26,21 +26,21 @@ const steps = [
     number: '01',
     label: 'Authorize',
     title: 'Connect the wallet that sends.',
-    description: 'Only the source-chain wallet is required. The destination stays an address.',
+    description: 'Only the source-chain wallet is required. The destination remains a public address.',
     icon: WalletMinimal,
   },
   {
     number: '02',
     label: 'Route',
     title: 'Compose the transfer.',
-    description: 'Choose direction, USDC amount, recipient, and the available privacy policy.',
+    description: 'Choose the direction, public USDC amount, recipient, and destination capacity.',
     icon: MoveRight,
   },
   {
     number: '03',
     label: 'Settle',
     title: 'Verify before release.',
-    description: 'The target flow verifies proof conditions before the destination reserve releases funds.',
+    description: 'The target flow proves note ownership before a public destination reserve payout.',
     icon: BadgeCheck,
   },
 ]
@@ -51,42 +51,42 @@ const useCases = [
     eyebrow: 'Treasury',
     title: 'Institutional settlement',
     description:
-      'Route working capital between ecosystems while keeping disclosure bound to an explicit review mandate.',
+      'Route working capital between ecosystems while encrypting business context for explicitly authorized review.',
   },
   {
     icon: ScanLine,
     eyebrow: 'Tokenized assets',
     title: 'Real-world asset movement',
     description:
-      'Keep sensitive investor and asset context within a controlled workflow instead of a public operations screen.',
+      'Keep sensitive investor and asset context outside public contract events while settlement remains visible.',
   },
   {
     icon: BriefcaseBusiness,
     eyebrow: 'Operations',
     title: 'Cross-border business payments',
     description:
-      'Separate payment execution from the commercial context while retaining a path for authorized oversight.',
+      'Separate public payment execution from confidential commercial context while retaining scoped oversight.',
   },
 ]
 
 const principles = [
   {
-    icon: Fingerprint,
+    icon: WalletMinimal,
     index: 'P-01',
-    title: 'Selective confidentiality',
-    description: 'Sensitive fields are intended to stay outside unapproved views.',
+    title: 'Public settlement',
+    description: 'Vault deposits, withdrawals, balances, and chain activity remain visible.',
   },
   {
-    icon: LockKeyhole,
+    icon: Fingerprint,
     index: 'P-02',
-    title: 'Proof before release',
-    description: 'Conditions can be verified without revealing their complete private inputs.',
+    title: 'Private linkage',
+    description: 'A note proof is designed to break the direct protocol-level deposit-to-payout link.',
   },
   {
     icon: KeyRound,
     index: 'P-03',
-    title: 'Scoped oversight',
-    description: 'A grant names who may inspect which fields, for which case, and until when.',
+    title: 'Scoped disclosure',
+    description: 'Encrypted context can be released by field, case, reviewer, and expiry.',
   },
 ]
 
@@ -131,7 +131,7 @@ function BridgeVisual() {
           <LockKeyhole aria-hidden="true" className="size-6 sm:size-7" />
         </div>
         <span className="absolute -bottom-8 min-w-max text-[9px] font-medium uppercase tracking-[0.18em] text-accent">
-          Privacy layer · planned
+          Private link · planned
         </span>
       </div>
     </div>
@@ -150,11 +150,11 @@ function LandingPage({ onNavigate }: LandingPageProps) {
               Testnet prototype · no asset movement
             </div>
             <h1 className="text-balance max-w-3xl text-[3.2rem] font-medium leading-[0.98] tracking-[-0.065em] text-foreground sm:text-6xl lg:text-[4.6rem]">
-              Privacy across chains. Trust without compromise.
+              Public settlement. Private connection.
             </h1>
             <p className="mt-7 max-w-2xl text-balance text-base leading-7 text-muted sm:text-lg">
-              A focused settlement interface for moving USDC between Ethereum and Stellar,
-              designed around verifiable conditions and controlled disclosure.
+              Move USDC between Ethereum and Stellar through independent destination reserves,
+              with a protocol designed to protect the transfer link and confidential context.
             </p>
             <p className="mt-3 max-w-xl text-xs leading-5 text-subtle">
               Product prototype. Signing, settlement, proofs, and disclosure controls are not connected.
@@ -185,8 +185,8 @@ function LandingPage({ onNavigate }: LandingPageProps) {
               <h2 className="mt-4 text-balance text-3xl font-medium tracking-[-0.045em] sm:text-5xl">Three decisions. One clear route.</h2>
             </div>
             <p className="max-w-2xl text-sm leading-6 text-muted lg:justify-self-end">
-              Zkross keeps the transaction flow legible: authorize the sender, define the route,
-              then verify the settlement conditions.
+              Zkross keeps the boundary legible: the chains record deposits and payouts, while
+              the target proof system authorizes release without publishing the secret note.
             </p>
           </div>
 
@@ -220,8 +220,8 @@ function LandingPage({ onNavigate }: LandingPageProps) {
             <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">Where it fits</p>
             <h2 className="mt-4 text-balance text-3xl font-medium tracking-[-0.045em] sm:text-5xl">Built for capital that needs context.</h2>
             <p className="mt-5 text-sm leading-6 text-muted sm:text-base">
-              The product separates public settlement rails from the sensitive business information
-              that gives a transaction meaning.
+              The product separates public settlement rails from the sensitive relationship and
+              business information that give a transaction meaning.
             </p>
           </div>
 
@@ -251,7 +251,7 @@ function LandingPage({ onNavigate }: LandingPageProps) {
         <div className="mx-auto max-w-[1180px]">
           <div className="max-w-3xl">
             <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">Protocol principles</p>
-            <h2 className="mt-4 text-balance text-3xl font-medium tracking-[-0.045em] sm:text-5xl">Confidential where required. Accountable where authorized.</h2>
+            <h2 className="mt-4 text-balance text-3xl font-medium tracking-[-0.045em] sm:text-5xl">Honest about what is public. Precise about what is protected.</h2>
           </div>
 
           <div className="mt-14 grid border-y border-border sm:grid-cols-3">
@@ -271,6 +271,16 @@ function LandingPage({ onNavigate }: LandingPageProps) {
                 </article>
               )
             })}
+          </div>
+          <div className="mt-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <p className="max-w-2xl text-xs leading-5 text-muted">
+              Timing, matching amounts, and reused addresses can still create correlations. Larger anonymity sets,
+              batching, temporary destinations, and relayers are later hardening layers—not current guarantees.
+            </p>
+            <Button variant="secondary" onClick={() => onNavigate('privacy')}>
+              Explore the privacy model
+              <ArrowRight aria-hidden="true" />
+            </Button>
           </div>
         </div>
       </section>
