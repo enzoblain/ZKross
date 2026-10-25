@@ -188,4 +188,157 @@ fn main() {
     println!("ok: {} compress, {} hash2, {} hash3, {} zero hashes -> {out}",
         doc["compress"].as_array().unwrap().len(), doc["hash2"].as_array().unwrap().len(),
         doc["hash3_offchain_t4"].as_array().unwrap().len(), doc["zero_hashes"].as_array().unwrap().len());
+
+    if let Some(spec_out) = std::env::args().nth(2) {
+        let spec = spec_vectors(&env, &r);
+        std::fs::write(&spec_out, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+        println!("ok: SPEC.md vectors -> {spec_out}");
+    }
+}
+
+// ========== SPEC.md Part B vectors ==========
+
+fn p2(a: &BigUint, b: &BigUint, tag: u64) -> BigUint {
+    fr_big(&t3::permutation(&[fr(a), fr(b), Fr::from(tag)])[0])
+}
+
+fn p3(a: &BigUint, b: &BigUint, c: &BigUint, tag: u64) -> BigUint {
+    fr_big(&t4::permutation(&[fr(a), fr(b), fr(c), Fr::from(tag)])[0])
+}
+
+const TAG_COMMITMENT: u64 = 0x01;
+const TAG_PUBKEY: u64 = 0x03;
+const TAG_BRIDGE: u64 = 0x07;
+const TAG_CLAIM: u64 = 0x08;
+
+/// SPEC.md B2: 2^64 + the first 8 bytes of sha256(passphrase), big-endian.
+fn stellar_chain_id(passphrase: &str) -> BigUint {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(passphrase.as_bytes());
+    (BigUint::from(1u8) << 64u32) + BigUint::from_bytes_be(&h[..8])
+}
+
+fn keccak(data: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    Keccak256::digest(data).into()
+}
+
+fn be32(v: &BigUint) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let b = v.to_bytes_be();
+    out[32 - b.len()..].copy_from_slice(&b);
+    out
+}
+
+/// SPEC.md B12, signed with the throwaway test key 1.
+fn attestation(src_chain: &BigUint, pool_id: [u8; 32], c: &BigUint, status: u8) -> Value {
+    use k256::ecdsa::SigningKey;
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"ZKROSS-ATTEST-v1");
+    msg.extend_from_slice(&be32(src_chain));
+    msg.extend_from_slice(&pool_id);
+    msg.extend_from_slice(&be32(c));
+    msg.push(status);
+    let digest = keccak(&msg);
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes[31] = 1;
+    let sk = SigningKey::from_bytes(&sk_bytes.into()).unwrap();
+    let (sig, recid) = sk.sign_prehash_recoverable(&digest).unwrap();
+    let sig = sig.normalize_s().map(|s| (s, true)).unwrap_or((sig, false));
+    // normalize_s returns Some if it flipped s; flipping s flips the recovery bit.
+    let (sig, flipped) = sig;
+    let v = 27 + (recid.to_byte() ^ u8::from(flipped));
+    let pubkey = sk.verifying_key().to_encoded_point(false);
+    let addr = &keccak(&pubkey.as_bytes()[1..])[12..];
+    let mut sig65 = sig.to_bytes().to_vec();
+    sig65.push(v);
+    json!({
+        "status": status,
+        "message": format!("0x{}", msg.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        "digest": format!("0x{}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        "signature": format!("0x{}", sig65.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        "attester_address": format!("0x{}", addr.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+    })
+}
+
+fn spec_vectors(env: &Env, r: &BigUint) -> Value {
+    let zero = BigUint::from(0u8);
+    let stellar = stellar_chain_id("Test SDF Network ; September 2015");
+    let sepolia = BigUint::from(11_155_111u64);
+    let asset = BigUint::from(1u8);
+
+    // (amount in bridge units, src, scale_src, dst, scale_dst, seed)
+    let cases = [
+        (1_234_567u64, &stellar, 10u64, &sepolia, 1u64, 3000u64),
+        (2_000_000u64, &sepolia, 1u64, &stellar, 10u64, 4000u64),
+    ];
+    let mut messages = Vec::new();
+    let id = env.register(TreeHost, ());
+    env.as_contract(&id, || MerkleTreeWithHistory::init(env, 20).unwrap());
+    for (amount, src, scale_src, dst, scale_dst, seed) in cases {
+        let amount_b = BigUint::from(amount);
+        let recipient_sk = sample(seed, r);
+        let recipient_pk = p2(&recipient_sk, &zero, TAG_PUBKEY);
+        let claim_secret = sample(seed + 1, r);
+        let deadline_bucket = BigUint::from(490_000u64 + seed);
+        let h1 = p3(&amount_b, &asset, src, TAG_BRIDGE);
+        let h2 = p3(&h1, dst, &recipient_pk, TAG_BRIDGE);
+        let c = p3(&h2, &claim_secret, &deadline_bucket, TAG_BRIDGE);
+        let claim_nullifier = p2(&claim_secret, &zero, TAG_CLAIM);
+        let refund_pk = p2(&sample(seed + 2, r), &zero, TAG_PUBKEY);
+        let refund_blinding = sample(seed + 3, r);
+        let refund_value = BigUint::from(amount * scale_src);
+        let refund_commitment = p3(&refund_value, &refund_pk, &refund_blinding, TAG_COMMITMENT);
+        let outbox_root = env.as_contract(&id, || {
+            MerkleTreeWithHistory::insert_two_leaves(env, big_to_u256(env, &c), big_to_u256(env, &zero)).unwrap();
+            u256_to_big(&MerkleTreeWithHistory::get_last_root(env).unwrap())
+        });
+        messages.push(json!({
+            "amount": amount, "asset_id": 1, "src_chain": src.to_str_radix(10), "dst_chain": dst.to_str_radix(10),
+            "scale_src": scale_src, "scale_dst": scale_dst,
+            "recipient_sk": hex(&recipient_sk), "recipient_pk": hex(&recipient_pk),
+            "claim_secret": hex(&claim_secret), "deadline_bucket": deadline_bucket.to_str_radix(10),
+            "h1": hex(&h1), "h2": hex(&h2), "C": hex(&c),
+            "claim_nullifier": hex(&claim_nullifier),
+            "refund_pk": hex(&refund_pk), "refund_blinding": hex(&refund_blinding),
+            "refund_value": amount * scale_src, "refund_commitment": hex(&refund_commitment),
+            "dst_value": amount * scale_dst,
+            "outbox_root_after_insert": hex(&outbox_root),
+        }));
+    }
+
+    let decimals: Vec<Value> = [12_345_678u64, 10, 9, 0, 70_000_001, 20_000_000]
+        .iter()
+        .map(|&stroops| json!({
+            "stellar_stroops": stroops, "bridge_amount": stroops / 10, "stellar_change": stroops % 10,
+            "ethereum_units": stroops / 10, "back_to_stellar_stroops": (stroops / 10) * 10,
+        }))
+        .collect();
+
+    let c0 = BigUint::parse_bytes(messages[0]["C"].as_str().unwrap()[2..].as_bytes(), 16).unwrap();
+    let mut eth_pool = [0u8; 32];
+    eth_pool[12..].copy_from_slice(&[0x11; 20]);
+    let attestations = vec![
+        attestation(&stellar, [0x22; 32], &c0, 0x01),
+        attestation(&sepolia, eth_pool, &c0, 0x02),
+    ];
+
+    json!({
+        "source": "SPEC.md Part B, computed with SPP's taceo_poseidon2 and SPP's pool-core tree in the Soroban host",
+        "tags": { "bridge": TAG_BRIDGE, "claim": TAG_CLAIM },
+        "chain_ids": { "stellar_testnet": stellar.to_str_radix(10), "sepolia": sepolia.to_str_radix(10) },
+        "asset_id_usdc": 1,
+        "bridge_messages": messages,
+        "decimal_conversion": decimals,
+        "attestations": {
+            "attester_private_key": "0x0000000000000000000000000000000000000000000000000000000000000001 (public test key, never fund)",
+            "stellar_source_pool_id": format!("0x{}", "22".repeat(32)),
+            "ethereum_source_pool_id": format!("0x{}", hex_bytes(&eth_pool)),
+            "cases": attestations,
+        },
+    })
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
