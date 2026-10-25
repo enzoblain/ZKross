@@ -4,14 +4,8 @@ export type PrivacyMode = 'transparent' | 'private-intent'
 export type WalletConnection = {
   network: NetworkId
   address: string
-}
-
-export type TransferDraft = {
-  from: NetworkId
-  to: NetworkId
-  amount: number
-  recipient: string
-  privacyMode: PrivacyMode
+  provider: string
+  simulated: true
 }
 
 export type MockQuote = {
@@ -32,19 +26,21 @@ export type TransferProgressStep = {
 
 export const networkMeta: Record<
   NetworkId,
-  { name: string; shortName: string; token: string; mark: string }
+  { name: string; shortName: string; token: string; mark: string; wallet: string }
 > = {
   stellar: {
-    name: 'Stellar',
+    name: 'Stellar Testnet',
     shortName: 'Stellar',
     token: 'USDC',
     mark: 'S',
+    wallet: 'Freighter',
   },
   ethereum: {
-    name: 'Ethereum',
+    name: 'Ethereum Sepolia',
     shortName: 'Ethereum',
     token: 'USDC',
     mark: 'Ξ',
+    wallet: 'MetaMask',
   },
 }
 
@@ -58,8 +54,13 @@ const wait = (milliseconds: number) =>
 
 export const mockBridgeAdapter = {
   async connectWallet(network: NetworkId): Promise<WalletConnection> {
-    await wait(650)
-    return { network, address: walletAddresses[network] }
+    await wait(520)
+    return {
+      network,
+      address: walletAddresses[network],
+      provider: networkMeta[network].wallet,
+      simulated: true,
+    }
   },
 
   getQuote(amount: number): MockQuote {
@@ -75,30 +76,24 @@ export const mockBridgeAdapter = {
     }
   },
 
-  createProgress(from: NetworkId): TransferProgressStep[] {
+  createProgress(): TransferProgressStep[] {
     return [
       {
         id: 'intent',
-        label: 'Intent prepared',
-        description: 'Local transfer parameters created',
+        label: 'Preparing transaction',
+        description: 'Local intent; no wallet approval',
         status: 'idle',
       },
       {
-        id: 'source',
-        label: `${networkMeta[from].name} lock simulated`,
-        description: 'No transaction is broadcast',
-        status: 'idle',
-      },
-      {
-        id: 'attestation',
-        label: 'Attestation simulated',
-        description: 'Mock relayer confirmation',
+        id: 'proof',
+        label: 'Generating privacy proof',
+        description: 'No ZK circuit is connected',
         status: 'idle',
       },
       {
         id: 'settlement',
-        label: 'Destination release simulated',
-        description: 'No assets are moved',
+        label: 'Verifying and completing',
+        description: 'No verification or asset movement',
         status: 'idle',
       },
     ]

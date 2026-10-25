@@ -171,7 +171,7 @@ function LiquidityPage() {
               setAllocation(Number(event.target.value))
               setPreviewed(false)
             }}
-            className="mt-4 h-1.5 w-full cursor-pointer accent-[#C4B5FD]"
+            className="mt-4 h-1.5 w-full cursor-pointer accent-accent"
           />
           <div className="mt-3 flex justify-between text-[10px] text-subtle">
             <span>Stellar {allocation}%</span>

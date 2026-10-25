@@ -1,27 +1,55 @@
-import { useState, type JSX } from 'react'
+import { useEffect, useState, type JSX } from 'react'
 
 import { AppShell } from './components/app-shell'
-import { AdminPage } from './pages/admin-page'
+import { ActivityPage } from './pages/activity-page'
 import { BridgePage } from './pages/bridge-page'
-import { LiquidityPage } from './pages/liquidity-page'
-import { PrivacyPage } from './pages/privacy-page'
+import { InstitutionalPage } from './pages/institutional-page'
+import { LandingPage } from './pages/landing-page'
 
-export type PageId = 'bridge' | 'liquidity' | 'privacy' | 'admin'
+export type PageId = 'landing' | 'bridge' | 'activity' | 'institutional'
+export type Theme = 'dark' | 'light'
 
-const pages: Record<PageId, () => JSX.Element> = {
+const pages: Record<Exclude<PageId, 'landing'>, () => JSX.Element> = {
   bridge: BridgePage,
-  liquidity: LiquidityPage,
-  privacy: PrivacyPage,
-  admin: AdminPage,
+  activity: ActivityPage,
+  institutional: InstitutionalPage,
 }
 
 function App() {
-  const [activePage, setActivePage] = useState<PageId>('bridge')
-  const ActivePage = pages[activePage]
+  const [activePage, setActivePage] = useState<PageId>('landing')
+  const [theme, setTheme] = useState<Theme>(() => {
+    const storedTheme = window.localStorage.getItem('zkross-theme')
+    return storedTheme === 'light' ? 'light' : 'dark'
+  })
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    window.localStorage.setItem('zkross-theme', theme)
+  }, [theme])
+
+  const navigate = (page: PageId) => {
+    setActivePage(page)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  const content =
+    activePage === 'landing' ? (
+      <LandingPage onNavigate={navigate} />
+    ) : (
+      (() => {
+        const ActivePage = pages[activePage]
+        return <ActivePage key={activePage} />
+      })()
+    )
 
   return (
-    <AppShell activePage={activePage} onNavigate={setActivePage}>
-      <ActivePage key={activePage} />
+    <AppShell
+      activePage={activePage}
+      onNavigate={navigate}
+      theme={theme}
+      onThemeChange={setTheme}
+    >
+      {content}
     </AppShell>
   )
 }

@@ -10,12 +10,12 @@ const buttonVariants = cva(
     variants: {
       variant: {
         default:
-          'bg-foreground text-background shadow-[0_1px_0_rgba(255,255,255,0.25)_inset] hover:bg-white active:scale-[0.99]',
+          'bg-foreground text-background shadow-[0_1px_0_color-mix(in_srgb,var(--foreground)_24%,transparent)_inset] hover:opacity-90 active:scale-[0.99]',
         accent:
-          'bg-accent text-[#171220] shadow-[0_1px_0_rgba(255,255,255,0.4)_inset] hover:bg-accent-strong active:scale-[0.99]',
+          'bg-accent text-white shadow-[0_1px_0_rgba(255,255,255,0.28)_inset] hover:bg-accent-strong active:scale-[0.99]',
         secondary:
           'border border-border bg-surface text-foreground hover:border-border-strong hover:bg-surface-raised',
-        ghost: 'text-muted hover:bg-white/[0.05] hover:text-foreground',
+        ghost: 'text-muted hover:bg-surface-raised hover:text-foreground',
         danger:
           'border border-danger/30 bg-danger/10 text-danger hover:bg-danger/15',
       },

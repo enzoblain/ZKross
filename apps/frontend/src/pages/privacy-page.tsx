@@ -40,7 +40,7 @@ function PrivacyPage() {
           Verifiable boundaries.
         </h1>
         <p className="mt-5 max-w-2xl text-sm leading-6 text-muted sm:text-[15px]">
-          NØCT is being designed around explicit circuit guarantees. Until those circuits
+          Zkross is being designed around explicit circuit guarantees. Until those circuits
           are integrated and audited, privacy interactions remain labeled previews.
         </p>
       </div>
