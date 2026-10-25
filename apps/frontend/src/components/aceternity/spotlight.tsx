@@ -20,7 +20,7 @@ function Spotlight({ className }: SpotlightProps) {
       transition={{ duration: 1.2, ease: 'easeOut' }}
       style={{
         background:
-          'radial-gradient(circle, rgba(115,87,255,0.42) 0%, rgba(115,87,255,0.10) 34%, transparent 70%)',
+          'radial-gradient(circle, rgba(196,181,253,0.30) 0%, rgba(196,181,253,0.08) 34%, transparent 70%)',
       }}
     />
   )

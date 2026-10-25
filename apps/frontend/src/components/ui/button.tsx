@@ -12,7 +12,7 @@ const buttonVariants = cva(
         default:
           'bg-foreground text-background shadow-[0_1px_0_color-mix(in_srgb,var(--foreground)_24%,transparent)_inset] hover:opacity-90 active:scale-[0.99]',
         accent:
-          'bg-accent text-white shadow-[0_1px_0_rgba(255,255,255,0.28)_inset] hover:bg-accent-strong active:scale-[0.99]',
+          'bg-accent text-[#0c0d11] shadow-[0_1px_0_rgba(255,255,255,0.28)_inset] hover:bg-accent-strong active:scale-[0.99]',
         secondary:
           'border border-border bg-surface text-foreground hover:border-border-strong hover:bg-surface-raised',
         ghost: 'text-muted hover:bg-surface-raised hover:text-foreground',

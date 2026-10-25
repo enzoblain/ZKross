@@ -292,7 +292,39 @@ function CompliancePage() {
         </div>
       </div>
 
-      <section className="mt-5 overflow-hidden rounded-[2rem] border border-border bg-surface">
+      <section className="mt-8 border-y border-border py-6" aria-labelledby="disclosure-flow-title">
+        <div className="flex flex-col gap-6 lg:flex-row lg:items-center">
+          <div className="lg:w-44 lg:shrink-0">
+            <p className="text-[9px] font-semibold uppercase tracking-[0.15em] text-accent">Controlled disclosure</p>
+            <h2 id="disclosure-flow-title" className="mt-2 text-sm font-semibold">Who unlocks what</h2>
+          </div>
+          <ol className="grid flex-1 gap-4 sm:grid-cols-5 sm:gap-0">
+            {[
+              [FileKey2, 'Request', 'Fields + mandate'],
+              [UserCheck, 'Approve', 'Two custodians'],
+              [KeyRound, 'Grant', 'Scoped + expiring'],
+              [Eye, 'Reveal', 'Auditor only'],
+              [ClipboardList, 'Record', 'Access evidence'],
+            ].map(([Icon, title, detail], index) => {
+              const StepIcon = Icon as typeof FileKey2
+              return (
+                <li key={title as string} className="relative flex gap-3 sm:block sm:px-3 sm:text-center">
+                  {index < 4 && <span aria-hidden="true" className="absolute left-1/2 right-[-50%] top-4 hidden h-px bg-border sm:block" />}
+                  <span className="relative z-10 grid size-8 shrink-0 place-items-center rounded-full border border-border-strong bg-background text-accent sm:mx-auto">
+                    <StepIcon aria-hidden="true" className="size-3.5" />
+                  </span>
+                  <div className="sm:mt-3">
+                    <p className="text-[10px] font-medium">{title as string}</p>
+                    <p className="mt-1 text-[9px] text-subtle">{detail as string}</p>
+                  </div>
+                </li>
+              )
+            })}
+          </ol>
+        </div>
+      </section>
+
+      <section className="mt-8 overflow-hidden rounded-[2rem] border border-border bg-surface">
         <div className="flex flex-col gap-4 border-b border-border px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-7">
           <div role="tablist" aria-label="Compliance workspace sections" className="flex max-w-full gap-1 overflow-x-auto rounded-xl border border-border bg-background p-1">
             {[

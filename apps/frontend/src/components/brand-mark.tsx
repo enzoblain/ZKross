@@ -7,13 +7,11 @@ function BrandMark({ className }: BrandMarkProps) {
     <span
       aria-hidden="true"
       className={cn(
-        'relative grid size-8 place-items-center overflow-hidden rounded-[10px] border border-border-strong bg-surface-raised',
+        'inline-flex items-baseline text-[15px] font-semibold leading-none tracking-[-0.075em] text-foreground',
         className,
       )}
     >
-      <span className="absolute left-[7px] h-[18px] w-[2px] -rotate-[31deg] rounded-full bg-foreground" />
-      <span className="absolute right-[7px] h-[18px] w-[2px] rotate-[31deg] rounded-full bg-accent" />
-      <span className="absolute h-[2px] w-3 rounded-full bg-accent" />
+      ZKR<span className="text-accent">Ø</span>SS
     </span>
   )
 }

@@ -7,9 +7,9 @@ Ethereum Sepolia → Stellar Testnet bridge.
 
 - Public product site with an implementation-aware privacy and compliance narrative
 - Focused bridge flow with injected MetaMask and Freighter wallet connections
-- Liquidity-providing workspace with a balanced allocation intent and local positions draft
+- Liquidity-providing workspace with a balanced allocation intent, local positions draft, and editable fee-share model
 - Review dialog and explicitly simulated proof/bridge progress
-- Privacy-first activity screen with loading, empty, table, mobile list, search, and detail states
+- Privacy-first activity ledger with a searchable transfer index and persistent route inspector
 - Unified compliance workspace for transactions, disclosure requests, role separation, and audit-log concepts
 - Transaction-scoped field grants with separate compliance, custodian, auditor, and platform roles
 - Dark and light themes, keyboard focus states, responsive layouts, and reduced-motion support
@@ -59,7 +59,9 @@ Implemented wallet boundary:
 - Shared wallet state across Bridge and Liquidity pages
 
 The two-sided Liquidity intent still requires both wallet connections because it models
-allocations on both networks. Bridge transfers do not.
+allocations on both networks. Bridge transfers do not. The earnings panel is an editable
+illustration based on monthly bridge volume, a 0.05% fee assumption, and the provider's
+modeled share of total pool liquidity. It is not a live quote, APY, or guarantee.
 
 Wallet signing and blockchain actions are not implemented.
 

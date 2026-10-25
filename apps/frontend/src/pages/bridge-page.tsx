@@ -1,6 +1,5 @@
 import {
   AlertTriangle,
-  ArrowDown,
   ArrowRight,
   Check,
   CheckCircle2,
@@ -11,6 +10,7 @@ import {
   Info,
   LoaderCircle,
   LockKeyhole,
+  Repeat2,
   RotateCcw,
   ShieldCheck,
 } from 'lucide-react'
@@ -212,110 +212,109 @@ function BridgePage() {
               </p>
             </div>
 
-            <div className="relative space-y-2">
-              <div className="rounded-3xl border border-border bg-background/55 p-4 sm:p-5">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <NetworkMark network={from} />
-                    <div>
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">From</p>
-                      <p className="mt-1 text-sm font-medium">{networkMeta[from].name}</p>
-                    </div>
-                  </div>
-                  <span className="rounded-lg border border-border px-2 py-1 text-[9px] font-medium text-subtle">USDC</span>
+            <div className="overflow-hidden rounded-[1.75rem] border border-border bg-background/55">
+              <div className="grid grid-cols-[1fr_auto_1fr] items-center border-b border-border px-4 py-5 sm:px-6">
+                <div className="flex min-w-0 flex-col items-center text-center">
+                  <NetworkMark network={from} className="size-12 rounded-[18px]" />
+                  <p className="mt-3 text-[9px] font-semibold uppercase tracking-[0.15em] text-accent">You send</p>
+                  <p className="mt-1 truncate text-xs font-medium">{networkMeta[from].shortName}</p>
                 </div>
-                <div className="mt-5 flex items-end gap-3 border-t border-border pt-4">
-                  <label htmlFor="bridge-amount" className="sr-only">Amount</label>
+
+                <button
+                  type="button"
+                  aria-label={`Reverse route to ${networkMeta[to].shortName} to ${networkMeta[from].shortName}`}
+                  title="Reverse transfer direction"
+                  onClick={reverseRoute}
+                  className="focus-ring group mx-3 grid size-11 place-items-center rounded-full border border-border-strong bg-surface-raised text-muted transition-colors hover:border-accent/45 hover:text-accent sm:mx-8"
+                >
+                  <Repeat2 key={from} aria-hidden="true" className="route-turn size-4" />
+                </button>
+
+                <div className="flex min-w-0 flex-col items-center text-center">
+                  <NetworkMark network={to} className="size-12 rounded-[18px]" />
+                  <p className="mt-3 text-[9px] font-semibold uppercase tracking-[0.15em] text-subtle">They receive</p>
+                  <p className="mt-1 truncate text-xs font-medium">{networkMeta[to].shortName}</p>
+                </div>
+              </div>
+
+              <div className="px-5 py-6 sm:px-7">
+                <div className="flex items-center justify-between gap-4">
+                  <label htmlFor="bridge-amount" className="text-[10px] font-medium text-subtle">Amount</label>
+                  <span className="text-[10px] text-subtle">Balance · 1,250.00 USDC</span>
+                </div>
+                <div className="mt-3 flex items-end gap-3">
                   <input
                     id="bridge-amount"
                     inputMode="decimal"
                     value={amount}
                     onChange={(event) => setAmount(event.target.value.replace(/[^0-9.]/g, ''))}
-                    className="min-w-0 flex-1 bg-transparent text-3xl font-medium tracking-[-0.045em] outline-none placeholder:text-subtle"
+                    className="min-w-0 flex-1 bg-transparent text-4xl font-medium tracking-[-0.06em] outline-none placeholder:text-subtle sm:text-5xl"
                     placeholder="0.00"
                   />
                   <button
                     type="button"
-                    className="focus-ring rounded-lg px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-accent hover:bg-accent/10"
+                    className="focus-ring mb-1 rounded-full border border-border px-3 py-1.5 text-[10px] font-semibold text-accent hover:border-accent/40"
                     onClick={() => setAmount('1250')}
                   >
-                    Max
+                    MAX
                   </button>
+                  <span className="mb-1 rounded-full bg-surface-raised px-3 py-1.5 text-xs font-semibold">USDC</span>
                 </div>
-                <p className="mt-2 text-[10px] text-subtle">Illustrative balance: 1,250.00 USDC</p>
+                <div className="mt-5 flex items-center justify-between border-t border-border pt-4 text-[11px]">
+                  <span className="text-subtle">Estimated at destination</span>
+                  <span className="font-mono">≈ {compactNumber.format(quote.amountOut)} USDC</span>
+                </div>
               </div>
 
-              <button
-                type="button"
-                aria-label="Reverse transfer direction"
-                title="Reverse transfer direction"
-                onClick={reverseRoute}
-                className="focus-ring absolute left-1/2 top-1/2 z-10 grid size-10 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-2xl border border-border-strong bg-surface-raised text-subtle transition-colors hover:border-accent/40 hover:text-accent"
-              >
-                <ArrowDown aria-hidden="true" className="size-4" />
-              </button>
-
-              <div className="rounded-3xl border border-border bg-background/55 p-4 sm:p-5">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <NetworkMark network={to} />
-                    <div>
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">To</p>
-                      <p className="mt-1 text-sm font-medium">{networkMeta[to].name}</p>
-                    </div>
-                  </div>
-                  <span className="font-mono text-sm text-foreground">≈ {compactNumber.format(quote.amountOut)}</span>
+              <div className="border-t border-border px-5 py-5 sm:px-7">
+                <label htmlFor="recipient" className="block text-[10px] font-medium text-subtle">
+                  Receiving {networkMeta[to].shortName} address
+                </label>
+                <div className="mt-3 flex items-center rounded-xl border border-border bg-surface/60 px-3 focus-within:border-accent/50">
+                  <input
+                    id="recipient"
+                    value={recipient}
+                    onChange={(event) => setRecipient(event.target.value)}
+                    aria-invalid={recipient.length > 0 && !recipientIsValid}
+                    className="min-w-0 flex-1 bg-transparent py-3 font-mono text-xs outline-none placeholder:text-subtle"
+                    placeholder={to === 'stellar' ? 'G…' : '0x…'}
+                  />
+                  <button
+                    type="button"
+                    aria-label={`Use a demo ${networkMeta[to].shortName} recipient`}
+                    title="Use demo recipient"
+                    className="focus-ring rounded-lg p-2 text-subtle hover:text-foreground"
+                    onClick={() => setRecipient(
+                      to === 'stellar'
+                        ? 'GCFX4N6W4FZDB3A7XUVKQ5BIRXW3S2E5HUEXAMPLEADDR'
+                        : '0x1111111111111111111111111111111111111111',
+                    )}
+                  >
+                    <Copy aria-hidden="true" className="size-4" />
+                  </button>
                 </div>
-                <div className="mt-5 border-t border-border pt-4">
-                  <label htmlFor="recipient" className="mb-2 block text-[10px] font-medium text-subtle">
-                    Receiving {networkMeta[to].shortName} address
-                  </label>
-                  <div className="flex items-center">
-                    <input
-                      id="recipient"
-                      value={recipient}
-                      onChange={(event) => setRecipient(event.target.value)}
-                      aria-invalid={recipient.length > 0 && !recipientIsValid}
-                      className="min-w-0 flex-1 bg-transparent font-mono text-xs outline-none placeholder:text-subtle"
-                      placeholder={to === 'stellar' ? 'G…' : '0x…'}
-                    />
-                    <button
-                      type="button"
-                      aria-label={`Use a demo ${networkMeta[to].shortName} recipient`}
-                      title="Use demo recipient"
-                      className="focus-ring rounded-lg p-2 text-subtle hover:bg-surface-raised hover:text-foreground"
-                      onClick={() => setRecipient(
-                        to === 'stellar'
-                          ? 'GCFX4N6W4FZDB3A7XUVKQ5BIRXW3S2E5HUEXAMPLEADDR'
-                          : '0x1111111111111111111111111111111111111111',
-                      )}
-                    >
-                      <Copy aria-hidden="true" className="size-4" />
-                    </button>
-                  </div>
-                  {recipient.length > 0 && !recipientIsValid && (
-                    <p className="mt-2 text-[10px] text-danger">
-                      {to === 'stellar'
-                        ? 'Enter a Stellar public address beginning with G.'
-                        : 'Enter a 42-character Ethereum address beginning with 0x.'}
-                    </p>
-                  )}
-                  {wallets[to] && recipient !== wallets[to]?.address && (
-                    <button
-                      type="button"
-                      className="focus-ring mt-2 rounded-md text-[10px] font-medium text-accent hover:text-accent-strong"
-                      onClick={() => setRecipient(wallets[to]?.address ?? '')}
-                    >
-                      Use connected {networkMeta[to].wallet} address
-                    </button>
-                  )}
-                  {wallets[to] && recipient === wallets[to]?.address && (
-                    <p className="mt-2 flex items-center gap-1.5 text-[10px] text-success">
-                      <CheckCircle2 aria-hidden="true" className="size-3" />
-                      Filled from connected {networkMeta[to].wallet}
-                    </p>
-                  )}
-                </div>
+                {recipient.length > 0 && !recipientIsValid && (
+                  <p className="mt-2 text-[10px] text-danger">
+                    {to === 'stellar'
+                      ? 'Enter a Stellar public address beginning with G.'
+                      : 'Enter a 42-character Ethereum address beginning with 0x.'}
+                  </p>
+                )}
+                {wallets[to] && recipient !== wallets[to]?.address && (
+                  <button
+                    type="button"
+                    className="focus-ring mt-2 rounded-md text-[10px] font-medium text-accent hover:text-accent-strong"
+                    onClick={() => setRecipient(wallets[to]?.address ?? '')}
+                  >
+                    Use connected {networkMeta[to].wallet} address
+                  </button>
+                )}
+                {wallets[to] && recipient === wallets[to]?.address && (
+                  <p className="mt-2 flex items-center gap-1.5 text-[10px] text-success">
+                    <CheckCircle2 aria-hidden="true" className="size-3" />
+                    Filled from connected {networkMeta[to].wallet}
+                  </p>
+                )}
               </div>
             </div>
 

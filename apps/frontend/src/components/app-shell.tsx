@@ -75,12 +75,11 @@ function AppShell({
         <div className="mx-auto flex h-16 max-w-[1240px] items-center justify-between gap-4">
           <button
             type="button"
-            className="focus-ring flex items-center gap-2.5 rounded-xl"
+            className="focus-ring rounded-lg px-1 py-2"
             onClick={() => onNavigate('landing')}
             aria-label="Zkross home"
           >
             <BrandMark />
-            <span className="text-sm font-semibold tracking-[-0.02em]">Zkross</span>
           </button>
 
           {isLanding ? (
@@ -141,7 +140,7 @@ function AppShell({
                 className="hidden sm:inline-flex"
               >
                 <WalletCards aria-hidden="true" />
-                Wallets · {walletCount}/2
+                {walletCount === 0 ? 'Connect wallet' : `${walletCount} wallet${walletCount > 1 ? 's' : ''} connected`}
               </Button>
             )}
           </div>
