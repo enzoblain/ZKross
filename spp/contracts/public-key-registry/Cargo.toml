@@ -1,0 +1,30 @@
+[package]
+name = "public-key-registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+# workspace
+contract-types.workspace = true
+pool-core.workspace = true
+soroban-utils.workspace = true
+
+# external
+soroban-sdk.workspace = true
+
+[dev-dependencies]
+# external
+ed25519-dalek.workspace = true
+sha2.workspace = true
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[lints]
+workspace = true

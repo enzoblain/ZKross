@@ -1,0 +1,180 @@
+use crate::{
+    chain::IndexerError,
+    planner::{PlanError, SpendSessionError},
+    types::{AspMembershipSync, Sensitive},
+};
+
+use crate::types::TransactionResult;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("not implemented")]
+    NotImplemented,
+
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error(transparent)]
+    Rpc(#[from] crate::chain::RpcError),
+
+    #[error(transparent)]
+    Plan(#[from] PlanError),
+
+    #[error(transparent)]
+    SpendSession(#[from] SpendSessionError),
+
+    #[error("ASP membership sync required: {0:?}")]
+    MembershipSync(AspMembershipSync),
+
+    #[error(transparent)]
+    PlanExecution(#[from] PlanExecutionError),
+
+    /// The user rejected the wallet signing request (SEP-0043 error code -4)
+    #[error("wallet request rejected by user: {0}")]
+    UserRejected(String),
+
+    /// An operation needs the note owner's own signature, and the session
+    /// signs with a different account.
+    ///
+    /// A session may hold a divergent pair: the payer sources the envelope,
+    /// `sender` and sequence number, and spending needs nothing else. Two
+    /// operations do need the owner itself — key derivation, whose signature
+    /// *is* the note secret, and registration, whose simulated auth entry is
+    /// the owner's. Those raise this; the session as a whole does not.
+    // Escapes to a UI toast, the telemetry ring buffer and CLI logs.
+    #[error(
+        "signing account {} cannot sign for the note owner {}; this step needs the owner's own signature",
+        Sensitive(signer),
+        Sensitive(owner)
+    )]
+    SignerIsNotNoteOwner { owner: String, signer: String },
+
+    /// The account has no ledger entry on-chain yet
+    #[error("account {} not found on-chain", crate::types::Sensitive(address))]
+    AccountNotFound { address: String },
+
+    /// The public key registry was deployed for another key derivation domain
+    /// than this session's config.
+    #[error(
+        "the public key registry uses key derivation domain {registry:?}, but this deployment's config uses {config:?}"
+    )]
+    KdfDomainMismatch { registry: String, config: String },
+
+    /// Local storage has no privacy keys for address
+    #[error(
+        "no privacy keys found in local storage for {}; derive privacy keys first",
+        Sensitive(user_address)
+    )]
+    PrivacyKeysNotFound { user_address: String },
+
+    #[error("disclosure verification failed: {0}")]
+    DisclosureVerification(String),
+
+    #[error("event history is unavailable: {0}")]
+    RetentionGap(#[from] RetentionGap),
+
+    /// A deposit into a paused pool, refused before proving.
+    #[error("deposits into pool {pool} are paused")]
+    DepositsPaused { pool: String },
+
+    /// An untyped failure.
+    ///
+    /// The message holds the whole `anyhow` cause chain, so the variant has no
+    /// `source`, which would print every cause twice.
+    #[error("{0:#}")]
+    Other(anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RetentionGap {
+    #[error("main RPC is missing event history and no fallback bootnode is configured")]
+    SyncGap,
+
+    #[error("configured bootnode failed to fill retention gap: {0}")]
+    BootnodeFailed(String),
+
+    /// The bootnode answered `-32004`; retry later.
+    #[error("configured bootnode cannot serve the event history yet: {0}")]
+    BootnodeNotReady(String),
+}
+
+/// Multi-tx plan stopped after one or more steps had already confirmed
+/// on-chain.
+///
+/// `completed` are those successes; `cause` is why the remaining steps did not
+/// finish. Recovery is sync + a fresh plan from current notes — the same plan
+/// is not resumed.
+#[derive(Debug, thiserror::Error)]
+#[error("plan failed after {} confirmed transaction(s): {cause}", .completed.len())]
+pub struct PlanExecutionError {
+    pub completed: Vec<TransactionResult>,
+    #[source]
+    pub cause: Box<Error>,
+}
+
+impl PlanExecutionError {
+    /// Attach already-confirmed txs to a mid-plan failure. If `completed` is
+    /// empty, returns `cause` unchanged (no wrapper).
+    pub fn into_error(mut completed: Vec<TransactionResult>, cause: Error) -> Error {
+        match cause {
+            Error::PlanExecution(PlanExecutionError {
+                completed: mut nested,
+                cause,
+            }) => {
+                completed.append(&mut nested);
+                Self::into_error(completed, *cause)
+            }
+            cause if completed.is_empty() => cause,
+            cause => Error::PlanExecution(PlanExecutionError {
+                completed,
+                cause: Box::new(cause),
+            }),
+        }
+    }
+
+    /// Underlying failure, unwrapping nested [`Error::PlanExecution`] if any.
+    pub fn cause(&self) -> &Error {
+        match self.cause.as_ref() {
+            Error::PlanExecution(inner) => inner.cause(),
+            other => other,
+        }
+    }
+}
+
+impl From<IndexerError> for Error {
+    fn from(ierr: IndexerError) -> Self {
+        match ierr {
+            IndexerError::Rpc(e) => e.into(),
+            IndexerError::Other(e) => e.into(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for Error {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_untyped_error_prints_its_causes() {
+        let error = Error::Other(
+            anyhow::anyhow!("HostError: Error(Contract, #18)").context("simulate transaction"),
+        );
+        assert_eq!(
+            error.to_string(),
+            "simulate transaction: HostError: Error(Contract, #18)"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_untyped_error_prints_each_cause_once() {
+        let inner = Error::Other(anyhow::anyhow!("B").context("A"));
+        let error = Error::Other(anyhow::Error::from(inner).context("sync"));
+        assert_eq!(error.to_string(), "sync: A: B");
+    }
+}

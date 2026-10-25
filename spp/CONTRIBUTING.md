@@ -1,0 +1,393 @@
+# Contributor's guide
+
+## Commit signing
+
+Enable [commit signing](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits)
+
+```sh
+git config commit.gpgsign true
+```
+
+## Documentation
+
+Unified project documentation is available at https://nethermindeth.github.io/stellar-private-payments/docs/
+
+## Communication and environment notes
+
+- External contributors should mention their PR in the project [LinkedIn group](https://www.linkedin.com/groups/18809039/). PRs from forks are not reviewed without this notice because we need to see a human behind the contribution.
+- Active development discussions happen in the [Telegram group](https://t.me/stellar_privacy). If you have technical questions you should ask them there.
+- You may need to reset local browser storage from time to time. [Bootnode](https://github.com/NethermindEth/stellar-private-payments/issues/169) support is not available yet, and contracts are redeployed during development.
+
+## Project Structure
+
+```
+stellar-private-payments/
+├── app/                        # Web application (see app/README.md, app/ARCHITECTURE.md)
+│   ├── js/                     # JavaScript frontend code (web interface)
+│   │   ├── ui/                 # UI components
+│   │   ├── admin.js            # Admin UI entry
+│   │   ├── ui.js               # Main UI entry
+│   │   ├── disclosure.js       # Selective disclosure UI entry
+│   │   ├── app-storage.js      # App-only persistence (settings, op history)
+│   │   ├── db-locked.js        # DB-locked (storage in use by another tab) modal
+│   │   ├── wallet.js           # Freighter connect/watch/sign UX
+│   │   ├── wasm-facade.js      # Runtime facade over stellar-private-payments
+│   │   └── sw.js               # Service worker
+│   ├── css/                    # Stylesheets
+│   ├── assets/                 # Static assets (logo, favicon)
+│   ├── index.html              # Main web application entry (includes the Disclosure view)
+│   └── admin.html              # Admin entry
+├── sdk/                        # Platform-agnostic Rust SDK crates
+│   ├── native/                 # Rust SDK (`stellar-private-payments`)
+│   ├── web/                    # Browser npm package (WASM, workers, bundled circuits)
+│   └── tests/                  # SDK integration tests
+├── circuits/                   # Circom ZK circuits
+│   ├── src/
+│   │   ├── core/               # Rust circuit helpers (Merkle, ...)
+│   │   ├── poseidon2/          # Poseidon2 hash circuits
+│   │   ├── smt/                # Sparse Merkle tree circuits
+│   │   ├── test/               # Circuit test utilities
+│   │   ├── policyTransaction.circom      # Base transact circuit
+│   │   ├── aspMembership.circom          # ASP allowlist proof subcircuit
+│   │   ├── aspNonMembership.circom       # ASP blocklist proof subcircuit
+│   │   ├── policyTransactionOpen.circom  # Open-policy transaction circuit
+│   │   ├── policyTransactionAllowlist.circom  # Allowlist-only transaction circuit
+│   │   ├── policyTransactionBlocklist.circom  # Blocklist-only transaction circuit
+│   │   ├── policyTransactionBoth.circom  # Both-policy transaction circuit
+│   │   ├── policy_tx_2_2[_A|_B|_AB].circom  # Entry points
+│   │   └── *.circom            # Supporting circuits
+│   └── build.rs                # Circuit compilation build script
+├── circuit-keys/               # Helpers to convert snarkjs keys to Arkworks
+├── contracts/                  # Soroban smart contracts
+│   ├── asp-membership/         # ASP membership Merkle tree
+│   ├── asp-non-membership/     # ASP non-membership sparse Merkle tree
+│   ├── circom-groth16-verifier/# On-chain Groth16 proof verifier
+│   ├── pool/                   # Main privacy pool contract
+│   ├── public-key-registry/    # On-chain public key registry
+│   ├── soroban-utils/          # Shared utilities (Poseidon2, etc.)
+│   └── types/                  # Shared contract types
+├── tools/                      # Auxiliary tools
+│   ├── bootnode/               # HTTPS JSON-RPC getEvents service (excluded from workspace)
+│   └── ceremony-cli/           # Groth16 BN254 trusted-setup ceremony CLI (wraps snarkjs)
+├── cli/                        # CLI binary (stellar-private-payments-cli; see CLI development)
+├── integration-tests-app/      # Real-Freighter browser e2e suite (see integration-tests-app/README.md)
+├── integration-tests-web/      # Pre-signing SDK browser e2e suite (see integration-tests-web/README.md)
+├── e2e-tests/                  # End-to-end integration tests
+├── deployments/                # Deployment scripts, testnet config, legal notices
+├── docs/                       # Project documentation (mdBook source)
+├── scripts/                    # Helper scripts
+├── vendor/                     # Vendored/patched dependencies (cranelift-control)
+├── dist/                       # Built static site output (generated)
+└── Makefile                    # Build automation
+```
+
+## Prerequisites
+
+- [**Rust**](https://www.rust-lang.org/tools/install): the supported minimum is declared in `workspace.package.rust-version` in `Cargo.toml`; `rust-toolchain.toml` selects the development and release compiler.
+- [**Circom**](https://github.com/iden3/circom) **2.2.3** for circuit / graph builds (`circuits/circom.lock`; same tag as the Rust circom crates in `circuits/Cargo.toml`).
+- [**Stellar CLI**](https://github.com/stellar/stellar-cli) for contract deployment.
+- [**Node.js**](https://github.com/nodejs/node) for frontend dependencies.
+- [**Trunk**](https://github.com/trunk-rs/trunk) for serving the web application.
+- [**Cargo Deny**](https://github.com/EmbarkStudios/cargo-deny)
+- [**Typos**](https://github.com/crate-ci/typos?tab=readme-ov-file#install)
+- [**Cargo Sort**](https://github.com/DevinR528/cargo-sort)
+- [**jq**](https://jqlang.github.io/jq/) for the MSRV and release scripts.
+- C compiler and archiver (`cc` and `ar`, plus `clang` for `wasm32-unknown-unknown` builds) to compile SQLite3MC from source.
+- [**wasm-bindgen-cli**](https://crates.io/crates/wasm-bindgen-cli) (provides `wasm-bindgen-test-runner` for `cargo test --target wasm32-unknown-unknown`)
+- [**wasm-pack**](https://rustwasm.github.io/wasm-pack/) for WASM bundling
+- **macOS only:** Homebrew LLVM (`brew install llvm`) provides clang for WebAssembly builds.
+  `make sdk-web-build`, `make serve`, `make build`, and `npm run build --prefix sdk/web` select it
+  automatically when installed, unless `CC_wasm32-unknown-unknown`, `CC_wasm32_unknown_unknown`,
+  `TARGET_CC`, or `CC` already selects a compiler.
+- **macOS only:** `llvm-ar` for `wasm32-unknown-unknown` builds (`rustup component add llvm-tools`). Apple's `ar`
+  silently drops wasm objects from archives, which breaks the SQLite build with undefined `sqlite3_*` symbols at link
+  time. `make serve` / `make build` / `npm run build --prefix sdk/web` use the active Rust toolchain's `llvm-ar`
+  automatically unless `AR_wasm32_unknown_unknown`, `TARGET_AR`, or `AR` is already set.
+
+For direct WebAssembly builds or the WASM tests below, select the compiler and archiver explicitly in your terminal:
+
+```bash
+# macOS only; run from the repository root to use the pinned Rust toolchain.
+brew install llvm
+export CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang"
+rustup component add llvm-tools
+export AR_wasm32_unknown_unknown="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar"
+cargo build -p stellar-private-payments-web --release --target wasm32-unknown-unknown
+```
+
+To keep it across terminals, put that path (`echo "$AR_wasm32_unknown_unknown"`) under `[env]` in your user-level
+`~/.cargo/config.toml` instead, and update it when `rust-toolchain.toml` moves to a new Rust version.
+
+The target-specific setting above also overrides a global `AR=ar` or `TARGET_AR=ar`. If those settings select
+Apple's archiver, the browser build script preserves them and the SQLite link error can recur; use the export
+above to select `llvm-ar` for WebAssembly. Linux builds keep their existing archiver selection and do not
+require this component.
+
+## Rust version support
+
+All first-party Rust packages share the minimum supported Rust version (MSRV)
+declared in the root `Cargo.toml`. Workspace members inherit it; excluded packages
+declare the same version explicitly. `bash scripts/msrv.sh` uses stable Cargo and
+`jq` to check the resolved declarations and workspace inheritance. The root field
+uses the canonical `rust-version = "X.Y.Z"` layout in `[workspace.package]`.
+Independent packages are listed explicitly in the checker; add new independent
+first-party packages there. Untracked scratch projects are not part of the policy.
+Vendored dependencies retain their own requirements and are checked by the actual
+MSRV builds; do not raise their requirements merely to match the development pin.
+
+The baseline is Rust 1.95.0, matching the requirement declared by
+`rusqlite_migration` (`spp-rusqlite-migration`) in the locked SDK dependency graph. The vendored
+`cranelift-control` retains upstream 0.133.0's Rust 1.94.0 requirement.
+
+The development/release compiler in `rust-toolchain.toml` may be newer. Updating
+that pin does not raise the MSRV. Keep the minimum until a language feature,
+dependency update, correctness fix, or maintenance need justifies an increase.
+Explain increases in the PR and release notes, and prefer a planned release
+boundary over a routine patch release. Update the workspace declaration and the
+excluded packages together. Older compiler support branches are not promised.
+
+The MSRV workflow runs on every PR, including source-only changes. Configure its
+three locked build checks as required in branch protection. Run
+its checks locally with the minimum toolchain installed:
+
+```sh
+rustup toolchain install "$(bash scripts/msrv.sh)" --profile minimal
+bash scripts/check-msrv.sh native
+bash scripts/check-msrv.sh browser
+bash scripts/check-msrv.sh contracts
+bash scripts/check-msrv.sh consumer
+```
+
+The scripts explicitly select the minimum compiler, independently of the local
+toolchain pin. Locked checks cover native workspace targets, the SDK's optional
+native `parallel` feature, browser WASM and workers, all deployable contracts,
+bootnode tests, and compilation of the excluded integration suites. Browser and
+contract checks install their Rust targets. The consumer check resolves fresh
+dependencies for the packaged SDK outside the workspace; it intentionally does
+not reuse the repository lockfile. Dependency updates must preserve both forms
+of compatibility. Fresh consumer resolution runs separately on dependency-related
+PRs, relevant pushes to main, or manual dispatch. It is not a required PR check:
+upstream releases must not block unrelated PRs. Run it manually before releasing
+or when investigating dependency changes.
+
+The contract check requires Stellar CLI 28.1.0 (the version installed by CI),
+which performs the Soroban SDK's required contract post-processing.
+
+The MSRV gate builds native test targets but leaves circuit-dependent test
+execution, browser execution, and local-network integration execution to their
+existing workflows. It covers native Linux and the two WASM targets; release CI
+provides the additional platform coverage. Formatting, Miri, coverage, and
+external tool installation can use separate toolchains.
+
+Circuit-specific witness graph regeneration (`circuit-compiler/witness-graph`)
+requires Circom and generated C++ inputs and is outside this MSRV guarantee;
+use the pinned development toolchain for that operation.
+
+## Building and testing crates
+
+### Patches
+
+`ark-circom` is [patched](https://github.com/NethermindEth/circom-compat/commits/wasm-no-parallel/) 
+(`Cargo.toml` is cleaned up from hardcoded `parallel` features) to allow running 
+in a single-threaded WASM - we don't want for now to enable multithreaded wasm support as the proving time is acceptable
+while wasm multithreading requires COOP/COEP headers and is much stricter to deploy.
+Also we delete `ethereum.rs` module to get rid of many irrelevant dependencies.
+`vendor/cranelift-control` is patched - the single dependency `arbitrary` is fixed at the same version as in
+the `soroban-sdk` - see https://github.com/NethermindEth/stellar-private-payments/issues/192.
+This patch remains for **circuits / ceremony** builds that still use ark-circom → Wasmer + Cranelift.
+The native SDK (`stellar-private-payments`) no longer depends on Wasmer; witness generation uses
+committed `circom-witness-rs` graphs (see `make circuits GRAPHS=1`).
+
+The workspace also aliases `rusqlite` and `rusqlite_migration` to the published
+[`spp-rusqlite`](https://crates.io/crates/spp-rusqlite) (`0.40.2`) and
+[`spp-rusqlite-migration`](https://crates.io/crates/spp-rusqlite-migration) (`2.6.0`) crates.
+`spp-rusqlite` is published from upstream `rusqlite` `main` at commit `b6476751` (which includes
+[`rusqlite` PR #1906](https://github.com/rusqlite/rusqlite/pull/1906) for `sqlite-wasm-rs 0.6`
+`sqlite3mc` support plus post-`0.40.2` changes on `main`) so `stellar-private-payments` can publish
+to crates.io before upstream cuts a release. Because `cargo audit` and `cargo deny` match RustSec
+advisories by crate name, check `rusqlite` and `rusqlite_migration` advisories manually until
+upstream releases include that change and the aliases are dropped.
+
+### Running WASM tests
+
+Some crates include unit tests intended to run under `wasm32-unknown-unknown` via `wasm-bindgen-test`.
+The workspace is configured to use `wasm-bindgen-test-runner` as the wasm test runner (see `.cargo/config.toml`),
+so you need it available on your `PATH` (typically by installing `wasm-bindgen-cli`).
+
+```bash
+# Install wasm-bindgen-cli (version must match `wasm-bindgen` in Cargo.lock)
+cargo install wasm-bindgen-cli --version 0.2.128 --locked --force
+
+# Example: run wasm tests for the Stellar Private Payments SDK
+cargo test --target wasm32-unknown-unknown -p stellar-private-payments --lib
+```
+
+### Building Circuits
+To explicitly build them:
+
+```bash
+# Build circuits → target/circuits-artifacts/
+make circuits
+```
+
+The circuit compiler (`tools/circuit-compiler`, via `make circuits`) also honors these flags:
+- **`--tests`** (`make circuits TESTS=1`): Builds the circom test circuits. Most Circom circuits simply define a template. And if you want to use it or test it, you need to instantiate it with some specific parameters.
+For efficiency, the compilation of these circuits test is gatekeeped behind this flag. When enabled, if the verifying keys are not in `testdata`, it will generate them. Deployed testnet keys are committed under `deployments/testnet/circuit_keys`.
+- **`--regen-keys`** (`make circuits REGEN_KEYS=1`): Forces the generation of new verification keys. R1CS compilation uses Circom `--O2`.
+- **`--graphs`** (`make circuits GRAPHS=1`): Regenerates `*.graph.bin` witness graphs after compiling. Requires Circom CLI matching `circuits/circom.lock` and a C++ toolchain. Graphs land in `target/circuits-artifacts/`; copy them into `deployments/testnet/circuit_keys/` to update committed artifacts.
+
+Also, for efficiency reasons, some tests are ignored by default. To run them:
+```bash
+# Compile test circuits first, then run ignored prove tests
+make circuits TESTS=1
+cargo test -p circuits -- --ignored
+```
+### Building Contracts
+
+```bash
+# Build all contracts
+stellar contract build --manifest-path Cargo.toml --out-dir target/stellar --optimize --package pool
+stellar contract build --manifest-path Cargo.toml --out-dir target/stellar --optimize --package asp-membership
+stellar contract build --manifest-path Cargo.toml --out-dir target/stellar --optimize --package asp-non-membership
+stellar contract build --manifest-path Cargo.toml --out-dir target/stellar --optimize --package circom-groth16-verifier
+
+# Or use the deployment script which builds automatically
+./deployments/scripts/deploy.sh --help
+```
+
+### Deploying Contracts
+
+See [DEPLOY.md](DEPLOY.md) for the `deployments/scripts/deploy.sh` pool spec
+syntax, options, and worked examples (including Global View Key deployments).
+
+### End-to-End Tests
+
+The E2E tests generate real Groth16 proofs and verify them, locally, using contracts and the Soroban-SDK. To run them:
+```bash
+cargo test -p e2e-tests
+```
+
+### Browser E2E setup
+
+The two browser e2e suites — the pre-signing SDK wasm tests and the
+real-Freighter tests in `integration-tests-app/` (see `integration-tests-app/README.md`) —
+each bring up their own prerequisites directly in their entry point script,
+rather than through a separate generalized preflight tool:
+
+- `integration-tests-web/run.sh` builds `sdk/web/dist` on demand
+  (`npm ci && npm run build`) and resolves `chromedriver` from `PATH` —
+  a missing Rust/wasm toolchain simply fails that build with its own error.
+- `integration-tests-app/scripts/serve-and-run.sh` and `run-e2e.sh` both run a cheap
+  filesystem check (node_modules, the vendored extension, the profile
+  snapshot) and only shell out to `integration-tests-app/scripts/setup.sh` when one
+  of those is actually missing. `E2E_SKIP_SETUP=1` bypasses it.
+
+`serve-and-run.sh` (and `integration-tests-web/run.sh`) also start/stop
+the local `stellar/quickstart` network (`deployments/scripts/localnet.sh`)
+and deploy fresh contracts to it (`deployments/scripts/deploy-local.sh`).
+`run-e2e.sh` alone does not — it expects a network and `APP_URL` already up,
+which is why it's normally invoked through `serve-and-run.sh`.
+
+See `integration-tests-app/README.md` for the per-distro Chromium/extension install
+instructions.
+
+## Code quality assurance
+
+Install a pre-push git hook:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+## App development
+
+### Prerequisites
+
+* Node.js
+* npm
+
+The web application:
+
+```sh
+make install
+make serve
+```
+
+Production build:
+
+```sh
+make release
+```
+
+### Browser SDK (`sdk/web`)
+
+Standalone npm package (`stellar-private-payments`). See [`sdk/web/README.md`](sdk/web/README.md).
+
+Requires [**wasm-bindgen-cli**](https://crates.io/crates/wasm-bindgen-cli) (version must match `Cargo.lock`).
+
+```sh
+make install
+make sdk-web-build
+npm run check:artifacts --prefix sdk/web
+npm run check:types --prefix sdk/web
+```
+
+CI runs these checks in `.github/workflows/wasm-build.yml`.
+
+## CLI development
+
+Build it in a debug mode
+
+```sh
+cargo build -p stellar-private-payments-cli
+```
+
+If you build it in a release mode, then ensure that proper data directory is configured.
+
+A CLI *prerelease* can be done with a release PR that bumps `cli/Cargo.toml` (keeping the same major.minor as `sdk/native` and `sdk/web/package.json`), then merge to `main`. Auto-tag creates `cli-v…` and the Release workflow publishes binaries.
+
+```sh
+./scripts/install.sh --pre
+```
+
+To make a production release of CLI, merge a release PR with the desired `cli/Cargo.toml` version bump. Tags and GitHub releases are created automatically (`cli-vX.Y.Z`).
+
+Release versions share **major.minor** across `sdk/native`, `sdk/web/package.json`, and `cli/Cargo.toml`; patch versions are independent. See `scripts/release-versions.sh check`.
+
+## Instrumentation & Logging Guidelines
+
+All contributions to the SDK must adhere to the following telemetry and instrumentation guidelines to prevent credential/key leaks:
+
+### 1. Instrumentation House Rules
+* Always use `#[tracing::instrument(skip_all, fields(...))]` on public functions or functions processing transaction requests.
+* Do not log parameters by default; instead, explicitly list only **non-sensitive** fields in the `fields(...)` allowlist of the macro.
+* Wrap all **Tier-1** parameters (such as amounts, recipient/sender addresses, note commitments, nullifiers, and public keys) inside the `types::Sensitive(value)` wrapper when logging or recording them inside spans.
+
+### 2. Tier Classification
+* **Tier-0 (Private/Secret)**: Private keys, seeds, signatures, circuit witness arrays, and membership blinding factors. **Strictly forbidden from being formatted or logged.** Do not wrap them; keep them out of logs completely.
+* **Tier-1 (Sensitive/Redactable)**: Stellar addresses, token amounts, commitments, and nullifiers. **Must be wrapped in `types::Sensitive`.**
+
+See [SECURITY.md](SECURITY.md) § "Logging Security & Privacy Model" for the full two-tier model and its invariants.
+
+### 3. Correlation IDs
+* Every instrumented boundary/operation function includes `correlation_id = %types::correlation_id_or_new()` in its `fields(...)`. It inherits the ambient id when nested and mints one at operation roots — never call `new_correlation_id()` directly.
+* CLI commands open a root span (`info_span!("cmd_*", correlation_id = ...)`) so SDK calls inherit the id.
+
+### 4. Timing & Durations
+* SDK crates (must stay wasm-compatible): use `web_time::Instant`. Native-only crates (e.g. `cli`): use `std::time::Instant`.
+* Time genuinely expensive operations only (proving, witness computation, key deserialization, external processes). Emit `elapsed_ms` at `debug!` level, on **both** success and error exits of the expensive section (capture the result, log, then `?`).
+* Use `u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)` — the workspace denies `clippy::cast_possible_truncation`.
+
+### 5. Levels & Payloads
+* Boundary spans at `info`; internal "started" breadcrumbs and durations at `debug`; verbose detail at `trace`; fallback/degraded paths at `warn`; hard failures at `error`.
+* External process boundaries (e.g. shelling out to `stellar`): an `info!` breadcrumb **before** spawn (this is the hang diagnostic), outcome + duration **after** exit.
+* Large or secret byte payloads (proving keys, witnesses, R1CS, XDR): log **lengths only**, never contents.
+
+## JS license policy maintenance
+
+The JS/npm license policy lives in `.github/js-license-policy.json` and is enforced by `.github/workflows/js-license-audit.yml`. The tooling is POSIX sh + jq (`scripts/check-js-licenses.sh`, `scripts/generate-js-attribution.sh`), so jq must be installed locally; GitHub runners provide it.
+
+- **Scan targets**: `scripts/check-js-licenses.sh` scans the two vendored JS workspaces only: `app/package-lock.json` and `sdk/web/package-lock.json`. It does NOT scan `circuits/src/circomlib/package-lock.json`; circomlib's GPL-3.0 npm devDependencies are build tooling, never shipped, mirroring the `circuits` exclusion in `deny.toml` (line 18). The workflow still guards circomlib's own license via a `circomlib license tripwire` step that asserts `iden3/circomlib` at the pinned SHA reports `LGPL-3.0` (its `.circom` sources compile into shipped artifacts, so redistribution obligations must be re-evaluated if the license changes).
+- **Allowlist updates**: add a new permissive SPDX identifier to `allowlist` when a PR introduces a dependency whose license is not already listed. Keep the list alphabetically sorted. Compound/dual licenses (e.g. `(MIT OR Apache-2.0)`) are matched as one exact string, not evaluated as boolean SPDX expressions — if a dependency reports one, add that literal string to the allowlist (see `(MIT AND BSD-3-Clause)`, used by app's `sha.js`) rather than expecting the scanner to parse it. Because `actions/dependency-review-action` rejects compound expressions in `allow-licenses` and silently treats them as "no match", a compound-allowlisted package must ALSO be listed in the workflow's `allow-dependencies-licenses` input as a `pkg:npm/<name>` identifier (e.g. `pkg:npm/sha.js` for `(MIT AND BSD-3-Clause)`).
+- **Exceptions**: if a dependency's license is not on the allowlist (or its `license` field is missing in `package-lock.json`), add an entry to `exceptions` with `approver: PENDING_PR_REVIEW`, a written justification, and the affected package(s). Scope every exception to its lockfile with `target` so build-tool carve-outs cannot cover the same package in a runtime footprint; omitting `target` applies the exception repo-wide — avoid unless intentional. Exceptions marked `PENDING_PR_REVIEW` must be ratified by a maintainer before merge. Before adding or editing an exception, run `sh scripts/verify-exception-licenses.sh` to confirm the declared license actually matches the npm registry at the package's *locked* version (not `latest` — some packages relicense between majors) — a manual tool, not run in CI.
+- **Attribution**: `dist/licenses/THIRD-PARTY-{app,sdk-web}.{json,txt}` are generated at build time by `scripts/generate-js-attribution.sh` (called from `deployments/scripts/stage-dist-legal.sh`). Do not edit them by hand.

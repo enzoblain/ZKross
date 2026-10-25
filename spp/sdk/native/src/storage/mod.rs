@@ -1,0 +1,273 @@
+//! Pluggable async wallet storage for [`crate::pool::PrivatePool`].
+
+use crate::{
+    gvk::GvkEvent,
+    planner::SpendableNote,
+    state::{SqliteStorage, StoredPrivateKeys},
+    types::{
+        ContractConfig, EncryptionKeyPair, EncryptionPublicKey, Field, NoteKeyPair, NotePublicKey,
+        OperationalFeedItem, PortfolioBalance, PortfolioPoolEntry, RecipientLookup,
+        UserNoteSummary,
+    },
+    zk::flows::TransactParams,
+};
+
+use crate::{
+    disclosure::{DisclosureInputs, DisclosureInputsRequest},
+    error::Error,
+    registration::{RegistrationInputs, RegistrationRequest},
+    transact::{BuildTransactParams, TransactRequest},
+};
+
+mod local;
+
+use std::collections::HashSet;
+
+pub use local::LocalStorage;
+
+pub(crate) fn map_build_params(
+    result: Result<BuildTransactParams, Error>,
+) -> Result<TransactParams, Error> {
+    match result? {
+        BuildTransactParams::Ready(params) => Ok(*params),
+        BuildTransactParams::MembershipSync(status) => Err(Error::MembershipSync(status)),
+    }
+}
+
+pub(crate) fn map_private_keys(
+    storage: &SqliteStorage,
+    user_address: &str,
+    kdf_domain: &str,
+) -> Result<StoredPrivateKeys, Error> {
+    storage
+        .get_private_keys(user_address, kdf_domain)?
+        .ok_or_else(|| Error::PrivacyKeysNotFound {
+            user_address: user_address.to_string(),
+        })
+}
+
+pub(crate) fn spendable_notes_from_storage(
+    storage: &SqliteStorage,
+    pool_contract_id: &str,
+    user_address: &str,
+    kdf_domain: &str,
+) -> Result<Vec<SpendableNote>, Error> {
+    Ok(storage
+        .list_unspent_user_notes(pool_contract_id, user_address, kdf_domain)?
+        .into_iter()
+        .map(|n| SpendableNote {
+            commitment: n.id,
+            amount: n.amount,
+        })
+        .collect())
+}
+
+pub(crate) fn pool_notes_from_storage(
+    storage: &SqliteStorage,
+    pool_contract_id: &str,
+    user_address: &str,
+    kdf_domain: &str,
+) -> Result<Vec<UserNoteSummary>, Error> {
+    Ok(storage.list_pool_user_notes(pool_contract_id, user_address, kdf_domain)?)
+}
+
+pub(crate) fn portfolio_balances_from_storage(
+    storage: &SqliteStorage,
+    user_address: &str,
+    kdf_domain: &str,
+    enabled_pools: &[PortfolioPoolEntry],
+) -> Result<Vec<PortfolioBalance>, Error> {
+    Ok(storage.list_portfolio_balances(user_address, kdf_domain, enabled_pools)?)
+}
+
+pub(crate) fn user_notes_from_storage(
+    storage: &SqliteStorage,
+    user_address: &str,
+    kdf_domain: &str,
+    limit: u32,
+) -> Result<Vec<UserNoteSummary>, Error> {
+    Ok(storage.list_user_notes(user_address, kdf_domain, limit)?)
+}
+
+pub(crate) fn operational_feed_from_storage(
+    storage: &SqliteStorage,
+    limit: u32,
+    config: &ContractConfig,
+) -> Result<Vec<OperationalFeedItem>, Error> {
+    Ok(storage.get_operational_feed(limit, &config.asp_membership, &config.public_key_registry)?)
+}
+
+pub(crate) fn recipient_lookup_from_storage(
+    storage: &SqliteStorage,
+    address: &str,
+    config: &ContractConfig,
+) -> Result<RecipientLookup, Error> {
+    Ok(storage.recipient_lookup(address, &config.public_key_registry)?)
+}
+
+/// Wallet reads and sync lifecycle for [`crate::pool::PrivatePool`].
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait Storage: crate::chain::ContractDataStorage {
+    /// Independent handle for a concurrent consumer
+    fn fork(&self) -> Result<StorageHandle, Error>;
+
+    async fn ensure_ready(&self) -> Result<(), Error>;
+
+    async fn spendable_notes(
+        &self,
+        pool_contract_id: &str,
+        user_address: &str,
+        kdf_domain: &str,
+    ) -> Result<Vec<SpendableNote>, Error>;
+
+    async fn notes(
+        &self,
+        pool_contract_id: &str,
+        user_address: &str,
+        kdf_domain: &str,
+    ) -> Result<Vec<UserNoteSummary>, Error>;
+
+    async fn list_portfolio_balances(
+        &self,
+        user_address: &str,
+        kdf_domain: &str,
+        enabled_pools: &[PortfolioPoolEntry],
+    ) -> Result<Vec<PortfolioBalance>, Error>;
+
+    async fn list_user_notes(
+        &self,
+        user_address: &str,
+        kdf_domain: &str,
+        limit: u32,
+    ) -> Result<Vec<UserNoteSummary>, Error>;
+
+    async fn operational_feed(
+        &self,
+        limit: u32,
+        config: &ContractConfig,
+    ) -> Result<Vec<OperationalFeedItem>, Error>;
+
+    async fn recipient_lookup(
+        &self,
+        address: &str,
+        config: &ContractConfig,
+    ) -> Result<RecipientLookup, Error>;
+
+    async fn build_transact_params(&self, req: &TransactRequest) -> Result<TransactParams, Error>;
+
+    async fn build_disclosure_inputs(
+        &self,
+        req: &DisclosureInputsRequest,
+    ) -> Result<Vec<DisclosureInputs>, Error>;
+
+    async fn build_registration_inputs(
+        &self,
+        req: &RegistrationRequest,
+    ) -> Result<RegistrationInputs, Error>;
+
+    /// Whether privacy keys are already stored for `user_address` under
+    /// `kdf_domain`.
+    async fn privacy_keys_exist(&self, user_address: &str, kdf_domain: &str)
+    -> Result<bool, Error>;
+
+    /// Persist freshly derived private keys for `user_address` under
+    /// `kdf_domain`.
+    async fn save_private_keys(
+        &self,
+        user_address: &str,
+        kdf_domain: &str,
+        note_keypair: &NoteKeyPair,
+        encryption_keypair: &EncryptionKeyPair,
+        membership_blinding: &Field,
+    ) -> Result<(), Error>;
+
+    async fn asp_secret(&self, user_address: &str, kdf_domain: &str) -> Result<Field, Error>;
+
+    async fn privacy_keys(
+        &self,
+        user_address: &str,
+        kdf_domain: &str,
+    ) -> Result<(NotePublicKey, EncryptionPublicKey), Error>;
+
+    async fn user_note_pubkey(
+        &self,
+        user_address: &str,
+        kdf_domain: &str,
+    ) -> Result<NotePublicKey, Error> {
+        Ok(self.privacy_keys(user_address, kdf_domain).await?.0)
+    }
+
+    async fn registered_privacy_keys(
+        &self,
+        address: &str,
+        public_key_registry_contract_id: &str,
+    ) -> Result<(NotePublicKey, EncryptionPublicKey), Error>;
+
+    /// Finalize local processing after RPC ingest
+    async fn process_pending_state(&self) -> Result<(), Error>;
+
+    /// Clear RPC pagination cursors so the indexer resumes by ledger (used on
+    /// wallet↔bootnode handoff).
+    async fn clear_indexing_cursors(&self) -> Result<(), Error>;
+
+    /// Lower proven catch-up ledger after bootnode handoff (retention cutoff).
+    async fn clamp_last_fully_indexed_ledger(&self, max_ledger: u32) -> Result<(), Error>;
+
+    /// Pool-gvk events in `(ledger, event_id)` order.
+    async fn list_pool_gvk_events(
+        &self,
+        pool_contract_id: &str,
+        after: Option<(u32, String)>,
+        limit: u32,
+    ) -> Result<Vec<GvkEvent>, Error>;
+
+    /// Subset of `commitments` registered for `pool_contract_id`.
+    async fn pool_has_commitments(
+        &self,
+        pool_contract_id: &str,
+        commitments: &[Field],
+    ) -> Result<HashSet<Field>, Error>;
+}
+
+#[cfg(target_arch = "wasm32")]
+pub type StorageHandle = crate::Handle<dyn Storage>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type StorageHandle = crate::Handle<dyn Storage + Send + Sync>;
+
+#[cfg(target_arch = "wasm32")]
+impl<T: Storage + 'static> From<T> for StorageHandle {
+    fn from(value: T) -> Self {
+        crate::Handle::from_box(Box::new(value) as Box<dyn Storage>)
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Storage + Send + Sync + 'static> From<T> for StorageHandle {
+    fn from(value: T) -> Self {
+        crate::Handle::from_box(Box::new(value) as Box<dyn Storage + Send + Sync>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_private_keys;
+    use crate::{
+        state::SqliteStorage,
+        types::{lock_reveal_flag, set_reveal_sensitive},
+    };
+
+    const ADDRESS: &str = "GTESTACCOUNTWITHNOSTOREDKEYS";
+
+    #[test]
+    fn missing_privacy_keys_error_redacts_the_address() {
+        let _guard = lock_reveal_flag();
+        set_reveal_sensitive(false);
+        let storage = SqliteStorage::connect_in_memory().expect("in-memory storage");
+
+        let err = map_private_keys(&storage, ADDRESS, "tests").expect_err("no keys are stored");
+        let rendered = err.to_string();
+
+        assert!(!rendered.contains(ADDRESS), "address leaked: {rendered}");
+        assert!(rendered.contains("<redacted>"), "not redacted: {rendered}");
+    }
+}

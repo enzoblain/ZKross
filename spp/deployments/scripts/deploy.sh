@@ -1,0 +1,921 @@
+#!/usr/bin/env bash
+# Deploy all Stellar private transaction contracts and optionally run constructors.
+# Usage: deploy.sh <network> [options]
+
+set -euo pipefail
+
+die() { echo "deploy.sh: $*" >&2; exit 1; }
+warn() { echo "deploy.sh: warning: $*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing '$1'"; }
+step() { echo "==> $*" >&2; }
+
+# bash 3.2 + `set -u` errors on "${arr[@]}" when arr is empty; this form is safe.
+array_values() {
+  eval "echo \"\${$1[@]+\"\${$1[@]}\"}\""
+}
+
+array_len() {
+  eval "echo \${#${1}[@]}"
+}
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: deploy.sh <network> [OPTIONS]
+
+Deploys and runs constructors for the ASP membership, ASP non-membership,
+one Circom Groth16 verifier per (policy, GVK mode) combination used, the public
+key registry with its own keyOwnership verifier, and one or more Pool / pool-gvk
+contracts.
+
+After writing the manifest, runs verify-deployment.sh against it (skipped with
+--skip-init) and exits with its status. On mainnet a failed custody check fails
+the deploy.
+
+Arguments:
+  network               Network name from Stellar CLI config (e.g. testnet, futurenet)
+
+Options:
+  --deployer NAME       Stellar identity or secret key used to deploy (required)
+  --admin ADDRESS       Admin address (G... or C...). Defaults to deployer address
+  --token ADDRESS       Legacy single-pool native XLM contract address (cannot be mixed with --pool)
+  --pool SPEC           Pool spec (repeatable). Optional prefixes per pool:
+                        [policy:][gvk-mode:]<ASSET-SPEC>
+                        policy: none | allowlist | blocklist | allowlist-blocklist
+                        gvk-mode: gvk-off | gvk-viewonly | gvk-traceable
+                        <ASSET-SPEC>:
+                        native:<TOKEN_CONTRACT_ID>
+                        classic:<CODE>:<ISSUER>:<TOKEN_CONTRACT_ID>
+                        <TOKEN_CONTRACT_ID> must be the asset's own Stellar asset contract.
+                        The script warns about each power a classic issuer's
+                        flags give it over the pool's balance.
+  --gvk-authority-pubkey JSON
+                        Admin Baby JubJub public key {"x":"0x..","y":"0x.."} for
+                        every pool with gvk-viewonly or gvk-traceable
+  --gvk-authority-pubkey-file PATH
+                        File containing the same JSON object
+  --asp-levels N        Merkle tree levels for asp-membership (required)
+  --pool-levels N       Merkle tree levels for pool (required)
+  --max-deposit U256    Maximum deposit amount (required)
+  --kdf-domain STRING   Privacy key derivation domain (required)
+  --policy-flags SPEC   Default pool ASP policy when a --pool spec omits the prefix:
+                        none, allowlist, blocklist, or allowlist-blocklist (required when
+                        running constructors unless every --pool spec includes a policy prefix)
+  --vk-json JSON        Verification key as a JSON string (snarkjs or repo format).
+                        Applies to allowlist-blocklist (AB suffix) verifier builds only.
+  --vk-file PATH        Path to a verification key JSON file (allowlist-blocklist only)
+  --skip-init           Deploy WASM only (no constructors). Writes verifiers under the
+                        circuit suffix key ("", A, B, AB, B_gvk_T, ...); use --policy-flags
+                        or per-pool prefixes when the suffix is not otherwise known.
+  --yes                 Skip confirmation for mainnet
+  -h, --help            Show this help
+
+Examples:
+  # Plain blocklist pool (legacy two-part spec still works)
+  deployments/scripts/deploy.sh futurenet \
+    --deployer alice \
+    --pool blocklist:native:CB... \
+    --pool allowlist-blocklist:classic:ABC:GA...:CC... \
+    --asp-levels 10 \
+    --pool-levels 20 \
+    --max-deposit 1000000000 \
+    --kdf-domain Nethermind
+
+  # GVK traceable blocklist pool
+  deployments/scripts/deploy.sh futurenet \
+    --deployer alice \
+    --gvk-authority-pubkey '{"x":"0x..","y":"0x.."}' \
+    --pool blocklist:gvk-traceable:native:CB... \
+    --asp-levels 10 \
+    --pool-levels 20 \
+    --max-deposit 1000000000 \
+    --kdf-domain Nethermind
+
+  # Mixed plain + GVK in one deployment
+  deployments/scripts/deploy.sh futurenet \
+    --deployer alice \
+    --gvk-authority-pubkey-file ./admin-d.json \
+    --pool blocklist:gvk-off:native:CB... \
+    --pool blocklist:gvk-traceable:native:CB... \
+    --asp-levels 10 \
+    --pool-levels 20 \
+    --max-deposit 1000000000 \
+    --kdf-domain Nethermind
+
+Notes:
+  - Each (policy, GVK mode) pair needs its own verifier contract (VK is baked into the WASM).
+  - The registry's verifier is built from deployments/<network>/circuit_keys/keyOwnership_vk.json.
+  - Per-pool policyFlags / gvkMode are written to deployments/<network>/deployments.json.
+  - Provide --vk-file/--vk-json only for ceremony allowlist-blocklist (AB) keys; other VKs
+    are taken from deployments/<network>/circuit_keys/ automatically.
+  - If neither --token nor --pool is provided, one native XLM pool is deployed by default.
+USAGE
+  exit 2
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+WASM_DIR="$ROOT_DIR/target/stellar"
+
+NETWORK="${1:-}"
+shift || true
+
+DEPLOYER=""
+ADMIN=""
+TOKEN=""
+POOL_SPECS=()
+ASP_LEVELS=""
+POOL_LEVELS=""
+MAX_DEPOSIT=""
+KDF_DOMAIN=""
+VK_JSON=""
+VK_FILE=""
+POLICY_FLAGS_SUFFIX=""
+POLICY_FLAGS_EXPLICIT=false
+GVK_AUTHORITY_PUB_KEY_JSON=""
+GVK_AUTHORITY_PUB_KEY_FILE=""
+SKIP_INIT=false
+YES=false
+
+policy_suffix_label() {
+  if [[ -z "$1" ]]; then
+    printf '%s' "none"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+parse_policy_flags_spec() {
+  local raw="$1" normalized allow=0 block=0 part
+  normalized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$normalized" in
+    none) printf '%s' ""; return ;;
+    allowlist) printf '%s' "A"; return ;;
+    blocklist) printf '%s' "B"; return ;;
+    allowlist-blocklist|blocklist-allowlist) printf '%s' "AB"; return ;;
+  esac
+  IFS='-' read -ra PARTS <<< "$normalized"
+  for part in "${PARTS[@]}"; do
+    case "$part" in
+      allowlist) allow=1 ;;
+      blocklist) block=1 ;;
+      *) die "invalid policy flag '$part' in '$raw' (use allowlist and/or blocklist)" ;;
+    esac
+  done
+  if [[ "$allow" == "1" && "$block" == "1" ]]; then printf '%s' "AB"
+  elif [[ "$allow" == "1" ]]; then printf '%s' "A"
+  elif [[ "$block" == "1" ]]; then printf '%s' "B"
+  else die "empty policy flags in '$raw'"
+  fi
+}
+
+parse_gvk_mode_spec() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    gvk-off|off) printf '%s' "off" ;;
+    gvk-viewonly|viewonly|view-only) printf '%s' "viewonly" ;;
+    gvk-traceable|traceable) printf '%s' "traceable" ;;
+    *) die "invalid GVK mode '$1' (use gvk-off, gvk-viewonly, or gvk-traceable)" ;;
+  esac
+}
+
+gvk_mode_to_json() {
+  case "$1" in
+    viewonly) printf '%s' "viewOnly" ;;
+    traceable) printf '%s' "traceable" ;;
+    *) die "internal error: gvk_mode_to_json called with '$1'" ;;
+  esac
+}
+
+gvk_mode_constructor_arg() {
+  case "$1" in
+    viewonly) echo 1 ;;
+    traceable) echo 2 ;;
+    *) die "internal error: gvk_mode_constructor_arg called with '$1'" ;;
+  esac
+}
+
+policy_flags_constructor_arg() {
+  case "$1" in
+    "") echo 0 ;;
+    A) echo 1 ;;
+    B) echo 2 ;;
+    AB) echo 3 ;;
+    *) die "internal error: unknown policy suffix '$1'" ;;
+  esac
+}
+
+policy_flags_to_json_array() {
+  case "$1" in
+    "") printf '[]' ;;
+    A) printf '["allowlist"]' ;;
+    B) printf '["blocklist"]' ;;
+    AB) printf '["allowlist","blocklist"]' ;;
+    *) die "internal error: unknown policy suffix '$1'" ;;
+  esac
+}
+
+verifier_key_for() {
+  local policy_suffix="$1" gvk_mode="$2"
+  case "$gvk_mode" in
+    off) printf '%s' "$policy_suffix" ;;
+    viewonly)
+      if [[ -z "$policy_suffix" ]]; then printf '%s' "gvk_V"
+      else printf '%s_gvk_V' "$policy_suffix"
+      fi
+      ;;
+    traceable)
+      if [[ -z "$policy_suffix" ]]; then printf '%s' "gvk_T"
+      else printf '%s_gvk_T' "$policy_suffix"
+      fi
+      ;;
+    *) die "internal error: unknown gvk mode '$gvk_mode'" ;;
+  esac
+}
+
+default_vk_file() {
+  local network="$1" verifier_key="$2"
+  local base="$ROOT_DIR/deployments/$network/circuit_keys/policy_tx_2_2"
+  if [[ -z "$verifier_key" ]]; then
+    printf '%s_vk.json' "$base"
+  else
+    printf '%s_%s_vk.json' "$base" "$verifier_key"
+  fi
+}
+
+verifier_wasm_name_for_key() {
+  local key="$1"
+  if [[ -z "$key" ]]; then
+    printf 'circom_groth16_verifier_none.wasm'
+  else
+    printf 'circom_groth16_verifier_%s.wasm' "$key"
+  fi
+}
+
+is_policy_flags_prefix() {
+  local prefix="$1"
+  case "$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]')" in
+    none|allowlist|blocklist) return 0 ;;
+    native|classic|contract) return 1 ;;
+  esac
+  local part
+  IFS='-' read -ra PARTS <<< "$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]')"
+  for part in "${PARTS[@]}"; do
+    case "$part" in
+      allowlist|blocklist) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+is_gvk_mode_prefix() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    gvk-off|gvk-viewonly|gvk-traceable|off|viewonly|view-only|traceable) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_asset_spec_prefix() {
+  case "$1" in
+    contract|native|classic) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Sets POOL_SPEC_POLICY_SUFFIX, POOL_SPEC_GVK_MODE, POOL_SPEC_BODY, POOL_SPEC_HAS_POLICY_PREFIX,
+# POOL_SPEC_HAS_GVK_PREFIX for a --pool spec.
+resolve_pool_spec() {
+  local spec="$1"
+  local first="${spec%%:*}"
+  POOL_SPEC_POLICY_SUFFIX=""
+  POOL_SPEC_GVK_MODE="off"
+  POOL_SPEC_BODY=""
+  POOL_SPEC_HAS_POLICY_PREFIX=false
+  POOL_SPEC_HAS_GVK_PREFIX=false
+
+  local rest="$spec"
+  if [[ "$rest" == *:* ]] && is_policy_flags_prefix "$first"; then
+    POOL_SPEC_HAS_POLICY_PREFIX=true
+    POOL_SPEC_POLICY_SUFFIX="$(parse_policy_flags_spec "$first")"
+    rest="${rest#*:}"
+  fi
+
+  if [[ "$rest" == *:* ]]; then
+    first="${rest%%:*}"
+    if is_gvk_mode_prefix "$first"; then
+      POOL_SPEC_HAS_GVK_PREFIX=true
+      POOL_SPEC_GVK_MODE="$(parse_gvk_mode_spec "$first")"
+      rest="${rest#*:}"
+    fi
+  fi
+
+  POOL_SPEC_BODY="$rest"
+}
+
+# Stellar CLI sometimes prints contract ids wrapped in one or more layers of quotes.
+strip_surrounding_quotes() {
+  local s="$1"
+  while [[ "$s" == \"*\" && "$s" == *\" ]]; do
+    s="${s#\"}"
+    s="${s%\"}"
+  done
+  printf '%s' "$s"
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Dies unless TOKEN is the Stellar asset contract of ASSET (`native` or CODE:ISSUER).
+require_asset_contract() {
+  local spec="$1" asset="$2" token="$3" expected
+  expected="$(stellar contract id asset --asset "$asset" --network "$NETWORK" 2>/dev/null || true)"
+  expected="$(strip_surrounding_quotes "$expected")"
+  [[ -n "$expected" ]] || die "failed to resolve the Stellar asset contract of $asset on '$NETWORK'"
+  [[ "$token" == "$expected" ]] \
+    || die "invalid pool spec '$spec': $token is not the Stellar asset contract of $asset ($expected)"
+}
+
+# Prints the token contract id, then the manifest's asset JSON. Refuses a contract token, whose own
+# code could freeze or take the pool's balance, and warns about each power a classic issuer holds.
+parse_pool_spec() {
+  local spec="$1"
+  local kind token code issuer rest flags
+  kind="${spec%%:*}"
+  rest="${spec#*:}"
+
+  case "$kind" in
+    contract)
+      die "invalid pool spec '$spec': a token contract's own code could move or freeze the pool's balance; use native: or classic:"
+      ;;
+    native)
+      token="$(strip_surrounding_quotes "$rest")"
+      [[ -n "$token" ]] || die "invalid pool spec '$spec': missing native token contract id"
+      require_asset_contract "$spec" native "$token"
+      printf '%s\n' "$token"
+      printf '%s\n' "{\"kind\":\"native\"}"
+      ;;
+    classic)
+      code="${rest%%:*}"
+      rest="${rest#*:}"
+      issuer="${rest%%:*}"
+      token="${rest#*:}"
+      token="$(strip_surrounding_quotes "$token")"
+      if [[ -z "$code" || -z "$issuer" || -z "$token" || "$token" == "$rest" ]]; then
+        die "invalid pool spec '$spec': expected classic:<CODE>:<ISSUER>:<TOKEN_CONTRACT_ID>"
+      fi
+      require_asset_contract "$spec" "$code:$issuer" "$token"
+      flags="$(stellar ledger entry fetch account --account "$issuer" --network "$NETWORK" --output json 2>/dev/null \
+        | jq '.entries[0].val.account.flags' || true)"
+      if [[ "$flags" =~ ^[0-9]+$ ]]; then
+        (( flags & 1 )) && warn "issuer $issuer has AUTH_REQUIRED set: deposits fail until it authorizes the pool's balance"
+        (( flags & 2 )) && warn "issuer $issuer has AUTH_REVOCABLE set: it can freeze the pool's balance, and with it every user's notes at once"
+        (( flags & 8 )) && warn "issuer $issuer has AUTH_CLAWBACK_ENABLED set: it can claw back the pool's balance, and the users who withdraw last lose"
+        (( flags & 4 )) || warn "issuer $issuer does not have AUTH_IMMUTABLE set: it can still set AUTH_REQUIRED, AUTH_REVOCABLE, or AUTH_CLAWBACK_ENABLED"
+      else
+        warn "could not read the account flags of issuer $issuer, so its powers over the pool's balance are unknown"
+      fi
+      printf '%s\n' "$token"
+      printf '%s\n' "{\"kind\":\"classic\",\"code\":\"$code\",\"issuer\":\"$issuer\"}"
+      ;;
+    *)
+      die "invalid pool spec '$spec': expected native:<id> | classic:<code>:<issuer>:<id>"
+      ;;
+  esac
+}
+
+VERIFIER_KEY_LIST=()
+VERIFIER_ID_LIST=()
+
+set_verifier_id() {
+  local key="$1" id="$2" i len
+  len="$(array_len VERIFIER_KEY_LIST)"
+  i=0
+  while [[ "$i" -lt "$len" ]]; do
+    if [[ "${VERIFIER_KEY_LIST[$i]}" == "$key" ]]; then
+      VERIFIER_ID_LIST[$i]="$id"
+      return
+    fi
+    i=$((i + 1))
+  done
+  VERIFIER_KEY_LIST+=("$key")
+  VERIFIER_ID_LIST+=("$id")
+}
+
+get_verifier_id() {
+  local key="$1" i len
+  len="$(array_len VERIFIER_KEY_LIST)"
+  i=0
+  while [[ "$i" -lt "$len" ]]; do
+    if [[ "${VERIFIER_KEY_LIST[$i]}" == "$key" ]]; then
+      printf '%s' "${VERIFIER_ID_LIST[$i]}"
+      return
+    fi
+    i=$((i + 1))
+  done
+}
+
+load_gvk_authority_pub_key() {
+  local raw=""
+  if [[ -n "$GVK_AUTHORITY_PUB_KEY_FILE" ]]; then
+    [[ -f "$GVK_AUTHORITY_PUB_KEY_FILE" ]] || die "gvk authority pub key file not found: $GVK_AUTHORITY_PUB_KEY_FILE"
+    raw="$(<"$GVK_AUTHORITY_PUB_KEY_FILE")"
+  else
+    raw="$GVK_AUTHORITY_PUB_KEY_JSON"
+  fi
+  [[ -n "$raw" ]] || return 1
+  jq -e '.x and .y' >/dev/null <<<"$raw" || die "gvk authority pub key must be JSON with x and y fields"
+
+  need cargo
+  printf '%s' "$raw" \
+    | cargo run --manifest-path "$ROOT_DIR/Cargo.toml" -p gvkey-gen --quiet -- validate >/dev/null \
+    || die "gvk authority pub key failed on-curve/low-order validation (see gvkey-gen error above)"
+
+  GVK_AUTHORITY_PUB_KEY_COMPACT="$(jq -c . <<<"$raw")"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --deployer) DEPLOYER="$2"; shift 2 ;;
+    --admin) ADMIN="$2"; shift 2 ;;
+    --token) TOKEN="$2"; shift 2 ;;
+    --pool) POOL_SPECS+=("$(strip_surrounding_quotes "$2")"); shift 2 ;;
+    --asp-levels) ASP_LEVELS="$2"; shift 2 ;;
+    --pool-levels) POOL_LEVELS="$2"; shift 2 ;;
+    --max-deposit) MAX_DEPOSIT="$2"; shift 2 ;;
+    --kdf-domain) KDF_DOMAIN="$(trim "$2")"; shift 2 ;;
+    --policy-flags) POLICY_FLAGS_SUFFIX="$(parse_policy_flags_spec "$2")"; POLICY_FLAGS_EXPLICIT=true; shift 2 ;;
+    --gvk-authority-pubkey) GVK_AUTHORITY_PUB_KEY_JSON="$2"; shift 2 ;;
+    --gvk-authority-pubkey-file) GVK_AUTHORITY_PUB_KEY_FILE="$2"; shift 2 ;;
+    --vk-json) VK_JSON="$2"; shift 2 ;;
+    --vk-file) VK_FILE="$2"; shift 2 ;;
+    --skip-init) SKIP_INIT=true; shift ;;
+    --yes) YES=true; shift ;;
+    -h|--help) usage ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+need stellar
+need jq
+
+[[ -n "$NETWORK" ]] || usage
+[[ "$NETWORK" =~ ^[a-zA-Z0-9_-]+$ ]] || die "invalid network folder name"
+NETWORK_METADATA="$(stellar network ls --long | jq -Rs --arg name "$NETWORK" '
+  split("\n\n") | map(split("\n") | map(
+    capture("^\\s*(?<key>Name|RPC url|Network passphrase):\\s*(?<value>.*)$")? ) |
+    map({key: .key, value: .value}) | from_entries) |
+  map(select(.Name == $name)) | first |
+  if .["RPC url"] == null or .["Network passphrase"] == null then error("network metadata missing")
+  else {rpcUrl: .["RPC url"], networkPassphrase: .["Network passphrase"]} end')" || die "failed to resolve network metadata"
+
+need stellar
+need jq
+
+[[ -n "$DEPLOYER" ]] || die "--deployer is required"
+[[ -n "$ASP_LEVELS" ]] || die "--asp-levels is required"
+[[ -n "$POOL_LEVELS" ]] || die "--pool-levels is required"
+[[ -n "$MAX_DEPOSIT" ]] || die "--max-deposit is required"
+[[ -n "$KDF_DOMAIN" ]] || die "--kdf-domain is required"
+
+if [[ -n "$VK_JSON" && -n "$VK_FILE" ]]; then
+  die "use only one of --vk-json or --vk-file"
+fi
+if [[ -n "$GVK_AUTHORITY_PUB_KEY_JSON" && -n "$GVK_AUTHORITY_PUB_KEY_FILE" ]]; then
+  die "use only one of --gvk-authority-pubkey or --gvk-authority-pubkey-file"
+fi
+
+if [[ "$NETWORK" == "mainnet" && "$YES" != "true" ]]; then
+  die "mainnet requires --yes"
+fi
+
+if [[ -n "$TOKEN" && ${#POOL_SPECS[@]} -gt 0 ]]; then
+  die "cannot mix --token with --pool"
+fi
+
+if [[ -n "$TOKEN" ]]; then
+  POOL_SPECS+=("native:$TOKEN")
+fi
+if [[ ${#POOL_SPECS[@]} -eq 0 ]]; then
+  NATIVE_TOKEN_ID="$(stellar contract id asset --asset native --network "$NETWORK" 2>/dev/null || true)"
+  NATIVE_TOKEN_ID="$(strip_surrounding_quotes "$NATIVE_TOKEN_ID")"
+  [[ -n "$NATIVE_TOKEN_ID" ]] || die "failed to resolve native XLM token contract id for network '$NETWORK'"
+  POOL_SPECS+=("native:$NATIVE_TOKEN_ID")
+fi
+
+POOL_BODY_SPECS=()
+POOL_POLICY_SUFFIXES=()
+POOL_GVK_MODES=()
+POOL_VERIFIER_KEYS=()
+POOL_TOKEN_IDS=()
+POOL_ASSET_JSONS=()
+NEEDS_GVK_POOL=false
+
+_ps_i=0
+_ps_len="$(array_len POOL_SPECS)"
+while [[ "$_ps_i" -lt "$_ps_len" ]]; do
+  spec="$(strip_surrounding_quotes "${POOL_SPECS[$_ps_i]}")"
+  resolve_pool_spec "$spec"
+  policy_suffix="$POOL_SPEC_POLICY_SUFFIX"
+  gvk_mode="$POOL_SPEC_GVK_MODE"
+  body="$(strip_surrounding_quotes "$POOL_SPEC_BODY")"
+
+  if [[ "$POOL_SPEC_HAS_POLICY_PREFIX" == "false" ]]; then
+    policy_suffix="$POLICY_FLAGS_SUFFIX"
+  fi
+  if [[ "$SKIP_INIT" != "true" && "$POOL_SPEC_HAS_POLICY_PREFIX" == "false" && "$POLICY_FLAGS_EXPLICIT" != "true" ]]; then
+    die "pool spec '$spec' has no policy flags; prefix with none:/allowlist:/blocklist:/allowlist-blocklist:, or pass --policy-flags"
+  fi
+
+  asset_kind="${body%%:*}"
+  if ! is_asset_spec_prefix "$asset_kind"; then
+    die "invalid pool spec '$spec': expected asset spec native:|classic: after optional policy:/gvk-mode: prefixes"
+  fi
+  # Checks every token before deploying anything; `set -e` stops the script on a refusal.
+  token_and_asset="$(parse_pool_spec "$body")"
+
+  verifier_key="$(verifier_key_for "$policy_suffix" "$gvk_mode")"
+  if [[ "$gvk_mode" != "off" ]]; then
+    NEEDS_GVK_POOL=true
+  fi
+
+  POOL_BODY_SPECS+=("$body")
+  POOL_POLICY_SUFFIXES+=("$policy_suffix")
+  POOL_GVK_MODES+=("$gvk_mode")
+  POOL_VERIFIER_KEYS+=("$verifier_key")
+  POOL_TOKEN_IDS+=("${token_and_asset%%$'\n'*}")
+  POOL_ASSET_JSONS+=("${token_and_asset#*$'\n'}")
+  _ps_i=$((_ps_i + 1))
+done
+
+UNIQUE_VERIFIER_KEYS=()
+_ps_i=0
+_ps_len="$(array_len POOL_VERIFIER_KEYS)"
+while [[ "$_ps_i" -lt "$_ps_len" ]]; do
+  key="${POOL_VERIFIER_KEYS[$_ps_i]}"
+  found=false
+  _u_i=0
+  _u_len="$(array_len UNIQUE_VERIFIER_KEYS)"
+  while [[ "$_u_i" -lt "$_u_len" ]]; do
+    if [[ "${UNIQUE_VERIFIER_KEYS[$_u_i]}" == "$key" ]]; then
+      found=true
+      break
+    fi
+    _u_i=$((_u_i + 1))
+  done
+  if [[ "$found" == "false" ]]; then
+    UNIQUE_VERIFIER_KEYS+=("$key")
+  fi
+  _ps_i=$((_ps_i + 1))
+done
+
+GVK_AUTHORITY_PUB_KEY_COMPACT=""
+if [[ "$NEEDS_GVK_POOL" == "true" ]]; then
+  load_gvk_authority_pub_key \
+    || die "gvk-viewonly/gvk-traceable pools require --gvk-authority-pubkey or --gvk-authority-pubkey-file"
+elif [[ -n "$GVK_AUTHORITY_PUB_KEY_JSON" || -n "$GVK_AUTHORITY_PUB_KEY_FILE" ]]; then
+  die "gvk authority pub key was provided but no pool uses gvk-viewonly or gvk-traceable"
+fi
+
+resolve_address() {
+  local input="$1"
+  if [[ "$input" =~ ^[GC][A-Z0-9]{55}$ ]]; then
+    echo "$input"
+    return
+  fi
+  if addr="$(stellar keys address "$input" 2>/dev/null)"; then
+    echo "$addr"
+    return
+  fi
+  echo "$input"
+}
+
+DEPLOYER_ADDR="$(resolve_address "$DEPLOYER")"
+if [[ -z "$ADMIN" ]]; then
+  ADMIN_ADDR="$DEPLOYER_ADDR"
+else
+  ADMIN_ADDR="$(resolve_address "$ADMIN")"
+fi
+
+get_latest_ledger_seq() {
+  local out seq
+  out="$(stellar ledger latest --network "$NETWORK" 2>&1)" || {
+    echo "$out" >&2
+    die "failed to query latest ledger via 'stellar ledger latest' (is your Stellar CLI up to date?)"
+  }
+  seq="$(grep -Eo '^Sequence:[[:space:]]*[0-9]+' <<<"$out" | grep -Eo '[0-9]+' | head -1 || true)"
+  [[ -n "$seq" ]] || { echo "$out" >&2; die "failed to parse ledger sequence from 'stellar ledger latest' output"; }
+  echo "$seq"
+}
+
+build_verifier_wasm_for_key() {
+  local key="$1"
+  local wasm_name vk_path tmp_vk=""
+  wasm_name="$(verifier_wasm_name_for_key "$key")"
+
+  if [[ "$key" == AB* && -n "$VK_FILE" ]]; then
+    [[ -f "$VK_FILE" ]] || die "vk file not found: $VK_FILE"
+    vk_path="$VK_FILE"
+  elif [[ "$key" == AB* && -n "$VK_JSON" ]]; then
+    tmp_vk="$(mktemp "${TMPDIR:-/tmp}/deploy-vk.XXXXXX.json")"
+    printf '%s' "$VK_JSON" > "$tmp_vk"
+    vk_path="$tmp_vk"
+  else
+    vk_path="$(default_vk_file "$NETWORK" "$key")"
+    [[ -f "$vk_path" ]] || die "VK not found for verifier key '$key': $vk_path (pass --vk-file for AB or AB_gvk_*)"
+  fi
+
+  step "building verifier WASM for $(policy_suffix_label "$key") from $vk_path"
+  "$SCRIPT_DIR/../../scripts/build-verifier-with-vk.sh" \
+    "$vk_path" --out-dir "$WASM_DIR" --wasm-name "$wasm_name"
+  [[ -z "$tmp_vk" ]] || rm -f "$tmp_vk"
+}
+
+step "build contracts"
+mkdir -p "$WASM_DIR"
+for pkg in asp-membership asp-non-membership public-key-registry pool; do
+  stellar contract build --manifest-path "$ROOT_DIR/Cargo.toml" --out-dir "$WASM_DIR" --optimize \
+    --package "$pkg" >/dev/null
+done
+if [[ "$NEEDS_GVK_POOL" == "true" ]]; then
+  stellar contract build --manifest-path "$ROOT_DIR/Cargo.toml" --out-dir "$WASM_DIR" --optimize \
+    --package pool-gvk >/dev/null
+  cp "$WASM_DIR/pool_gvk.wasm" "$WASM_DIR/pool-gvk.wasm"
+fi
+
+REGISTRY_VERIFIER_WASM="$WASM_DIR/circom_groth16_verifier_keyOwnership.wasm"
+if [[ "$SKIP_INIT" != "true" ]]; then
+  _u_i=0
+  _u_len="$(array_len UNIQUE_VERIFIER_KEYS)"
+  while [[ "$_u_i" -lt "$_u_len" ]]; do
+    build_verifier_wasm_for_key "${UNIQUE_VERIFIER_KEYS[$_u_i]}"
+    _u_i=$((_u_i + 1))
+  done
+
+  registry_vk="$ROOT_DIR/deployments/$NETWORK/circuit_keys/keyOwnership_vk.json"
+  [[ -f "$registry_vk" ]] || die "VK not found for the registry verifier: $registry_vk"
+  step "building verifier WASM for the public key registry from $registry_vk"
+  "$SCRIPT_DIR/../../scripts/build-verifier-with-vk.sh" \
+    "$registry_vk" --out-dir "$WASM_DIR" --wasm-name "$(basename "$REGISTRY_VERIFIER_WASM")"
+  [[ -f "$REGISTRY_VERIFIER_WASM" ]] || die "missing wasm: $REGISTRY_VERIFIER_WASM"
+fi
+
+ASP_MEMBERSHIP_WASM="$WASM_DIR/asp_membership.wasm"
+ASP_NON_MEMBERSHIP_WASM="$WASM_DIR/asp_non_membership.wasm"
+PUBLIC_KEY_REGISTRY_WASM="$WASM_DIR/public_key_registry.wasm"
+POOL_WASM="$WASM_DIR/pool.wasm"
+POOL_GVK_WASM="$WASM_DIR/pool-gvk.wasm"
+
+[[ -f "$ASP_MEMBERSHIP_WASM" ]] || die "missing wasm: $ASP_MEMBERSHIP_WASM"
+[[ -f "$ASP_NON_MEMBERSHIP_WASM" ]] || die "missing wasm: $ASP_NON_MEMBERSHIP_WASM"
+[[ -f "$PUBLIC_KEY_REGISTRY_WASM" ]] || die "missing wasm: $PUBLIC_KEY_REGISTRY_WASM"
+[[ -f "$POOL_WASM" ]] || die "missing wasm: $POOL_WASM"
+if [[ "$NEEDS_GVK_POOL" == "true" ]]; then
+  [[ -f "$POOL_GVK_WASM" ]] || die "missing wasm: $POOL_GVK_WASM"
+fi
+
+# The network names uploaded code by the SHA-256 of its bytes.
+wasm_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+ASP_MEMBERSHIP_WASM_HASH="$(wasm_hash "$ASP_MEMBERSHIP_WASM")"
+ASP_NON_MEMBERSHIP_WASM_HASH="$(wasm_hash "$ASP_NON_MEMBERSHIP_WASM")"
+REGISTRY_VERIFIER_WASM_HASH=""
+[[ "$SKIP_INIT" == "true" ]] || REGISTRY_VERIFIER_WASM_HASH="$(wasm_hash "$REGISTRY_VERIFIER_WASM")"
+
+deploy_contract() {
+  local name="$1"
+  local wasm="$2"
+  shift 2
+  local output
+  if [[ $# -gt 0 ]]; then
+    output="$(stellar contract deploy --wasm "$wasm" --source-account "$DEPLOYER" --network "$NETWORK" -- "$@" 2>&1)"
+  else
+    output="$(stellar contract deploy --wasm "$wasm" --source-account "$DEPLOYER" --network "$NETWORK" 2>&1)"
+  fi
+  local id
+  id="$(grep -Eo 'C[A-Z0-9]{55}' <<<"$output" | head -1 || true)"
+  [[ -n "$id" ]] || { echo "$output" >&2; die "failed to parse contract id for $name"; }
+  echo "$id"
+}
+
+verify_deployed_gvk() {
+  local id="$1" expected_mode key coord hex expected actual mode
+  need bc
+  expected_mode="$(gvk_mode_constructor_arg "$2")"
+  key="$(stellar contract invoke --id "$id" --source-account "$DEPLOYER" --network "$NETWORK" --send=no -- get_admin_view_key)" \
+    || die "failed to read AdminViewKey from pool $id"
+  # The CLI prints U256 as decimal, the config as hex.
+  for coord in x y; do
+    hex="$(jq -r ".$coord | ltrimstr(\"0x\") | ascii_upcase" <<<"$GVK_AUTHORITY_PUB_KEY_COMPACT")"
+    expected="$(BC_LINE_LENGTH=0 bc <<<"ibase=16; $hex")"
+    actual="$(jq -r ".$coord" <<<"$key" 2>/dev/null)"
+    [[ "$actual" == "$expected" ]] || die "pool $id AdminViewKey.$coord mismatch: chain=$actual expected=$expected"
+  done
+  mode="$(stellar contract invoke --id "$id" --source-account "$DEPLOYER" --network "$NETWORK" --send=no -- get_gvk_mode)" \
+    || die "failed to read GvkMode from pool $id"
+  [[ "$mode" == "$expected_mode" ]] || die "pool $id GvkMode mismatch: chain=$mode expected=$expected_mode"
+}
+
+step "deploy asp-membership"
+if [[ "$SKIP_INIT" != "true" ]]; then
+  ASP_MEMBERSHIP_ID="$(deploy_contract asp-membership "$ASP_MEMBERSHIP_WASM" --admin "$ADMIN_ADDR" --levels "$ASP_LEVELS")"
+else
+  ASP_MEMBERSHIP_ID="$(deploy_contract asp-membership "$ASP_MEMBERSHIP_WASM")"
+fi
+
+step "deploy asp-non-membership"
+if [[ "$SKIP_INIT" != "true" ]]; then
+  ASP_NON_MEMBERSHIP_ID="$(deploy_contract asp-non-membership "$ASP_NON_MEMBERSHIP_WASM" --admin "$ADMIN_ADDR")"
+else
+  ASP_NON_MEMBERSHIP_ID="$(deploy_contract asp-non-membership "$ASP_NON_MEMBERSHIP_WASM")"
+fi
+
+if [[ "$SKIP_INIT" == "true" ]]; then
+  _uniq_len="$(array_len UNIQUE_VERIFIER_KEYS)"
+  if [[ "$_uniq_len" -gt 1 ]]; then
+    die "--skip-init supports at most one verifier key; deploy without --skip-init for mixed verifiers"
+  fi
+
+  if [[ "$_uniq_len" -eq 1 ]]; then
+    skip_init_verifier_key="${UNIQUE_VERIFIER_KEYS[0]}"
+  elif [[ "$POLICY_FLAGS_EXPLICIT" == "true" ]]; then
+    skip_init_verifier_key="$(verifier_key_for "$POLICY_FLAGS_SUFFIX" "off")"
+  else
+    die "--skip-init requires policy flags (--policy-flags or pool prefix none:/allowlist:/blocklist:/allowlist-blocklist:)"
+  fi
+
+  verifier_wasm="$WASM_DIR/$(verifier_wasm_name_for_key "$skip_init_verifier_key")"
+  [[ -f "$verifier_wasm" ]] \
+    || die "missing verifier wasm for $(policy_suffix_label "$skip_init_verifier_key") (run build-verifier-with-vk.sh or deploy without --skip-init)"
+  step "deploy circom-groth16-verifier ($(policy_suffix_label "$skip_init_verifier_key"))"
+  set_verifier_id "$skip_init_verifier_key" "$(deploy_contract circom-groth16-verifier "$verifier_wasm")"
+else
+  _u_i=0
+  _u_len="$(array_len UNIQUE_VERIFIER_KEYS)"
+  while [[ "$_u_i" -lt "$_u_len" ]]; do
+    key="${UNIQUE_VERIFIER_KEYS[$_u_i]}"
+    verifier_wasm="$WASM_DIR/$(verifier_wasm_name_for_key "$key")"
+    [[ -f "$verifier_wasm" ]] || die "missing wasm: $verifier_wasm"
+    step "deploy circom-groth16-verifier ($(policy_suffix_label "$key"))"
+    set_verifier_id "$key" "$(deploy_contract circom-groth16-verifier "$verifier_wasm")"
+    _u_i=$((_u_i + 1))
+  done
+fi
+
+REGISTRY_VERIFIER_ID=""
+if [[ "$SKIP_INIT" != "true" ]]; then
+  step "deploy circom-groth16-verifier (public key registry)"
+  REGISTRY_VERIFIER_ID="$(deploy_contract circom-groth16-verifier "$REGISTRY_VERIFIER_WASM")"
+fi
+
+step "deploy public-key-registry"
+if [[ "$SKIP_INIT" != "true" ]]; then
+  PUBLIC_KEY_REGISTRY_ID="$(deploy_contract public-key-registry "$PUBLIC_KEY_REGISTRY_WASM" \
+    --kdf-domain "$KDF_DOMAIN" --verifier "$REGISTRY_VERIFIER_ID")"
+else
+  PUBLIC_KEY_REGISTRY_ID="$(deploy_contract public-key-registry "$PUBLIC_KEY_REGISTRY_WASM")"
+fi
+
+POOL_IDS=()
+POOL_DEPLOYMENT_LEDGERS=()
+
+_pool_i=0
+_pool_len="$(array_len POOL_BODY_SPECS)"
+while [[ "$_pool_i" -lt "$_pool_len" ]]; do
+  body="$(strip_surrounding_quotes "${POOL_BODY_SPECS[$_pool_i]}")"
+  policy_suffix="${POOL_POLICY_SUFFIXES[$_pool_i]}"
+  gvk_mode="${POOL_GVK_MODES[$_pool_i]}"
+  verifier_key="${POOL_VERIFIER_KEYS[$_pool_i]}"
+  token_id="${POOL_TOKEN_IDS[$_pool_i]}"
+
+  pool_deployment_ledger="$(get_latest_ledger_seq)"
+  step "deploy pool ($(policy_suffix_label "$verifier_key"), gvk=$gvk_mode) for spec '$body'"
+  if [[ "$SKIP_INIT" != "true" ]]; then
+    verifier_id="$(get_verifier_id "$verifier_key")"
+    [[ -n "$verifier_id" ]] || die "internal error: missing verifier id for key '$verifier_key'"
+    if [[ "$gvk_mode" == "off" ]]; then
+      pool_id="$(deploy_contract pool "$POOL_WASM" \
+        --admin "$ADMIN_ADDR" --token "$token_id" --verifier "$verifier_id" \
+        --asp-membership "$ASP_MEMBERSHIP_ID" --asp-non-membership "$ASP_NON_MEMBERSHIP_ID" \
+        --asp-membership-wasm-hash "$ASP_MEMBERSHIP_WASM_HASH" \
+        --asp-non-membership-wasm-hash "$ASP_NON_MEMBERSHIP_WASM_HASH" \
+        --maximum-deposit-amount "$MAX_DEPOSIT" --levels "$POOL_LEVELS" \
+        --policy-flags "$(policy_flags_constructor_arg "$policy_suffix")" \
+        --kdf-domain "$KDF_DOMAIN")"
+    else
+      pool_id="$(deploy_contract pool-gvk "$POOL_GVK_WASM" \
+        --admin "$ADMIN_ADDR" --token "$token_id" --verifier "$verifier_id" \
+        --asp-membership "$ASP_MEMBERSHIP_ID" --asp-non-membership "$ASP_NON_MEMBERSHIP_ID" \
+        --asp-membership-wasm-hash "$ASP_MEMBERSHIP_WASM_HASH" \
+        --asp-non-membership-wasm-hash "$ASP_NON_MEMBERSHIP_WASM_HASH" \
+        --maximum-deposit-amount "$MAX_DEPOSIT" --levels "$POOL_LEVELS" \
+        --policy-flags "$(policy_flags_constructor_arg "$policy_suffix")" \
+        --kdf-domain "$KDF_DOMAIN" \
+        --admin-view-key "$GVK_AUTHORITY_PUB_KEY_COMPACT" \
+        --gvk-mode "$(gvk_mode_constructor_arg "$gvk_mode")")"
+      verify_deployed_gvk "$pool_id" "$gvk_mode"
+    fi
+  else
+    if [[ "$gvk_mode" == "off" ]]; then
+      pool_id="$(deploy_contract pool "$POOL_WASM")"
+    else
+      pool_id="$(deploy_contract pool-gvk "$POOL_GVK_WASM")"
+    fi
+  fi
+
+  POOL_IDS+=("$pool_id")
+  POOL_DEPLOYMENT_LEDGERS+=("$pool_deployment_ledger")
+  _pool_i=$((_pool_i + 1))
+done
+
+{
+  cat >&2 <<__DEPLOY_SUMMARY__
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                    ✅ DEPLOYMENT SUCCESSFUL                      │
+  └─────────────────────────────────────────────────────────────────┘
+
+Deployment complete
+  Network:             $NETWORK
+  Deployer:            $DEPLOYER_ADDR
+  Admin:               $ADMIN_ADDR
+  KDF domain:          $KDF_DOMAIN
+  ASP membership:      $ASP_MEMBERSHIP_ID
+  ASP non-membership:  $ASP_NON_MEMBERSHIP_ID
+  Public key registry: $PUBLIC_KEY_REGISTRY_ID
+  Registry verifier:   ${REGISTRY_VERIFIER_ID:-none}
+  Pools deployed:      ${#POOL_IDS[@]}
+  Constructed:         $([[ "$SKIP_INIT" == "true" ]] && echo "no" || echo "yes")
+__DEPLOY_SUMMARY__
+  _vi=0
+  _vlen="$(array_len VERIFIER_KEY_LIST)"
+  while [[ "$_vi" -lt "$_vlen" ]]; do
+    printf '  Verifier (%s):     %s\n' "$(policy_suffix_label "${VERIFIER_KEY_LIST[$_vi]}")" "${VERIFIER_ID_LIST[$_vi]}" >&2
+    _vi=$((_vi + 1))
+  done
+  _pi=0
+  _plen="$(array_len POOL_IDS)"
+  while [[ "$_pi" -lt "$_plen" ]]; do
+    printf '  Pool[%s] (%s/%s):   %s\n' "$_pi" \
+      "$(policy_suffix_label "${POOL_VERIFIER_KEYS[$_pi]}")" \
+      "${POOL_GVK_MODES[$_pi]}" \
+      "${POOL_IDS[$_pi]}" >&2
+    _pi=$((_pi + 1))
+  done
+}
+
+verifiers_json="\"verifiers\":{"
+_vi=0
+_vlen="$(array_len VERIFIER_KEY_LIST)"
+while [[ "$_vi" -lt "$_vlen" ]]; do
+  key="${VERIFIER_KEY_LIST[$_vi]}"
+  id="${VERIFIER_ID_LIST[$_vi]}"
+  [[ "$_vi" -gt 0 ]] && verifiers_json+=","
+  verifiers_json+="\"$key\":\"$id\""
+  _vi=$((_vi + 1))
+done
+verifiers_json+="}"
+
+pools_json="["
+_pi=0
+_plen="$(array_len POOL_IDS)"
+while [[ "$_pi" -lt "$_plen" ]]; do
+  policy_suffix="${POOL_POLICY_SUFFIXES[$_pi]}"
+  gvk_mode="${POOL_GVK_MODES[$_pi]}"
+  flags_json="$(policy_flags_to_json_array "$policy_suffix")"
+  entry="{\"poolContractId\":\"${POOL_IDS[$_pi]}\",\"tokenContractId\":\"${POOL_TOKEN_IDS[$_pi]}\",\"deploymentLedger\":${POOL_DEPLOYMENT_LEDGERS[$_pi]},\"enabled\":true,\"policyFlags\":${flags_json},\"asset\":${POOL_ASSET_JSONS[$_pi]}"
+  if [[ "$gvk_mode" != "off" ]]; then
+    entry+=",\"gvkMode\":\"$(gvk_mode_to_json "$gvk_mode")\",\"gvkAuthorityPubKey\":$GVK_AUTHORITY_PUB_KEY_COMPACT"
+  fi
+  entry+="}"
+  [[ "$_pi" -gt 0 ]] && pools_json+=","
+  pools_json+="$entry"
+  _pi=$((_pi + 1))
+done
+pools_json+="]"
+
+registry_verifier_json=""
+[[ -z "$REGISTRY_VERIFIER_ID" ]] \
+  || registry_verifier_json=",\"public_key_registry_verifier\":\"$REGISTRY_VERIFIER_ID\",\"public_key_registry_verifier_wasm_hash\":\"$REGISTRY_VERIFIER_WASM_HASH\""
+
+DEPLOY_JSON="{\"network\":\"$NETWORK\",\"kdf_domain\":$(jq -Rn --arg d "$KDF_DOMAIN" '$d'),\"deployer\":\"$DEPLOYER_ADDR\",\"admin\":\"$ADMIN_ADDR\",\"asp_membership\":\"$ASP_MEMBERSHIP_ID\",\"added_asp_memberships\":[],\"asp_non_membership\":\"$ASP_NON_MEMBERSHIP_ID\",\"asp_membership_wasm_hash\":\"$ASP_MEMBERSHIP_WASM_HASH\",\"asp_non_membership_wasm_hash\":\"$ASP_NON_MEMBERSHIP_WASM_HASH\",${verifiers_json},\"public_key_registry\":\"$PUBLIC_KEY_REGISTRY_ID\"${registry_verifier_json},\"pools\":$pools_json}"
+
+DEPLOYMENTS_DIR="$ROOT_DIR/deployments/$NETWORK"
+mkdir -p "$DEPLOYMENTS_DIR"
+DEPLOY_JSON_PRETTY="$(printf '%s\n' "$DEPLOY_JSON" | jq --argjson metadata "$NETWORK_METADATA" '. + $metadata')"
+printf '%s\n' "$DEPLOY_JSON_PRETTY" > "$DEPLOYMENTS_DIR/deployments.json"
+printf '%s\n' "$DEPLOY_JSON_PRETTY"
+
+# A --skip-init deployment runs no constructors, so it stores no admin and every check would fail.
+if [[ "$SKIP_INIT" != "true" ]]; then
+  step "verify the deployment against its manifest"
+  "$SCRIPT_DIR/verify-deployment.sh" "$NETWORK" --manifest "$DEPLOYMENTS_DIR/deployments.json" >&2
+fi

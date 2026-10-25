@@ -1,0 +1,3738 @@
+use super::disclaimer::{CURRENT_DISCLAIMER_HASH_HEX, CURRENT_DISCLAIMER_TEXT_MD};
+use crate::types::{
+    AspMembershipSync, BootnodeSetting, ContractEvent, EncryptionKeyPair, EncryptionPrivateKey,
+    EncryptionPublicKey, Field, GlobalViewKeyCiphertext, GvkAuthoritySetting, LeafAddedEvent,
+    NewCommitmentEvent, NewNullifierEvent, NoteAmount, NoteKeyPair, NotePrivateKey, NotePublicKey,
+    OperationalFeedItem, PortfolioBalance, PortfolioPoolEntry, PublicKeyEvent, RecipientLookup,
+    UserNoteSummary, UserOperation,
+};
+use anyhow::{Context, Result, anyhow, ensure};
+use rusqlite::{Connection, Error as SqlError, OptionalExtension, params, params_from_iter};
+use rusqlite_migration::{M, Migrations};
+use serde::{Serialize, de::DeserializeOwned};
+use std::{collections::HashSet, path::Path};
+
+pub const APP_SETTING_BOOTNODE_CONFIG: &str = "bootnode_config";
+pub const APP_SETTING_GVK_AUTHORITY: &str = "gvk_authority";
+pub const APP_SETTING_EXPLORER: &str = "explorer";
+pub const DEFAULT_BOOTNODE_URL: &str = "https://bootnode.dev-nethermind.xyz";
+
+const MIGRATION_ARRAY: &[M] = &[
+    M::up(include_str!("schema.sql")),
+    M::up(include_str!("schema_v2_gvk_ciphertext.sql")),
+    M::up(include_str!("schema_v3_account_kdf_domain.sql")).foreign_key_check(),
+    M::up(include_str!("schema_v4_processed_events.sql")),
+    M::up(include_str!("schema_v5_leaves_per_tree.sql")),
+    M::up(include_str!("schema_v6_repeated_commitments.sql")).foreign_key_check(),
+];
+const MIGRATIONS: Migrations = Migrations::from_slice(MIGRATION_ARRAY);
+
+pub struct Storage {
+    pub(super) conn: Connection,
+}
+
+#[derive(Debug, Clone)]
+pub struct DisclaimerState {
+    pub disclaimer_text_md: String,
+    pub disclaimer_hash_hex: String,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AccountKeys {
+    pub account_id: i64,
+    pub keys: StoredPrivateKeys,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredPrivateKeys {
+    pub note_keypair: NoteKeyPair,
+    pub encryption_keypair: EncryptionKeyPair,
+    pub membership_blinding: Field,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PoolCommitmentRow {
+    pub commitment_id: i64,
+    pub commitment: Field,
+    pub leaf_index: u32,
+    pub encrypted_output: Vec<u8>,
+    #[allow(dead_code)]
+    pub gvk_ciphertext: Option<crate::types::GlobalViewKeyCiphertext>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DerivedUserNoteRow {
+    pub amount: NoteAmount,
+    pub blinding: Field,
+    pub expected_nullifier: Field,
+}
+
+pub(crate) type DeriveNoteFn<'a> =
+    dyn FnMut(&AccountKeys, &PoolCommitmentRow) -> Result<Option<DerivedUserNoteRow>> + 'a;
+
+impl Storage {
+    /// Validate every database page and foreign-key relationship after
+    /// restoring a backup.
+    pub fn check_integrity(&self) -> Result<()> {
+        check_integrity(&self.conn)
+    }
+
+    /// Open encrypted storage with an explicit key and create/open policy.
+    pub fn connect_encrypted(
+        path: impl AsRef<Path>,
+        key: &super::database_key::DatabaseKey,
+        purpose: super::database_key::OpenPurpose,
+    ) -> Result<Self> {
+        Self::connect_with_connection(super::database_key::open(path.as_ref(), key, purpose)?)
+    }
+
+    /// Open another handle to encrypted storage that an open handle already
+    /// unlocked with `key`. Used for forks.
+    pub fn reopen_encrypted(
+        path: impl AsRef<Path>,
+        key: &super::database_key::DatabaseKey,
+    ) -> Result<Self> {
+        Self::connect_with_connection(super::database_key::reopen(path.as_ref(), key)?)
+    }
+
+    pub fn connect_in_memory() -> Result<Self> {
+        Self::connect_with_connection(Connection::open_in_memory()?)
+    }
+
+    pub(super) fn connect_with_connection(mut conn: Connection) -> Result<Self> {
+        // Table rebuilds in migrations must not cascade into dependent tables.
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        MIGRATIONS.to_latest(&mut conn)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self { conn })
+    }
+
+    pub fn save_events_batch(&mut self, data: &crate::types::ContractsEventData) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO raw_contract_events (id, ledger, contract_id, topics, value)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO NOTHING",
+            )?;
+
+            for event in &data.events {
+                let event_contract_id = Self::get_or_create_contract_id(&tx, &event.contract_id)?;
+                stmt.execute(params![
+                    event.id,
+                    event.ledger,
+                    event_contract_id,
+                    event.topics.join(","),
+                    event.value
+                ])?;
+            }
+        }
+        tx.commit()?;
+        tracing::debug!(
+            "[STORAGE] saved {} events and cursor {} (latest_ledger={})",
+            data.events.len(),
+            data.cursor,
+            data.latest_ledger
+        );
+        Ok(())
+    }
+
+    pub fn save_sync_progress(
+        &mut self,
+        metadata: &[crate::types::SyncMetadata],
+        fully_indexed: bool,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for entry in metadata {
+            let contract_id = Self::get_or_create_contract_id(&tx, &entry.contract_id)?;
+            tx.execute(
+                "INSERT INTO indexing_metadata (contract_id, last_cursor, last_indexed_ledger, last_fully_indexed_ledger)
+                 VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(contract_id) DO NOTHING",
+                params![contract_id, entry.cursor, entry.last_indexed_ledger],
+            )?;
+
+            if fully_indexed {
+                tx.execute(
+                    "UPDATE indexing_metadata
+                     SET last_cursor = ?2, last_indexed_ledger = ?3, last_fully_indexed_ledger = ?3
+                     WHERE contract_id = ?1",
+                    params![contract_id, entry.cursor, entry.last_indexed_ledger],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE indexing_metadata
+                     SET last_cursor = ?2, last_indexed_ledger = ?3
+                     WHERE contract_id = ?1",
+                    params![contract_id, entry.cursor, entry.last_indexed_ledger],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clears stored RPC cursors so the indexer restarts pagination by ledger.
+    pub fn clear_indexing_cursors(&mut self) -> Result<()> {
+        self.conn
+            .execute("UPDATE indexing_metadata SET last_cursor = NULL", [])
+            .context("failed to clear indexing cursors")?;
+        Ok(())
+    }
+
+    /// Lowers `last_fully_indexed_ledger` after bootnode handoff so stale tip
+    /// markers do not survive past the retention cutoff.
+    pub fn clamp_last_fully_indexed_ledger(&mut self, max_ledger: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE indexing_metadata
+                 SET last_fully_indexed_ledger = MIN(last_fully_indexed_ledger, ?1)",
+                params![max_ledger],
+            )
+            .context("failed to clamp last_fully_indexed_ledger")?;
+        Ok(())
+    }
+
+    pub fn get_sync_metadata(&self) -> Result<Vec<crate::types::SyncMetadata>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.address, m.last_indexed_ledger, m.last_fully_indexed_ledger, m.last_cursor
+             FROM indexing_metadata m
+             JOIN contracts c ON c.contract_id = m.contract_id
+             ORDER BY m.contract_id",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let contract_id: String = row.get(0)?;
+            let indexed_ledger_i64: i64 = row.get(1)?;
+            let last_indexed_ledger = col_u32(indexed_ledger_i64, 1)?;
+            let fully_indexed_ledger_i64: i64 = row.get(2)?;
+            let last_fully_indexed_ledger = col_u32(fully_indexed_ledger_i64, 2)?;
+            let cursor: Option<String> = row.get(3)?;
+            Ok(crate::types::SyncMetadata {
+                contract_id,
+                last_indexed_ledger,
+                last_fully_indexed_ledger,
+                cursor: cursor.unwrap_or_default(),
+            })
+        })?;
+
+        let mut metadata = Vec::new();
+        for row in rows {
+            metadata.push(row?);
+        }
+
+        Ok(metadata)
+    }
+
+    pub fn network_tip_ledger(&self) -> Result<u32> {
+        let metadata = self.get_sync_metadata()?;
+        Ok(metadata
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .last_indexed_ledger
+                    .max(entry.last_fully_indexed_ledger)
+            })
+            .max()
+            .unwrap_or_default())
+    }
+
+    pub fn get_private_keys(
+        &self,
+        address: &str,
+        kdf_domain: &str,
+    ) -> Result<Option<StoredPrivateKeys>> {
+        self.conn
+            .query_row(
+                "SELECT
+                encryption_private_key,
+                encryption_public_key,
+                note_private_key,
+                note_public_key,
+                membership_blinding
+                FROM keypairs
+                JOIN accounts ON keypairs.account_id = accounts.id
+                WHERE accounts.address = ?1 AND accounts.kdf_domain = ?2",
+                params![address, kdf_domain],
+                |row| {
+                    let enc_priv: EncryptionPrivateKey = row.get(0)?;
+                    let enc_pub: EncryptionPublicKey = row.get(1)?;
+                    let note_priv: NotePrivateKey = row.get(2)?;
+                    let note_pub: NotePublicKey = row.get(3)?;
+                    let membership_blinding: Field = row.get(4)?;
+
+                    Ok(StoredPrivateKeys {
+                        note_keypair: NoteKeyPair {
+                            private: note_priv,
+                            public: note_pub,
+                        },
+                        encryption_keypair: EncryptionKeyPair {
+                            private: enc_priv,
+                            public: enc_pub,
+                        },
+                        membership_blinding,
+                    })
+                },
+            )
+            .optional()
+            .context(format!("Failed to fetch keys for account: {}", address))
+    }
+
+    pub fn save_encryption_and_note_keypairs(
+        &mut self,
+        account_address: &str,
+        kdf_domain: &str,
+        note_keypair: &NoteKeyPair,
+        encryption_keypair: &EncryptionKeyPair,
+        membership_blinding: &Field,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("failed to start transaction")?;
+
+        let account_id = Self::get_or_create_account(&tx, account_address, kdf_domain)?;
+
+        tx.execute(
+            "INSERT INTO keypairs (
+                encryption_private_key,
+                encryption_public_key,
+                note_private_key,
+                note_public_key,
+                membership_blinding,
+                account_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(account_id) DO UPDATE SET
+                encryption_private_key = excluded.encryption_private_key,
+                encryption_public_key = excluded.encryption_public_key,
+                note_private_key = excluded.note_private_key,
+                note_public_key = excluded.note_public_key,
+                membership_blinding = excluded.membership_blinding",
+            params![
+                &encryption_keypair.private,
+                &encryption_keypair.public,
+                &note_keypair.private,
+                &note_keypair.public,
+                membership_blinding,
+                account_id,
+            ],
+        )
+        .context("failed to insert keypairs")?;
+        tx.commit().context("failed to commit transaction")?;
+        tracing::debug!(
+            "[STORAGE] saved new keypairs for the account {}",
+            crate::types::Sensitive(&account_address)
+        );
+        Ok(())
+    }
+
+    pub fn get_disclaimer_state(&self, address: &str) -> Result<DisclaimerState> {
+        let accepted: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1
+                 FROM disclaimer_acceptances
+                 WHERE address = ?1 AND disclaimer_hash = ?2
+                 LIMIT 1",
+                params![address, CURRENT_DISCLAIMER_HASH_HEX],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to query disclaimer acceptance")?;
+
+        Ok(DisclaimerState {
+            disclaimer_text_md: CURRENT_DISCLAIMER_TEXT_MD.to_string(),
+            disclaimer_hash_hex: CURRENT_DISCLAIMER_HASH_HEX.to_string(),
+            accepted: accepted.is_some(),
+        })
+    }
+
+    pub fn accept_current_disclaimer(
+        &mut self,
+        address: &str,
+        disclaimer_hash_hex: &str,
+    ) -> Result<()> {
+        if disclaimer_hash_hex != CURRENT_DISCLAIMER_HASH_HEX {
+            anyhow::bail!("Disclaimer hash mismatch. Please refresh and try again.");
+        }
+
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO disclaimer_acceptances (address, disclaimer_hash)
+                 VALUES (?1, ?2)",
+                params![address, disclaimer_hash_hex],
+            )
+            .context("failed to insert disclaimer acceptance")?;
+        Ok(())
+    }
+
+    pub fn get_setting_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        // The historical JSON column has NUMERIC affinity: SQLite stores bare
+        // JSON numbers as INTEGER/REAL. Cast on read to support existing rows.
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT CAST(value AS TEXT) FROM app_settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to query app setting")?;
+
+        raw.map(|value| serde_json::from_str(&value).context("failed to decode app setting"))
+            .transpose()
+    }
+
+    pub fn set_setting_json<T: Serialize>(&mut self, key: &str, value: &T) -> Result<()> {
+        let value_json = serde_json::to_string(value).context("failed to encode app setting")?;
+        self.conn
+            .execute(
+                "INSERT INTO app_settings (key, value)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value_json],
+            )
+            .context("failed to upsert app setting")?;
+        Ok(())
+    }
+
+    pub fn get_bootnode_setting(&self) -> Result<BootnodeSetting> {
+        Ok(self
+            .get_setting_json(APP_SETTING_BOOTNODE_CONFIG)?
+            .unwrap_or(BootnodeSetting {
+                enabled: false,
+                url: String::new(),
+            }))
+    }
+
+    pub fn set_bootnode_setting(&mut self, enabled: bool, url: &str) -> Result<()> {
+        self.set_setting_json(
+            APP_SETTING_BOOTNODE_CONFIG,
+            &BootnodeSetting {
+                enabled,
+                url: url.to_string(),
+            },
+        )
+    }
+
+    pub fn get_gvk_authority_setting(&self) -> Result<Option<GvkAuthoritySetting>> {
+        self.get_setting_json(APP_SETTING_GVK_AUTHORITY)
+    }
+
+    pub fn set_gvk_authority_setting(&mut self, setting: &GvkAuthoritySetting) -> Result<()> {
+        setting.validate_consistency()?;
+        self.set_setting_json(APP_SETTING_GVK_AUTHORITY, setting)
+    }
+
+    /// Internal helper to handle the "Get or Create" logic for accounts
+    fn get_or_create_account(
+        tx: &rusqlite::Transaction,
+        address: &str,
+        kdf_domain: &str,
+    ) -> Result<i64> {
+        tx.execute(
+            "INSERT OR IGNORE INTO accounts (address, kdf_domain) VALUES (?1, ?2)",
+            params![address, kdf_domain],
+        )
+        .context("failed to insert account")?;
+
+        let id: i64 = tx
+            .query_row(
+                "SELECT id FROM accounts WHERE address = ?1 AND kdf_domain = ?2",
+                params![address, kdf_domain],
+                |row| row.get(0),
+            )
+            .context("failed to fetch account id")?;
+
+        Ok(id)
+    }
+
+    fn get_or_create_contract_id(tx: &rusqlite::Transaction, address: &str) -> Result<i64> {
+        let id: i64 = tx
+            .query_row(
+                "INSERT INTO contracts (address)
+                 VALUES (?1)
+                 ON CONFLICT(address) DO UPDATE SET address = excluded.address
+                 RETURNING contract_id",
+                params![address],
+                |row| row.get(0),
+            )
+            .context("failed to get or create contract id")?;
+
+        Ok(id)
+    }
+
+    /// The latest keys `address` registered with the registry at
+    /// `public_key_registry_contract_id`.
+    pub fn lookup_public_key_by_address(
+        &self,
+        address: &str,
+        public_key_registry_contract_id: &str,
+    ) -> Result<Option<crate::types::PublicKeyEntry>> {
+        self.conn
+            .query_row(
+                "SELECT p.owner, p.encryption_key, p.note_key, r.ledger
+                 FROM public_keys p
+                 JOIN raw_contract_events r ON r.id = p.event_id
+                 JOIN contracts c ON c.contract_id = r.contract_id
+                 WHERE p.owner = ?1 AND c.address = ?2
+                 ORDER BY r.ledger DESC, r.id DESC
+                 LIMIT 1",
+                params![address, public_key_registry_contract_id],
+                map_public_key_entry,
+            )
+            .optional()
+            .context("lookup_public_key_by_address")
+    }
+
+    /// List notes derived for `address` (newest first).
+    pub fn list_user_notes(
+        &self,
+        address: &str,
+        kdf_domain: &str,
+        limit: u32,
+    ) -> Result<Vec<UserNoteSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                n.id,
+                pool.address,
+                n.amount,
+                c.leaf_index,
+                r.ledger,
+                CASE WHEN n.nullifier_id IS NULL THEN 0 ELSE 1 END AS spent,
+                c.gvk_ciphertext
+             FROM user_notes n
+             JOIN accounts a ON a.id = n.account_id
+             JOIN pool_commitments c ON c.id = n.commitment_id
+             JOIN raw_contract_events r ON r.id = c.event_id
+             JOIN contracts pool ON pool.contract_id = r.contract_id
+             WHERE a.address = ?1 AND a.kdf_domain = ?2
+             ORDER BY r.ledger DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(params![address, kdf_domain, limit], |row| {
+            let id: Field = row.get(0)?;
+            let pool_contract_id: String = row.get(1)?;
+            let amount: NoteAmount = row.get(2)?;
+            let leaf_index_i64: i64 = row.get(3)?;
+            let leaf_index = col_u32(leaf_index_i64, 3)?;
+            let created_at_ledger_i64: i64 = row.get(4)?;
+            let created_at_ledger = col_u32(created_at_ledger_i64, 4)?;
+            let spent_i64: i64 = row.get(5)?;
+            let gvk_ciphertext = optional_gvk_ciphertext_col(row, 6)?;
+
+            Ok(UserNoteSummary {
+                id,
+                pool_contract_id,
+                amount,
+                leaf_index,
+                created_at_ledger,
+                spent: spent_i64 != 0,
+                gvk_ciphertext,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// All notes for `address` in `pool_contract_id` (newest first), spent and
+    /// unspent.
+    pub fn list_pool_user_notes(
+        &self,
+        pool_contract_id: &str,
+        address: &str,
+        kdf_domain: &str,
+    ) -> Result<Vec<UserNoteSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                n.id,
+                n.amount,
+                c.leaf_index,
+                r.ledger,
+                CASE WHEN n.nullifier_id IS NULL THEN 0 ELSE 1 END AS spent,
+                c.gvk_ciphertext
+             FROM user_notes n
+             JOIN accounts a ON a.id = n.account_id
+             JOIN pool_commitments c ON c.id = n.commitment_id
+             JOIN raw_contract_events r ON r.id = c.event_id
+             JOIN contracts pool ON pool.contract_id = r.contract_id
+             WHERE a.address = ?1 AND pool.address = ?2 AND a.kdf_domain = ?3
+             ORDER BY r.ledger DESC",
+        )?;
+
+        let rows = stmt.query_map(params![address, pool_contract_id, kdf_domain], |row| {
+            let id: Field = row.get(0)?;
+            let amount: NoteAmount = row.get(1)?;
+            let leaf_index_i64: i64 = row.get(2)?;
+            let leaf_index = col_u32(leaf_index_i64, 2)?;
+            let created_at_ledger_i64: i64 = row.get(3)?;
+            let created_at_ledger = col_u32(created_at_ledger_i64, 3)?;
+            let spent_i64: i64 = row.get(4)?;
+            let gvk_ciphertext = optional_gvk_ciphertext_col(row, 5)?;
+
+            Ok(UserNoteSummary {
+                id,
+                pool_contract_id: pool_contract_id.to_string(),
+                amount,
+                leaf_index,
+                created_at_ledger,
+                spent: spent_i64 != 0,
+                gvk_ciphertext,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// All unspent notes for `address` in `pool_contract_id` (newest first).
+    pub fn list_unspent_user_notes(
+        &self,
+        pool_contract_id: &str,
+        address: &str,
+        kdf_domain: &str,
+    ) -> Result<Vec<UserNoteSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                n.id,
+                pool.address,
+                n.amount,
+                c.leaf_index,
+                r.ledger,
+                c.gvk_ciphertext
+             FROM user_notes n
+             JOIN accounts a ON a.id = n.account_id
+             JOIN pool_commitments c ON c.id = n.commitment_id
+             JOIN raw_contract_events r ON r.id = c.event_id
+             JOIN contracts pool ON pool.contract_id = r.contract_id
+             WHERE a.address = ?1
+               AND pool.address = ?2
+               AND a.kdf_domain = ?3
+               AND n.nullifier_id IS NULL
+             ORDER BY r.ledger DESC",
+        )?;
+
+        let rows = stmt.query_map(params![address, pool_contract_id, kdf_domain], |row| {
+            let id: Field = row.get(0)?;
+            let pool_contract_id: String = row.get(1)?;
+            let amount: NoteAmount = row.get(2)?;
+            let leaf_index_i64: i64 = row.get(3)?;
+            let leaf_index = col_u32(leaf_index_i64, 3)?;
+            let created_at_ledger_i64: i64 = row.get(4)?;
+            let created_at_ledger = col_u32(created_at_ledger_i64, 4)?;
+            let gvk_ciphertext = optional_gvk_ciphertext_col(row, 5)?;
+
+            Ok(UserNoteSummary {
+                id,
+                pool_contract_id,
+                amount,
+                leaf_index,
+                created_at_ledger,
+                spent: false,
+                gvk_ciphertext,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_portfolio_balances(
+        &self,
+        address: &str,
+        kdf_domain: &str,
+        enabled_pools: &[PortfolioPoolEntry],
+    ) -> Result<Vec<PortfolioBalance>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pool.address, n.amount
+             FROM user_notes n
+             JOIN accounts a ON a.id = n.account_id
+             JOIN pool_commitments c ON c.id = n.commitment_id
+             JOIN raw_contract_events r ON r.id = c.event_id
+             JOIN contracts pool ON pool.contract_id = r.contract_id
+             WHERE a.address = ?1 AND a.kdf_domain = ?2 AND n.nullifier_id IS NULL
+             ORDER BY pool.address",
+        )?;
+
+        let rows = stmt.query_map(params![address, kdf_domain], |row| {
+            let pool_contract_id: String = row.get(0)?;
+            let amount: NoteAmount = row.get(1)?;
+            Ok((pool_contract_id, amount))
+        })?;
+
+        let mut aggregated = std::collections::HashMap::new();
+        for row in rows {
+            let (pool_contract_id, amount) = row?;
+            let entry = aggregated
+                .entry(pool_contract_id)
+                .or_insert((0u32, NoteAmount::ZERO));
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry
+                .1
+                .checked_add(amount)
+                .ok_or_else(|| anyhow!("overflow computing total balance"))?;
+        }
+
+        let mut balances = Vec::new();
+        for pool in enabled_pools {
+            let (note_count, amount) = aggregated
+                .remove(&pool.pool_contract_id)
+                .unwrap_or((0, NoteAmount::ZERO));
+            balances.push(PortfolioBalance {
+                pool_contract_id: pool.pool_contract_id.clone(),
+                token_contract_id: pool.token_contract_id.clone(),
+                token_label: pool.token_label.clone(),
+                amount,
+                note_count,
+            });
+        }
+
+        Ok(balances)
+    }
+
+    pub fn recipient_lookup(
+        &self,
+        address: &str,
+        public_key_registry_contract_id: &str,
+    ) -> Result<RecipientLookup> {
+        let entry = self.lookup_public_key_by_address(address, public_key_registry_contract_id)?;
+        let registry_last_fully_indexed_ledger = self
+            .get_sync_metadata()?
+            .into_iter()
+            .find(|meta| meta.contract_id == public_key_registry_contract_id)
+            .map(|meta| meta.last_fully_indexed_ledger)
+            .unwrap_or_default();
+        let network_tip_ledger = self.network_tip_ledger()?;
+
+        Ok(RecipientLookup {
+            entry,
+            registry_fully_synced: network_tip_ledger > 0
+                && registry_last_fully_indexed_ledger >= network_tip_ledger,
+            network_tip_ledger,
+            registry_last_fully_indexed_ledger,
+        })
+    }
+
+    pub fn get_operational_feed(
+        &self,
+        limit: u32,
+        asp_membership_contract_id: &str,
+        public_key_registry_contract_id: &str,
+    ) -> Result<Vec<OperationalFeedItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, title, body, ledger, contract_id, pool_contract_id, tx_type
+             FROM (
+                SELECT
+                    'pool' AS kind,
+                    'Pool activity' AS title,
+                    printf('%d commitment(s), %d nullifier(s)', SUM(commitments), SUM(nullifiers)) AS body,
+                    ledger,
+                    pool_contract_id AS contract_id,
+                    pool_contract_id,
+                    CASE
+                        WHEN SUM(commitments) > 0 AND SUM(nullifiers) > 0 THEN 'mixed'
+                        WHEN SUM(commitments) > 0 THEN 'deposit_or_transfer'
+                        ELSE 'spend'
+                    END AS tx_type
+                FROM (
+                    SELECT r.ledger AS ledger, c.address AS pool_contract_id, COUNT(*) AS commitments, 0 AS nullifiers
+                    FROM pool_commitments pc
+                    JOIN raw_contract_events r ON r.id = pc.event_id
+                    JOIN contracts c ON c.contract_id = r.contract_id
+                    GROUP BY r.ledger, c.address
+                    UNION ALL
+                    SELECT r.ledger AS ledger, c.address AS pool_contract_id, 0 AS commitments, COUNT(*) AS nullifiers
+                    FROM pool_nullifiers pnl
+                    JOIN raw_contract_events r ON r.id = pnl.event_id
+                    JOIN contracts c ON c.contract_id = r.contract_id
+                    GROUP BY r.ledger, c.address
+                )
+                GROUP BY ledger, pool_contract_id
+
+                UNION ALL
+
+                SELECT
+                    'registry' AS kind,
+                    'Address book registration' AS title,
+                    printf('%d public key registration(s)', COUNT(*)) AS body,
+                    r.ledger AS ledger,
+                    c.address AS contract_id,
+                    NULL AS pool_contract_id,
+                    'registration' AS tx_type
+                FROM public_keys pk
+                JOIN raw_contract_events r ON r.id = pk.event_id
+                JOIN contracts c ON c.contract_id = r.contract_id
+                WHERE c.address = ?1
+                GROUP BY r.ledger, c.address
+
+                UNION ALL
+
+                SELECT
+                    'asp' AS kind,
+                    'ASP membership update' AS title,
+                    printf('%d membership leaf/leaves inserted', COUNT(*)) AS body,
+                    r.ledger AS ledger,
+                    c.address AS contract_id,
+                    NULL AS pool_contract_id,
+                    'membership' AS tx_type
+                FROM asp_membership_leaves aml
+                JOIN raw_contract_events r ON r.id = aml.event_id
+                JOIN contracts c ON c.contract_id = r.contract_id
+                WHERE c.address = ?2
+                GROUP BY r.ledger, c.address
+             )
+             ORDER BY ledger DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(
+            params![
+                public_key_registry_contract_id,
+                asp_membership_contract_id,
+                limit
+            ],
+            |row| {
+                Ok(OperationalFeedItem {
+                    kind: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    ledger: col_u32(row.get::<_, i64>(3)?, 3)?,
+                    contract_id: row.get(4)?,
+                    pool_contract_id: row.get(5)?,
+                    tx_type: row.get(6)?,
+                })
+            },
+        )?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch all pool commitments ordered by `leaf_index` (0..N-1) with no
+    /// gaps.
+    ///
+    /// Returns the commitment list as [`Field`] values (each stored as 32-byte
+    /// LE blob).
+    ///
+    /// Errors if there are gaps/out-of-order indices, because Merkle
+    /// reconstruction would be ambiguous/incorrect.
+    pub fn get_pool_commitment_leaves_ordered(&self, pool_contract_id: &str) -> Result<Vec<Field>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pc.leaf_index, pc.commitment
+             FROM pool_commitments pc
+             JOIN raw_contract_events r ON r.id = pc.event_id
+             JOIN contracts c ON c.contract_id = r.contract_id
+             WHERE c.address = ?1
+             ORDER BY pc.leaf_index ASC",
+        )?;
+
+        let rows = stmt.query_map(params![pool_contract_id], |row| {
+            let idx: i64 = row.get(0)?;
+            let idx = col_u32(idx, 0)?;
+            let commitment: Field = row.get(1)?;
+            Ok((idx, commitment))
+        })?;
+
+        let mut leaves: Vec<Field> = Vec::new();
+        let mut expected_index: u32 = 0;
+
+        for row in rows {
+            let (idx, leaf) = row?;
+            if idx != expected_index {
+                anyhow::bail!(
+                    "pool_commitments gap/out-of-order: expected index {}, got {}",
+                    expected_index,
+                    idx
+                );
+            }
+            leaves.push(leaf);
+            expected_index = expected_index
+                .checked_add(1)
+                .context("pool_commitments index overflow")?;
+        }
+
+        Ok(leaves)
+    }
+
+    /// Lookup an unspent user note by pool commitment.
+    ///
+    /// Returns `(amount, blinding, leaf_index)` when found and unspent.
+    pub fn get_unspent_user_note_by_commitment(
+        &self,
+        pool_contract_id: &str,
+        account_address: &str,
+        kdf_domain: &str,
+        commitment: &Field,
+    ) -> Result<Option<(NoteAmount, Field, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.amount, n.blinding, pc.leaf_index
+             FROM user_notes n
+             JOIN accounts a ON a.id = n.account_id
+             JOIN pool_commitments pc ON pc.id = n.commitment_id
+             JOIN raw_contract_events r ON r.id = pc.event_id
+             JOIN contracts c ON c.contract_id = r.contract_id
+             WHERE a.address = ?2
+               AND c.address = ?1
+               AND pc.commitment = ?3
+               AND a.kdf_domain = ?4
+               AND n.nullifier_id IS NULL
+             LIMIT 1",
+        )?;
+
+        let row = stmt
+            .query_row(
+                params![pool_contract_id, account_address, commitment, kdf_domain],
+                |row| {
+                    let amount: NoteAmount = row.get(0)?;
+                    let blinding: Field = row.get(1)?;
+                    let leaf_index_i64: i64 = row.get(2)?;
+                    let leaf_index = col_u32(leaf_index_i64, 2)?;
+                    Ok((amount, blinding, leaf_index))
+                },
+            )
+            .optional()
+            .context("Failed to query unspent user note by commitment")?;
+
+        Ok(row)
+    }
+
+    /// Like [`Self::get_unspent_user_note_by_commitment`], but returns the note
+    /// regardless of spent status.
+    ///
+    /// Selective disclosure proves Merkle membership of a commitment; spending
+    /// a note publishes a nullifier but does not remove its commitment leaf
+    /// from the tree, so a spent note can still be disclosed. Use this
+    /// lookup on the disclosure input-building path. The transact path must
+    /// keep using [`Self::get_unspent_user_note_by_commitment`], which
+    /// excludes spent notes.
+    pub fn get_user_note_by_commitment(
+        &self,
+        pool_contract_id: &str,
+        account_address: &str,
+        kdf_domain: &str,
+        commitment: &Field,
+    ) -> Result<Option<(NoteAmount, Field, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.amount, n.blinding, pc.leaf_index
+             FROM user_notes n
+             JOIN accounts a ON a.id = n.account_id
+             JOIN pool_commitments pc ON pc.id = n.commitment_id
+             JOIN raw_contract_events r ON r.id = pc.event_id
+             JOIN contracts c ON c.contract_id = r.contract_id
+             WHERE a.address = ?2
+               AND c.address = ?1
+               AND pc.commitment = ?3
+               AND a.kdf_domain = ?4
+             LIMIT 1",
+        )?;
+
+        let row = stmt
+            .query_row(
+                params![pool_contract_id, account_address, commitment, kdf_domain],
+                |row| {
+                    let amount: NoteAmount = row.get(0)?;
+                    let blinding: Field = row.get(1)?;
+                    let leaf_index_i64: i64 = row.get(2)?;
+                    let leaf_index = col_u32(leaf_index_i64, 2)?;
+                    Ok((amount, blinding, leaf_index))
+                },
+            )
+            .optional()
+            .context("Failed to query user note by commitment")?;
+
+        Ok(row)
+    }
+
+    /// Batch upsert for spent nullifiers
+    pub fn save_nullifier_events_batch(&mut self, events: &Vec<NewNullifierEvent>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pool_nullifiers (nullifier, event_id, gvk_ciphertext)
+                    VALUES (?1, ?2, ?3)
+                    ON CONFLICT(event_id) DO NOTHING",
+            )?;
+
+            for event in events {
+                stmt.execute(params![
+                    event.nullifier,
+                    event.id,
+                    encode_optional_gvk_ciphertext(event.gvk_ciphertext.as_ref())?,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Batch upsert for Merkle tree commitments
+    pub fn save_commitment_events_batch(&mut self, events: &Vec<NewCommitmentEvent>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pool_commitments (commitment, leaf_index, encrypted_output, event_id, gvk_ciphertext)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    ON CONFLICT(event_id) DO NOTHING",
+            )?;
+
+            for event in events {
+                stmt.execute(params![
+                    event.commitment,
+                    event.index,
+                    event.encrypted_output,
+                    event.id,
+                    encode_optional_gvk_ciphertext(event.gvk_ciphertext.as_ref())?,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Flat pool GVK events in `(ledger, event_id)` order.
+    pub fn list_pool_gvk_events(
+        &self,
+        pool_contract_id: &str,
+        after: Option<(u32, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::gvk::GvkEvent>> {
+        let sql = "SELECT ledger, id, kind, field, gvk_ciphertext FROM (
+                SELECT r.ledger, r.id, 0 AS kind, c.commitment AS field, c.gvk_ciphertext
+                FROM pool_commitments c
+                JOIN raw_contract_events r ON r.id = c.event_id
+                JOIN contracts pool ON pool.contract_id = r.contract_id
+                WHERE pool.address = ?1 AND c.gvk_ciphertext IS NOT NULL
+                UNION ALL
+                SELECT r.ledger, r.id, 1 AS kind, n.nullifier AS field, n.gvk_ciphertext
+                FROM pool_nullifiers n
+                JOIN raw_contract_events r ON r.id = n.event_id
+                JOIN contracts pool ON pool.contract_id = r.contract_id
+                WHERE pool.address = ?1
+            )
+            WHERE (?2 IS NULL OR ledger > ?3 OR (ledger = ?3 AND id > ?4))
+            ORDER BY ledger ASC, id ASC
+            LIMIT ?5";
+
+        let (after_ledger, after_id) = match after {
+            Some((ledger, id)) => (Some(ledger), Some(id)),
+            None => (None, None),
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![
+                pool_contract_id,
+                after_ledger.map(|_| 1i32),
+                after_ledger,
+                after_id,
+                limit,
+            ],
+            |row| {
+                let ledger: u32 = row.get(0)?;
+                let event_id: String = row.get(1)?;
+                let kind: i32 = row.get(2)?;
+                let field: Field = row.get(3)?;
+                let encoded: Option<String> = row.get(4)?;
+                Ok((ledger, event_id, kind, field, encoded))
+            },
+        )?;
+
+        rows.map(|row| {
+            let (ledger, event_id, kind, field, encoded) = row?;
+            let gvk_ciphertext_opt = encoded.as_deref().map(decode_gvk_ciphertext).transpose()?;
+            match kind {
+                0 => {
+                    let gvk_ciphertext = gvk_ciphertext_opt.ok_or_else(|| {
+                        anyhow!("commitment row missing gvk_ciphertext after filter")
+                    })?;
+                    Ok(crate::gvk::GvkEvent::Commitment {
+                        ledger,
+                        event_id,
+                        commitment: field,
+                        gvk_ciphertext,
+                    })
+                }
+                1 => Ok(crate::gvk::GvkEvent::Nullifier {
+                    ledger,
+                    event_id,
+                    nullifier: field,
+                    gvk_ciphertext: gvk_ciphertext_opt,
+                }),
+                other => Err(anyhow!("unknown pool GVK event kind: {other}")),
+            }
+        })
+        .collect()
+    }
+
+    /// Subset of `commitments` that exist in `pool_contract_id`.
+    pub fn pool_has_commitments(
+        &self,
+        pool_contract_id: &str,
+        commitments: &[Field],
+    ) -> Result<HashSet<Field>> {
+        if commitments.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let placeholders = (0..commitments.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT c.commitment
+             FROM pool_commitments c
+             JOIN raw_contract_events r ON r.id = c.event_id
+             JOIN contracts pool ON pool.contract_id = r.contract_id
+             WHERE pool.address = ?1 AND c.commitment IN ({placeholders})"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> =
+            Vec::with_capacity(1_usize.saturating_add(commitments.len()));
+        params.push(&pool_contract_id);
+        params.extend(commitments.iter().map(|c| c as &dyn rusqlite::types::ToSql));
+        let rows = stmt.query_map(params_from_iter(params), |row| row.get(0))?;
+        rows.collect::<Result<HashSet<_>, _>>().map_err(Into::into)
+    }
+
+    /// Batch upsert for Public Keys (Address owner and BLOB keys)
+    pub fn save_public_key_events_batch(&mut self, events: &Vec<PublicKeyEvent>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO public_keys (owner, encryption_key, note_key, event_id)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(event_id) DO NOTHING",
+            )?;
+
+            for event in events {
+                stmt.execute(params![
+                    event.owner,
+                    event.encryption_key,
+                    event.note_key,
+                    event.id
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Batch upsert for ASP Membership Leaves
+    pub fn save_leaf_added_events_batch(&mut self, events: &Vec<LeafAddedEvent>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO asp_membership_leaves (contract_id, leaf_index, leaf, root, event_id)
+                    VALUES ((SELECT contract_id FROM raw_contract_events WHERE id = ?4), ?1, ?2, ?3, ?4)
+                    ON CONFLICT(contract_id, leaf_index) DO NOTHING",
+            )?;
+
+            for event in events {
+                stmt.execute(params![event.index, event.leaf, event.root, event.id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Checks whether ASP membership data is usable for proving at the current
+    /// network tip.
+    ///
+    /// Returns:
+    /// - `AspMembershipSync::UserIndex(user_leaf_index)` if:
+    ///   1) raw event ingestion is caught up to `current_ledger`,
+    ///   2) `current_root` equals the last stored root in
+    ///      `asp_membership_leaves`,
+    ///   3) and `user_leaf` is present in `asp_membership_leaves`.
+    /// - `AspMembershipSync::RegisterAtASP` if the DB is caught up but either:
+    ///   1) no membership leaves have been observed yet, or
+    ///   2) the user leaf is not present.
+    /// - `AspMembershipSync::SyncRequired(Some(gap))` if:
+    ///   1) the indexer is behind the chain tip, or
+    ///   2) raw events are caught up but ASP membership leaf processing is
+    ///      behind (root mismatch where the last stored leaf is from an earlier
+    ///      ledger).
+    /// - `Err(_)` if the root is inconsistent at the same ledger (mismatched
+    ///   networks/corruption). Local metadata sitting a few ledgers *ahead* of
+    ///   `current_ledger` is normal skew between independent RPC reads and is
+    ///   tolerated, not treated as an error.
+    pub fn check_asp_membership_precondition(
+        &self,
+        asp_membership_contract_id: &str,
+        user_leaf: &Field,
+        current_root: &Field,
+        current_ledger: u32,
+    ) -> Result<AspMembershipSync> {
+        // The indexer sync metadata is authoritative for "how far we've
+        // indexed", even if there were no ASP events in recent ledgers.
+        let sync_meta = self
+            .get_sync_metadata()?
+            .into_iter()
+            .find(|meta| meta.contract_id == asp_membership_contract_id);
+        let Some(sync_meta) = sync_meta else {
+            return Ok(AspMembershipSync::SyncRequired(Some(current_ledger)));
+        };
+
+        if current_ledger > sync_meta.last_fully_indexed_ledger {
+            let gap = current_ledger.saturating_sub(sync_meta.last_fully_indexed_ledger);
+            return Ok(AspMembershipSync::SyncRequired(Some(gap)));
+        }
+
+        // `current_ledger <= last_fully_indexed_ledger`: we have indexed at
+        // least as far as the ledger of this contract-state read, so we
+        // have the data needed to reconcile membership. The indexer tip
+        // can legitimately sit a few ledgers *ahead* of this read — the
+        // events RPC and the contract-state read advance independently
+        // — so "metadata ahead" is normal skew, not corruption, and
+        // must not be a hard error. The authoritative correctness check
+        // is the root reconciliation below, which detects any genuine
+        // divergence.
+
+        // Get the last stored root for the ASP membership tree and the ledger
+        // that produced it. The ledger is derived by joining with the raw event
+        // log so we can distinguish:
+        // - "no new ASP events" (root matches, even if last leaf ledger < tip),
+        //   vs
+        // - "partial processing" (raw events ingested to tip but leaves table
+        //   lags).
+        let mut stmt = self.conn.prepare(
+            "SELECT l.root, r.ledger
+             FROM asp_membership_leaves l
+             JOIN raw_contract_events r ON r.id = l.event_id
+             JOIN contracts c ON c.contract_id = r.contract_id
+             WHERE c.address = ?1
+             ORDER BY l.leaf_index DESC
+             LIMIT 1",
+        )?;
+
+        let last: Option<(Field, u32)> = stmt
+            .query_row(params![asp_membership_contract_id], |row| {
+                let root: Field = row.get(0)?;
+                let ledger_i64: i64 = row.get(1)?;
+                let ledger = col_u32(ledger_i64, 1)?;
+                Ok((root, ledger))
+            })
+            .optional()
+            .context("Failed to query asp_membership_leaves last root/ledger")?;
+
+        let Some((last_root, last_leaf_ledger)) = last else {
+            return Ok(AspMembershipSync::RegisterAtASP);
+        };
+
+        // current_ledger == last_fully_indexed_ledger: require root match and
+        // leaf existence.
+        if *current_root != last_root {
+            // If the root at the chain tip doesn't match the last stored root
+            // but our last stored leaf is from an earlier ledger, we may have
+            // ingested raw events without yet processing them into
+            // asp_membership_leaves.
+            if last_leaf_ledger < current_ledger {
+                let gap = current_ledger.saturating_sub(last_leaf_ledger);
+                return Ok(AspMembershipSync::SyncRequired(Some(gap)));
+            }
+            anyhow::bail!("asp membership root mismatch at ledger {}", current_ledger);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT l.leaf_index
+             FROM asp_membership_leaves l
+             JOIN raw_contract_events r ON r.id = l.event_id
+             JOIN contracts c ON c.contract_id = r.contract_id
+             WHERE l.leaf = ?1 AND c.address = ?2
+             LIMIT 1",
+        )?;
+
+        let user_leaf_index: Option<u32> = stmt
+            .query_row(params![user_leaf, asp_membership_contract_id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .context("Failed to query asp_membership_leaves user leaf existence")?;
+
+        if let Some(user_leaf_index) = user_leaf_index {
+            return Ok(AspMembershipSync::UserIndex(user_leaf_index));
+        }
+
+        Ok(AspMembershipSync::RegisterAtASP)
+    }
+
+    // TODO ideally we should return an iterator here
+    /// Fetch all ASP membership leaves ordered by index (0..N-1), returning the
+    /// leaf list plus the last stored root (root after the last insertion).
+    ///
+    /// Errors if there are gaps/out-of-order indices, because Merkle
+    /// reconstruction would be ambiguous/incorrect.
+    pub fn get_all_asp_membership_leaves_ordered(
+        &self,
+        asp_membership_contract_id: &str,
+    ) -> Result<Vec<Field>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.leaf_index, l.leaf
+             FROM asp_membership_leaves l
+             JOIN raw_contract_events r ON r.id = l.event_id
+             JOIN contracts c ON c.contract_id = r.contract_id
+             WHERE c.address = ?1
+             ORDER BY l.leaf_index ASC",
+        )?;
+
+        let rows = stmt.query_map(params![asp_membership_contract_id], |row| {
+            let idx: i64 = row.get(0)?;
+            let idx = col_u32(idx, 0)?;
+            let leaf: Field = row.get(1)?;
+            Ok((idx, leaf))
+        })?;
+
+        let mut leaves: Vec<Field> = Vec::new();
+        let mut expected_index: u32 = 0;
+
+        for row in rows {
+            let (idx, leaf) = row?;
+            if idx != expected_index {
+                anyhow::bail!(
+                    "asp_membership_leaves gap/out-of-order: expected index {}, got {}",
+                    expected_index,
+                    idx
+                );
+            }
+            leaves.push(leaf);
+            expected_index = expected_index
+                .checked_add(1)
+                .context("asp_membership_leaves index overflow")?;
+        }
+
+        Ok(leaves)
+    }
+
+    /// Marks events so [`Self::get_unprocessed_events`] skips them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be opened or an insert
+    /// fails.
+    pub fn save_processed_event_ids(&mut self, ids: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO processed_events (event_id)
+                    VALUES (?1)
+                    ON CONFLICT(event_id) DO NOTHING",
+            )?;
+
+            for id in ids {
+                stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Unprocessed raw events fetch
+    pub fn get_unprocessed_events(&self, limit: u32) -> Result<Vec<ContractEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.ledger, c.address, r.topics, r.value
+                FROM raw_contract_events r
+                JOIN contracts c ON c.contract_id = r.contract_id
+                LEFT JOIN pool_commitments pc ON r.id = pc.event_id
+                LEFT JOIN public_keys p ON r.id = p.event_id
+                LEFT JOIN asp_membership_leaves l ON r.id = l.event_id
+                LEFT JOIN pool_nullifiers n ON r.id = n.event_id
+                LEFT JOIN processed_events pe ON r.id = pe.event_id
+                WHERE pc.event_id IS NULL
+                AND p.event_id IS NULL
+                AND n.event_id IS NULL
+                AND l.event_id IS NULL
+                AND pe.event_id IS NULL
+                ORDER BY r.ledger ASC, r.id ASC
+                LIMIT ?1",
+        )?;
+
+        let event_iter = stmt.query_map(params![limit], |row| {
+            let topics_str: String = row.get(3)?;
+            Ok(ContractEvent {
+                id: row.get(0)?,
+                ledger: row.get(1)?,
+                contract_id: row.get(2)?,
+                // Split the comma-separated topics back into a Vec
+                topics: topics_str.split(',').map(|s| s.to_string()).collect(),
+                value: row.get(4)?,
+            })
+        })?;
+
+        let mut events = Vec::new();
+        for event in event_iter {
+            events.push(event?);
+        }
+
+        Ok(events)
+    }
+
+    fn get_accounts_with_keypairs(&self) -> Result<Vec<AccountKeys>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                a.id,
+                k.encryption_private_key,
+                k.encryption_public_key,
+                k.note_private_key,
+                k.note_public_key,
+                k.membership_blinding
+             FROM accounts a
+             JOIN keypairs k ON k.account_id = a.id
+             ORDER BY a.id ASC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let account_id: i64 = row.get(0)?;
+            let enc_priv: EncryptionPrivateKey = row.get(1)?;
+            let enc_pub: EncryptionPublicKey = row.get(2)?;
+            let note_priv: NotePrivateKey = row.get(3)?;
+            let note_pub: NotePublicKey = row.get(4)?;
+            let membership_blinding: Field = row.get(5)?;
+
+            Ok(AccountKeys {
+                account_id,
+                keys: StoredPrivateKeys {
+                    note_keypair: NoteKeyPair {
+                        private: note_priv,
+                        public: note_pub,
+                    },
+                    encryption_keypair: EncryptionKeyPair {
+                        private: enc_priv,
+                        public: enc_pub,
+                    },
+                    membership_blinding,
+                },
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Scan pool commitments and insert decryptable notes into `user_notes`.
+    ///
+    /// Progress is tracked per-account in `account_commitment_scan`.
+    pub(crate) fn scan_commitments_for_user_notes(
+        &mut self,
+        total_limit: u32,
+        derive: &mut DeriveNoteFn<'_>,
+    ) -> Result<bool> {
+        const ACCOUNT_CHUNK: u32 = 4;
+
+        let accounts = self.get_accounts_with_keypairs()?;
+        if accounts.is_empty() || total_limit == 0 {
+            return Ok(false);
+        }
+
+        let pool_ids: Vec<i64> = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT r.contract_id
+                 FROM pool_commitments c
+                 JOIN raw_contract_events r ON r.id = c.event_id
+                 ORDER BY r.contract_id",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<core::result::Result<Vec<i64>, _>>()?;
+
+        if pool_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let pool_count_u32 =
+            u32::try_from(pool_ids.len()).map_err(|_| anyhow::anyhow!("pool count exceeds u32"))?;
+        let base_quota = if pool_count_u32 == 0 {
+            0
+        } else if total_limit >= pool_count_u32 {
+            total_limit
+                .checked_div(pool_count_u32)
+                .expect("pool count is not zero")
+        } else {
+            tracing::warn!(
+                "pool count {pool_count_u32} exceeds total limit {total_limit} of commitments to scan"
+            );
+            1
+        };
+
+        let mut quotas = vec![base_quota; pool_ids.len()];
+        let assigned = base_quota.saturating_mul(pool_count_u32);
+        let mut remainder = total_limit.saturating_sub(assigned);
+        let mut next_pool = 0usize;
+        while remainder > 0 {
+            quotas[next_pool] = quotas[next_pool].saturating_add(1);
+            remainder = remainder.saturating_sub(1);
+            next_pool = (next_pool
+                .checked_add(1)
+                .expect("next_pool shouldn't overflow"))
+            .checked_rem(pool_ids.len())
+            .expect("pool ids is not zero");
+        }
+
+        let mut did_any_progress = false;
+
+        for (pool_idx, pool_contract_id) in pool_ids.iter().enumerate() {
+            let mut pool_quota = quotas[pool_idx];
+            if pool_quota == 0 {
+                continue;
+            }
+
+            let tx = self.conn.transaction()?;
+
+            for account in &accounts {
+                tx.execute(
+                    "INSERT OR IGNORE INTO account_commitment_scan (pool_contract_id, account_id, last_commitment_id)
+                     VALUES (?1, ?2, 0)",
+                    params![pool_contract_id, account.account_id],
+                )?;
+            }
+
+            let mut did_progress_in_pool = false;
+
+            while pool_quota > 0 {
+                let mut progressed_this_cycle = false;
+
+                for account in &accounts {
+                    if pool_quota == 0 {
+                        break;
+                    }
+
+                    let last_commitment_id: i64 = tx.query_row(
+                        "SELECT last_commitment_id
+                         FROM account_commitment_scan
+                         WHERE pool_contract_id = ?1 AND account_id = ?2",
+                        params![pool_contract_id, account.account_id],
+                        |row| row.get(0),
+                    )?;
+
+                    let quota = pool_quota.min(ACCOUNT_CHUNK);
+                    let commitments: Vec<PoolCommitmentRow> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT c.id, c.commitment, c.leaf_index, c.encrypted_output, c.gvk_ciphertext
+                             FROM pool_commitments c
+                             JOIN raw_contract_events r ON r.id = c.event_id
+                             WHERE r.contract_id = ?1 AND c.id > ?2
+                             ORDER BY c.id ASC
+                             LIMIT ?3",
+                        )?;
+
+                        let rows = stmt.query_map(
+                            params![pool_contract_id, last_commitment_id, quota],
+                            |row| {
+                                let commitment_id: i64 = row.get(0)?;
+                                let commitment: Field = row.get(1)?;
+                                let leaf_index_i64: i64 = row.get(2)?;
+                                let leaf_index = col_u32(leaf_index_i64, 2)?;
+                                let encrypted_output: Vec<u8> = row.get(3)?;
+                                let gvk_ciphertext = optional_gvk_ciphertext_col(row, 4)?;
+                                Ok(PoolCommitmentRow {
+                                    commitment_id,
+                                    commitment,
+                                    leaf_index,
+                                    encrypted_output,
+                                    gvk_ciphertext,
+                                })
+                            },
+                        )?;
+
+                        let mut out = Vec::new();
+                        for r in rows {
+                            out.push(r?);
+                        }
+                        out
+                    };
+
+                    if commitments.is_empty() {
+                        continue;
+                    }
+
+                    progressed_this_cycle = true;
+                    did_progress_in_pool = true;
+
+                    let mut max_scanned_id = last_commitment_id;
+                    let scanned_count = u32::try_from(commitments.len())
+                        .map_err(|_| anyhow::anyhow!("commitments batch length exceeds u32"))?;
+
+                    for row in commitments {
+                        if row.commitment_id > max_scanned_id {
+                            max_scanned_id = row.commitment_id;
+                        }
+
+                        let Some(derived) = derive(account, &row)? else {
+                            continue;
+                        };
+
+                        let nullifier_id: Option<i64> = tx
+                            .query_row(
+                                "SELECT n.id
+                                 FROM pool_nullifiers n
+                                 JOIN raw_contract_events r ON r.id = n.event_id
+                                 WHERE r.contract_id = ?1 AND n.nullifier = ?2
+                                 LIMIT 1",
+                                params![pool_contract_id, derived.expected_nullifier],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+
+                        tx.execute(
+                            "INSERT OR IGNORE INTO user_notes (
+                                id,
+                                account_id,
+                                commitment_id,
+                                nullifier_id,
+                                expected_nullifier,
+                                blinding,
+                                amount
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            params![
+                                row.commitment,
+                                account.account_id,
+                                row.commitment_id,
+                                nullifier_id,
+                                derived.expected_nullifier,
+                                derived.blinding,
+                                derived.amount.to_string()
+                            ],
+                        )?;
+                    }
+
+                    tx.execute(
+                        "UPDATE account_commitment_scan
+                         SET last_commitment_id = ?1
+                         WHERE pool_contract_id = ?2 AND account_id = ?3",
+                        params![max_scanned_id, pool_contract_id, account.account_id],
+                    )?;
+
+                    pool_quota = pool_quota.saturating_sub(scanned_count);
+                }
+
+                if !progressed_this_cycle {
+                    break;
+                }
+            }
+
+            tx.commit()?;
+            did_any_progress |= did_progress_in_pool;
+        }
+
+        Ok(did_any_progress)
+    }
+
+    pub fn reconcile_nullifiers(&mut self, limit: u32) -> Result<bool> {
+        if limit == 0 {
+            return Ok(false);
+        }
+
+        let pool_ids: Vec<i64> = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT r.contract_id
+                 FROM pool_nullifiers n
+                 JOIN raw_contract_events r ON r.id = n.event_id
+                 ORDER BY r.contract_id",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<core::result::Result<Vec<i64>, _>>()?;
+
+        if pool_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let mut did_any = false;
+
+        for pool_contract_id in pool_ids {
+            let tx = self.conn.transaction()?;
+
+            tx.execute(
+                "INSERT OR IGNORE INTO nullifier_scan_state (pool_contract_id, last_nullifier_id)
+                 VALUES (?1, 0)",
+                params![pool_contract_id],
+            )?;
+
+            let last_nullifier_id: i64 = tx.query_row(
+                "SELECT last_nullifier_id FROM nullifier_scan_state WHERE pool_contract_id = ?1",
+                params![pool_contract_id],
+                |row| row.get(0),
+            )?;
+
+            let nullifiers: Vec<(i64, Field)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT n.id, n.nullifier
+                     FROM pool_nullifiers n
+                     JOIN raw_contract_events r ON r.id = n.event_id
+                     WHERE r.contract_id = ?1 AND n.id > ?2
+                     ORDER BY n.id ASC
+                     LIMIT ?3",
+                )?;
+
+                let rows =
+                    stmt.query_map(params![pool_contract_id, last_nullifier_id, limit], |row| {
+                        let id: i64 = row.get(0)?;
+                        let nullifier: Field = row.get(1)?;
+                        Ok((id, nullifier))
+                    })?;
+
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r?);
+                }
+                out
+            };
+
+            let mut max_id = last_nullifier_id;
+
+            for (nullifier_id, nullifier) in nullifiers {
+                did_any = true;
+                if nullifier_id > max_id {
+                    max_id = nullifier_id;
+                }
+
+                tx.execute(
+                    "UPDATE user_notes
+                     SET nullifier_id = ?1
+                     WHERE nullifier_id IS NULL
+                       AND expected_nullifier = ?2
+                       AND EXISTS (
+                           SELECT 1
+                           FROM pool_commitments c
+                           JOIN raw_contract_events r ON r.id = c.event_id
+                           WHERE c.id = user_notes.commitment_id
+                             AND r.contract_id = ?3
+                       )",
+                    params![nullifier_id, nullifier, pool_contract_id],
+                )?;
+            }
+
+            if max_id > last_nullifier_id {
+                tx.execute(
+                    "UPDATE nullifier_scan_state
+                     SET last_nullifier_id = ?1
+                     WHERE pool_contract_id = ?2",
+                    params![max_id, pool_contract_id],
+                )?;
+            }
+
+            tx.commit()?;
+        }
+
+        Ok(did_any)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row-mapping helpers
+// ---------------------------------------------------------------------------
+
+/// Converts an `i64` SQLite column to `u32`, returning a rusqlite error on
+/// overflow.
+fn col_u32(val: i64, col: usize) -> Result<u32, SqlError> {
+    u32::try_from(val).map_err(|_| SqlError::IntegralValueOutOfRange(col, val))
+}
+
+impl Storage {
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_operation(
+        &self,
+        address: &str,
+        pool_contract_id: &str,
+        op_type: &str,
+        amount: &str,
+        direction: &str,
+        counterparty: Option<&str>,
+        tx_hash: Option<&str>,
+    ) -> Result<()> {
+        // created_at is filled by the DB as UTC epoch seconds, not the client
+        // clock.
+        self.conn.execute(
+            "INSERT INTO app_user_operations
+                (address, pool_contract_id, op_type, amount, direction, counterparty, tx_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s','now'))",
+            params![address, pool_contract_id, op_type, amount, direction, counterparty, tx_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_operations(
+        &self,
+        address: &str,
+        pool_contract_id: &str,
+        limit: u32,
+    ) -> Result<Vec<UserOperation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT op_type, amount, direction, counterparty, tx_hash, created_at
+             FROM app_user_operations
+             WHERE address = ?1 AND pool_contract_id = ?2
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![address, pool_contract_id, limit], |row| {
+            Ok(UserOperation {
+                op_type: row.get(0)?,
+                amount: row.get(1)?,
+                direction: row.get(2)?,
+                counterparty: row.get(3)?,
+                tx_hash: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+}
+
+fn map_public_key_entry(row: &rusqlite::Row<'_>) -> Result<crate::types::PublicKeyEntry, SqlError> {
+    Ok(crate::types::PublicKeyEntry {
+        address: row.get(0)?,
+        encryption_key: row.get(1)?,
+        note_key: row.get(2)?,
+        ledger: col_u32(row.get::<_, i64>(3)?, 3)?,
+    })
+}
+
+fn encode_optional_gvk_ciphertext(
+    ciphertext: Option<&GlobalViewKeyCiphertext>,
+) -> Result<Option<String>> {
+    match ciphertext {
+        None => Ok(None),
+        Some(ct) => Ok(Some(serde_json::to_string(ct)?)),
+    }
+}
+
+fn decode_gvk_ciphertext(encoded: &str) -> Result<GlobalViewKeyCiphertext> {
+    serde_json::from_str(encoded).map_err(Into::into)
+}
+
+fn optional_gvk_ciphertext_col(
+    row: &rusqlite::Row<'_>,
+    idx: usize,
+) -> rusqlite::Result<Option<GlobalViewKeyCiphertext>> {
+    let encoded: Option<String> = row.get(idx)?;
+    match encoded {
+        None => Ok(None),
+        Some(encoded) => decode_gvk_ciphertext(&encoded).map(Some).map_err(|e| {
+            rusqlite::Error::InvalidParameterName(format!("gvk_ciphertext[{idx}]: {e:#}"))
+        }),
+    }
+}
+
+pub(super) fn check_integrity(conn: &Connection) -> Result<()> {
+    let mut statement = conn.prepare("PRAGMA integrity_check")?;
+    let messages = statement
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(messages == ["ok"], "database integrity check failed");
+    ensure!(
+        conn.prepare("PRAGMA foreign_key_check")?
+            .query([])?
+            .next()?
+            .is_none(),
+        "database foreign key check failed"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn numeric_app_settings_round_trip() -> anyhow::Result<()> {
+        let mut storage = super::Storage::connect_in_memory()?;
+        assert_eq!(storage.get_setting_json::<u32>("auto_lock_minutes")?, None);
+        for minutes in [5_u32, 15, 0] {
+            storage.set_setting_json("auto_lock_minutes", &minutes)?;
+            assert_eq!(
+                storage.get_setting_json::<u32>("auto_lock_minutes")?,
+                Some(minutes)
+            );
+        }
+        storage.set_setting_json("fraction", &1.5_f64)?;
+        assert_eq!(storage.get_setting_json::<f64>("fraction")?, Some(1.5));
+        Ok(())
+    }
+
+    use super::*;
+    use crate::{
+        state::test_events,
+        types::{ContractEvent, ContractsEventData, KeyDerivationSignature, NoteAmount},
+        zk::{crypto, encryption},
+    };
+
+    fn dummy_event(id: &str) -> ContractEvent {
+        ContractEvent {
+            id: id.to_string(),
+            ledger: 1,
+            contract_id: "CPOOL".to_string(),
+            topics: vec!["dummy".to_string()],
+            value: "dummy".to_string(),
+        }
+    }
+
+    fn commitment_event(id: &str, commitment: Field, index: u32) -> NewCommitmentEvent {
+        NewCommitmentEvent {
+            id: id.to_string(),
+            commitment,
+            index,
+            encrypted_output: vec![],
+            gvk_ciphertext: None,
+        }
+    }
+
+    #[test]
+    fn scan_commitments_and_reconcile_nullifiers() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        // Create an account with keypairs.
+        let signature = KeyDerivationSignature(vec![1u8; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(signature.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&signature, "testnet")?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+
+        let account_id: i64 = storage.conn.query_row(
+            "SELECT id FROM accounts WHERE address = ?1",
+            params!["GTESTACCOUNT"],
+            |row| row.get(0),
+        )?;
+
+        // Build a commitment + encrypted output addressed to the account.
+        let amount = NoteAmount::from(5);
+        let mut blinding_le = [0u8; 32];
+        blinding_le[0] = 7;
+        let blinding = Field::try_from_le_bytes(blinding_le)?;
+
+        let amount_field_le = Field::from(amount).to_le_bytes();
+        let commitment_le = crypto::compute_commitment(
+            &amount_field_le,
+            note_keypair.public.as_ref(),
+            &blinding.to_le_bytes(),
+        )?;
+        let commitment_le: [u8; 32] = commitment_le.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("commitment: expected 32 bytes, got {}", v.len())
+        })?;
+        let commitment = Field::try_from_le_bytes(commitment_le)?;
+
+        let encrypted_output =
+            encryption::encrypt_output_note(&enc_keypair.public, amount, &blinding)?;
+
+        // Insert the raw event + the parsed pool commitment row.
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-commit")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![NewCommitmentEvent {
+            id: "evt-commit".to_string(),
+            commitment,
+            index: 3,
+            encrypted_output: encrypted_output.clone(),
+            gvk_ciphertext: None,
+        }])?;
+
+        // Scan commitments -> user_notes.
+        let mut derive = |account: &AccountKeys,
+                          row: &PoolCommitmentRow|
+         -> Result<Option<DerivedUserNoteRow>> {
+            let opt = crate::zk::notes::try_decrypt_and_derive_user_note(
+                &account.keys.note_keypair,
+                &account.keys.encryption_keypair.private,
+                &row.commitment,
+                row.leaf_index,
+                &row.encrypted_output,
+            )?;
+            Ok(opt.map(|d| DerivedUserNoteRow {
+                amount: d.amount,
+                blinding: d.blinding,
+                expected_nullifier: d.expected_nullifier,
+            }))
+        };
+        assert!(storage.scan_commitments_for_user_notes(100, &mut derive)?);
+
+        let note_count: i64 =
+            storage
+                .conn
+                .query_row("SELECT COUNT(*) FROM user_notes", [], |row| row.get(0))?;
+        assert_eq!(note_count, 1);
+
+        let scanned: i64 = storage.conn.query_row(
+            "SELECT last_commitment_id FROM account_commitment_scan WHERE account_id = ?1",
+            params![account_id],
+            |row| row.get(0),
+        )?;
+        assert!(scanned > 0);
+
+        // Insert a matching nullifier event.
+        let leaf_index: u32 = 3;
+        let mut path_indices_le = [0u8; 32];
+        path_indices_le[..8].copy_from_slice(&(u64::from(leaf_index)).to_le_bytes());
+        let signature = crypto::compute_signature(
+            &note_keypair.private.0,
+            &commitment.to_le_bytes(),
+            &path_indices_le,
+        )?;
+        let nullifier_le =
+            crypto::compute_nullifier(&commitment.to_le_bytes(), &path_indices_le, &signature)?;
+        let nullifier_le: [u8; 32] = nullifier_le.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("nullifier: expected 32 bytes, got {}", v.len())
+        })?;
+        let nullifier = Field::try_from_le_bytes(nullifier_le)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-null")],
+            cursor: "cur2".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_nullifier_events_batch(&vec![NewNullifierEvent {
+            id: "evt-null".to_string(),
+            nullifier,
+            gvk_ciphertext: None,
+        }])?;
+
+        assert!(storage.reconcile_nullifiers(100)?);
+
+        let nullifier_id: Option<i64> = storage.conn.query_row(
+            "SELECT nullifier_id FROM user_notes WHERE account_id = ?1",
+            params![account_id],
+            |row| row.get(0),
+        )?;
+        assert!(nullifier_id.is_some());
+
+        Ok(())
+    }
+
+    /// Outputs too short to be ciphertexts are skipped and do not stop the scan
+    #[test]
+    fn scan_commitments_skips_malformed_encrypted_outputs() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let signature = KeyDerivationSignature(vec![1u8; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(signature.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&signature, "testnet")?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+
+        let amount = NoteAmount::from(5);
+        let blinding = Field::from(NoteAmount::from(7));
+        let commitment_le: [u8; 32] = crypto::compute_commitment(
+            &Field::from(amount).to_le_bytes(),
+            note_keypair.public.as_ref(),
+            &blinding.to_le_bytes(),
+        )?
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("commitment: expected 32 bytes, got {}", v.len()))?;
+        let commitment = Field::try_from_le_bytes(commitment_le)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![
+                dummy_event("evt-empty"),
+                dummy_event("evt-short"),
+                dummy_event("evt-real"),
+            ],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![
+            commitment_event("evt-empty", Field::from(NoteAmount::from(1)), 0),
+            NewCommitmentEvent {
+                encrypted_output: vec![1, 2, 3],
+                ..commitment_event("evt-short", Field::from(NoteAmount::from(2)), 1)
+            },
+            NewCommitmentEvent {
+                encrypted_output: encryption::encrypt_output_note(
+                    &enc_keypair.public,
+                    amount,
+                    &blinding,
+                )?,
+                ..commitment_event("evt-real", commitment, 2)
+            },
+        ])?;
+
+        let mut derive = |account: &AccountKeys,
+                          row: &PoolCommitmentRow|
+         -> Result<Option<DerivedUserNoteRow>> {
+            let opt = crate::zk::notes::try_decrypt_and_derive_user_note(
+                &account.keys.note_keypair,
+                &account.keys.encryption_keypair.private,
+                &row.commitment,
+                row.leaf_index,
+                &row.encrypted_output,
+            )?;
+            Ok(opt.map(|d| DerivedUserNoteRow {
+                amount: d.amount,
+                blinding: d.blinding,
+                expected_nullifier: d.expected_nullifier,
+            }))
+        };
+        assert!(storage.scan_commitments_for_user_notes(100, &mut derive)?);
+
+        let note_commitment_ids: Vec<i64> = storage
+            .conn
+            .prepare("SELECT commitment_id FROM user_notes")?
+            .query_map([], |row| row.get(0))?
+            .collect::<core::result::Result<_, _>>()?;
+        let (max_commitment_id, scanned): (i64, i64) = storage.conn.query_row(
+            "SELECT (SELECT MAX(id) FROM pool_commitments), last_commitment_id
+             FROM account_commitment_scan",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(note_commitment_ids, vec![max_commitment_id]);
+        assert_eq!(scanned, max_commitment_id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_metadata_tracks_progress_and_caught_up_tip() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "c1".to_string(),
+            latest_ledger: 10,
+            events: vec![dummy_event("evt-1")],
+        })?;
+        storage.save_sync_progress(
+            &[crate::types::SyncMetadata {
+                contract_id: "CPOOL".to_string(),
+                cursor: "c1".to_string(),
+                last_indexed_ledger: 10,
+                last_fully_indexed_ledger: 0,
+            }],
+            false,
+        )?;
+
+        let meta = storage
+            .get_sync_metadata()?
+            .into_iter()
+            .find(|meta| meta.contract_id == "CPOOL")
+            .expect("expected sync metadata");
+        assert_eq!(meta.cursor, "c1");
+        assert_eq!(meta.last_indexed_ledger, 10);
+        assert_eq!(meta.last_fully_indexed_ledger, 0);
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "c2".to_string(),
+            latest_ledger: 123,
+            events: vec![],
+        })?;
+        storage.save_sync_progress(
+            &[crate::types::SyncMetadata {
+                contract_id: "CPOOL".to_string(),
+                cursor: "c2".to_string(),
+                last_indexed_ledger: 123,
+                last_fully_indexed_ledger: 0,
+            }],
+            true,
+        )?;
+
+        let meta = storage
+            .get_sync_metadata()?
+            .into_iter()
+            .find(|meta| meta.contract_id == "CPOOL")
+            .expect("expected sync metadata");
+        assert_eq!(meta.cursor, "c2");
+        assert_eq!(meta.last_indexed_ledger, 123);
+        assert_eq!(meta.last_fully_indexed_ledger, 123);
+
+        storage.clear_indexing_cursors()?;
+        let meta = storage
+            .get_sync_metadata()?
+            .into_iter()
+            .find(|meta| meta.contract_id == "CPOOL")
+            .expect("expected sync metadata");
+        assert!(meta.cursor.is_empty());
+        assert_eq!(meta.last_indexed_ledger, 123);
+        assert_eq!(meta.last_fully_indexed_ledger, 123);
+
+        Ok(())
+    }
+
+    #[test]
+    fn clamp_last_fully_indexed_ledger_after_handoff() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+        const HANDOFF: u32 = 2_999_000;
+        const TIP: u32 = 3_000_000;
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "c1".to_string(),
+            latest_ledger: TIP,
+            events: vec![dummy_event("evt-1")],
+        })?;
+        storage.save_sync_progress(
+            &[crate::types::SyncMetadata {
+                contract_id: "CPOOL".to_string(),
+                cursor: "c1".to_string(),
+                last_indexed_ledger: TIP,
+                last_fully_indexed_ledger: 0,
+            }],
+            true,
+        )?;
+        storage.save_sync_progress(
+            &[crate::types::SyncMetadata {
+                contract_id: "CPOOL".to_string(),
+                cursor: String::new(),
+                last_indexed_ledger: HANDOFF,
+                last_fully_indexed_ledger: 0,
+            }],
+            false,
+        )?;
+
+        storage.clamp_last_fully_indexed_ledger(HANDOFF)?;
+
+        let meta = storage
+            .get_sync_metadata()?
+            .into_iter()
+            .find(|meta| meta.contract_id == "CPOOL")
+            .expect("expected sync metadata");
+        assert_eq!(meta.last_indexed_ledger, HANDOFF);
+        assert_eq!(meta.last_fully_indexed_ledger, HANDOFF);
+
+        Ok(())
+    }
+
+    #[test]
+    fn saving_keys_again_replaces_them() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let signature_1 = KeyDerivationSignature(vec![1u8; 64]);
+        let signature_2 = KeyDerivationSignature(vec![3u8; 64]);
+        let (note_keypair_1, enc_keypair_1) =
+            encryption::derive_encryption_and_note_keypairs(signature_1.clone())?;
+        let (note_keypair_2, enc_keypair_2) =
+            encryption::derive_encryption_and_note_keypairs(signature_2.clone())?;
+        let membership_blinding_1 =
+            encryption::derive_membership_blinding(&signature_1, "testnet")?;
+        let membership_blinding_2 =
+            encryption::derive_membership_blinding(&signature_2, "testnet")?;
+
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair_1,
+            &enc_keypair_1,
+            &membership_blinding_1,
+        )?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair_2,
+            &enc_keypair_2,
+            &membership_blinding_2,
+        )?;
+
+        let keys = storage
+            .get_private_keys("GTESTACCOUNT", "tests")?
+            .expect("expected keypairs to exist");
+        assert_eq!(keys.note_keypair.public.0, note_keypair_2.public.0);
+        assert_eq!(keys.encryption_keypair.public.0, enc_keypair_2.public.0);
+        assert_eq!(
+            keys.membership_blinding.to_le_bytes(),
+            membership_blinding_2.to_le_bytes()
+        );
+
+        Ok(())
+    }
+
+    fn keys_for(seed: u8) -> Result<(NoteKeyPair, EncryptionKeyPair, Field)> {
+        let signature = KeyDerivationSignature(vec![seed; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(signature.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&signature, "testnet")?;
+        Ok((note_keypair, enc_keypair, membership_blinding))
+    }
+
+    #[test]
+    fn keys_are_scoped_to_kdf_domain() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+        let (note_a, enc_a, blinding_a) = keys_for(1)?;
+        let (note_b, enc_b, blinding_b) = keys_for(3)?;
+
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "a",
+            &note_a,
+            &enc_a,
+            &blinding_a,
+        )?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "b",
+            &note_b,
+            &enc_b,
+            &blinding_b,
+        )?;
+
+        let keys_a = storage
+            .get_private_keys("GTESTACCOUNT", "a")?
+            .expect("keys for domain a");
+        let keys_b = storage
+            .get_private_keys("GTESTACCOUNT", "b")?
+            .expect("keys for domain b");
+        assert_eq!(keys_a.note_keypair.public.0, note_a.public.0);
+        assert_eq!(keys_b.note_keypair.public.0, note_b.public.0);
+        assert!(storage.get_private_keys("GTESTACCOUNT", "c")?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_attributes_notes_to_the_decrypting_kdf_domain() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+        let (note_a, enc_a, blinding_a) = keys_for(1)?;
+        let (note_b, enc_b, blinding_b) = keys_for(3)?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "a",
+            &note_a,
+            &enc_a,
+            &blinding_a,
+        )?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "b",
+            &note_b,
+            &enc_b,
+            &blinding_b,
+        )?;
+
+        let amount = NoteAmount::from(5);
+        let blinding = Field::try_from_le_bytes([7; 32].map(|b| b & 0x0f))?;
+        let commitment = Field::try_from_le_bytes(
+            crypto::compute_commitment(
+                &Field::from(amount).to_le_bytes(),
+                note_b.public.as_ref(),
+                &blinding.to_le_bytes(),
+            )?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("commitment: expected 32 bytes"))?,
+        )?;
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-commit")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![NewCommitmentEvent {
+            id: "evt-commit".to_string(),
+            commitment,
+            index: 0,
+            encrypted_output: encryption::encrypt_output_note(&enc_b.public, amount, &blinding)?,
+            gvk_ciphertext: None,
+        }])?;
+
+        let mut derive = |account: &AccountKeys,
+                          row: &PoolCommitmentRow|
+         -> Result<Option<DerivedUserNoteRow>> {
+            let opt = crate::zk::notes::try_decrypt_and_derive_user_note(
+                &account.keys.note_keypair,
+                &account.keys.encryption_keypair.private,
+                &row.commitment,
+                row.leaf_index,
+                &row.encrypted_output,
+            )?;
+            Ok(opt.map(|d| DerivedUserNoteRow {
+                amount: d.amount,
+                blinding: d.blinding,
+                expected_nullifier: d.expected_nullifier,
+            }))
+        };
+        storage.scan_commitments_for_user_notes(100, &mut derive)?;
+
+        assert!(storage.list_user_notes("GTESTACCOUNT", "a", 10)?.is_empty());
+        assert_eq!(storage.list_user_notes("GTESTACCOUNT", "b", 10)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn kdf_domain_migration_drops_account_data() -> Result<()> {
+        let mut conn = Connection::open_in_memory()?;
+        MIGRATIONS.to_version(&mut conn, 2)?;
+        conn.execute_batch(
+            "INSERT INTO accounts (id, address) VALUES (1, 'GTESTACCOUNT');
+             INSERT INTO disclaimer_acceptances (account_id, disclaimer_hash) VALUES (1, 'hash');",
+        )?;
+        let (note_keypair, enc_keypair, membership_blinding) = keys_for(1)?;
+        conn.execute(
+            "INSERT INTO keypairs (
+                encryption_private_key, encryption_public_key, note_private_key,
+                note_public_key, membership_blinding, account_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                &enc_keypair.private,
+                &enc_keypair.public,
+                &note_keypair.private,
+                &note_keypair.public,
+                &membership_blinding,
+            ],
+        )?;
+
+        let mut storage = Storage::connect_with_connection(conn)?;
+
+        assert!(storage.get_private_keys("GTESTACCOUNT", "tests")?.is_none());
+        let rows: i64 = storage.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM accounts) + (SELECT COUNT(*) FROM keypairs)",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, 0);
+        let accepted: i64 = storage.conn.query_row(
+            "SELECT COUNT(*) FROM disclaimer_acceptances WHERE address = 'GTESTACCOUNT'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(accepted, 1);
+
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+        assert!(storage.get_private_keys("GTESTACCOUNT", "tests")?.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn save_keypairs_does_not_duplicate_accounts() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let signature = KeyDerivationSignature(vec![1u8; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(signature.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&signature, "testnet")?;
+
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+
+        let count: i64 = storage.conn.query_row(
+            "SELECT COUNT(*) FROM accounts WHERE address = ?1",
+            params!["GTESTACCOUNT"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn asp_membership_precondition_partial_processing_returns_sync_required() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let mut root_old_bytes = [0u8; 32];
+        root_old_bytes[0] = 1;
+        let root_old = Field::try_from_le_bytes(root_old_bytes)?;
+
+        let mut root_new_bytes = [0u8; 32];
+        root_new_bytes[0] = 2;
+        let root_new = Field::try_from_le_bytes(root_new_bytes)?;
+
+        let mut leaf_bytes = [0u8; 32];
+        leaf_bytes[0] = 3;
+        let leaf = Field::try_from_le_bytes(leaf_bytes)?;
+
+        let last_leaf_ledger = 10u32;
+        let current_ledger = 12u32;
+
+        // Ingest raw events (including a newer ASP event)...
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "cur-raw".to_string(),
+            latest_ledger: 11,
+            events: vec![
+                ContractEvent {
+                    id: "asp-leaf-10".to_string(),
+                    ledger: last_leaf_ledger,
+                    contract_id: "CASP".to_string(),
+                    topics: vec!["leaf_added".to_string()],
+                    value: "dummy".to_string(),
+                },
+                ContractEvent {
+                    id: "asp-leaf-11-unprocessed".to_string(),
+                    ledger: 11,
+                    contract_id: "CASP".to_string(),
+                    topics: vec!["leaf_added".to_string()],
+                    value: "dummy".to_string(),
+                },
+            ],
+        })?;
+
+        // ...but only process the older one into asp_membership_leaves.
+        storage.save_leaf_added_events_batch(&vec![LeafAddedEvent {
+            id: "asp-leaf-10".to_string(),
+            leaf,
+            index: 0,
+            root: root_old,
+        }])?;
+
+        // Mark the indexer as fully caught up to the chain tip (even though
+        // event processing is behind).
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "cur-tip".to_string(),
+            latest_ledger: current_ledger,
+            events: vec![],
+        })?;
+        storage.save_sync_progress(
+            &[crate::types::SyncMetadata {
+                contract_id: "CASP".to_string(),
+                cursor: "cur-tip".to_string(),
+                last_indexed_ledger: current_ledger,
+                last_fully_indexed_ledger: 0,
+            }],
+            true,
+        )?;
+
+        // Root matches the last stored root: this should NOT require syncing
+        // even if the last ASP leaf was emitted earlier than the current tip.
+        let status =
+            storage.check_asp_membership_precondition("CASP", &leaf, &root_new, current_ledger)?;
+        assert!(matches!(
+            status,
+            AspMembershipSync::SyncRequired(Some(gap)) if gap == current_ledger - last_leaf_ledger
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn asp_membership_precondition_root_mismatch_at_same_ledger_errors() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let mut root_old_bytes = [0u8; 32];
+        root_old_bytes[0] = 1;
+        let root_old = Field::try_from_le_bytes(root_old_bytes)?;
+
+        let mut root_new_bytes = [0u8; 32];
+        root_new_bytes[0] = 2;
+        let root_new = Field::try_from_le_bytes(root_new_bytes)?;
+
+        let mut leaf_bytes = [0u8; 32];
+        leaf_bytes[0] = 3;
+        let leaf = Field::try_from_le_bytes(leaf_bytes)?;
+
+        let current_ledger = 10u32;
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "cur-raw".to_string(),
+            latest_ledger: current_ledger,
+            events: vec![ContractEvent {
+                id: "asp-leaf-10".to_string(),
+                ledger: current_ledger,
+                contract_id: "CASP".to_string(),
+                topics: vec!["leaf_added".to_string()],
+                value: "dummy".to_string(),
+            }],
+        })?;
+
+        storage.save_leaf_added_events_batch(&vec![LeafAddedEvent {
+            id: "asp-leaf-10".to_string(),
+            leaf,
+            index: 0,
+            root: root_old,
+        }])?;
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "cur-tip".to_string(),
+            latest_ledger: current_ledger,
+            events: vec![],
+        })?;
+        storage.save_sync_progress(
+            &[crate::types::SyncMetadata {
+                contract_id: "CASP".to_string(),
+                cursor: "cur-tip".to_string(),
+                last_indexed_ledger: current_ledger,
+                last_fully_indexed_ledger: 0,
+            }],
+            true,
+        )?;
+
+        let err = storage
+            .check_asp_membership_precondition("CASP", &leaf, &root_new, current_ledger)
+            .expect_err("root mismatch at same ledger should be an error");
+        assert!(err.to_string().contains("asp membership root mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn asp_membership_precondition_allows_tip_without_recent_asp_events() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let mut root_bytes = [0u8; 32];
+        root_bytes[0] = 1;
+        let root = Field::try_from_le_bytes(root_bytes)?;
+
+        let mut leaf_bytes = [0u8; 32];
+        leaf_bytes[0] = 3;
+        let leaf = Field::try_from_le_bytes(leaf_bytes)?;
+
+        let last_leaf_ledger = 10u32;
+        let current_ledger = 12u32;
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "cur-raw".to_string(),
+            latest_ledger: last_leaf_ledger,
+            events: vec![ContractEvent {
+                id: "asp-leaf-10".to_string(),
+                ledger: last_leaf_ledger,
+                contract_id: "CASP".to_string(),
+                topics: vec!["leaf_added".to_string()],
+                value: "dummy".to_string(),
+            }],
+        })?;
+
+        storage.save_leaf_added_events_batch(&vec![LeafAddedEvent {
+            id: "asp-leaf-10".to_string(),
+            leaf,
+            index: 0,
+            root,
+        }])?;
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "cur-tip".to_string(),
+            latest_ledger: current_ledger,
+            events: vec![],
+        })?;
+        storage.save_sync_progress(
+            &[crate::types::SyncMetadata {
+                contract_id: "CASP".to_string(),
+                cursor: "cur-tip".to_string(),
+                last_indexed_ledger: current_ledger,
+                last_fully_indexed_ledger: 0,
+            }],
+            true,
+        )?;
+
+        let status =
+            storage.check_asp_membership_precondition("CASP", &leaf, &root, current_ledger)?;
+        assert!(!matches!(status, AspMembershipSync::SyncRequired(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn asp_membership_precondition_tolerates_metadata_ahead_of_read() -> Result<()> {
+        // The events indexer can sit a few ledgers ahead of an independent
+        // contract-state read (here last_fully_indexed=15 > current_ledger=12).
+        // With a matching root this is benign skew and must resolve, not error.
+        let mut storage = Storage::connect_with_connection(Connection::open_in_memory()?)?;
+
+        let mut root_bytes = [0u8; 32];
+        root_bytes[0] = 1;
+        let root = Field::try_from_le_bytes(root_bytes)?;
+
+        let mut leaf_bytes = [0u8; 32];
+        leaf_bytes[0] = 3;
+        let leaf = Field::try_from_le_bytes(leaf_bytes)?;
+
+        let last_leaf_ledger = 10u32;
+        let current_ledger = 12u32;
+        let indexed_tip = 15u32;
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "cur-raw".to_string(),
+            latest_ledger: last_leaf_ledger,
+            events: vec![ContractEvent {
+                id: "asp-leaf-10".to_string(),
+                ledger: last_leaf_ledger,
+                contract_id: "CASP".to_string(),
+                topics: vec!["leaf_added".to_string()],
+                value: "dummy".to_string(),
+            }],
+        })?;
+
+        storage.save_leaf_added_events_batch(&vec![LeafAddedEvent {
+            id: "asp-leaf-10".to_string(),
+            leaf,
+            index: 0,
+            root,
+        }])?;
+
+        storage.save_events_batch(&ContractsEventData {
+            cursor: "cur-tip".to_string(),
+            latest_ledger: indexed_tip,
+            events: vec![],
+        })?;
+        storage.save_sync_progress(
+            &[crate::types::SyncMetadata {
+                contract_id: "CASP".to_string(),
+                cursor: "cur-tip".to_string(),
+                last_indexed_ledger: indexed_tip,
+                last_fully_indexed_ledger: 0,
+            }],
+            true,
+        )?;
+
+        let status =
+            storage.check_asp_membership_precondition("CASP", &leaf, &root, current_ledger)?;
+        assert!(matches!(status, AspMembershipSync::UserIndex(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn get_unspent_user_note_by_commitment_finds_unspent_note() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let sig = KeyDerivationSignature(vec![1u8; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(sig.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&sig, "testnet")?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+
+        let amount = NoteAmount::from(5);
+        let mut blinding_le = [0u8; 32];
+        blinding_le[0] = 7;
+        let blinding = Field::try_from_le_bytes(blinding_le)?;
+
+        let amount_field_le = Field::from(amount).to_le_bytes();
+        let commitment_le = crypto::compute_commitment(
+            &amount_field_le,
+            note_keypair.public.as_ref(),
+            &blinding.to_le_bytes(),
+        )?;
+        let commitment_le: [u8; 32] = commitment_le.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("commitment: expected 32 bytes, got {}", v.len())
+        })?;
+        let commitment = Field::try_from_le_bytes(commitment_le)?;
+
+        let encrypted_output =
+            encryption::encrypt_output_note(&enc_keypair.public, amount, &blinding)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-commit")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![NewCommitmentEvent {
+            id: "evt-commit".to_string(),
+            commitment,
+            index: 3,
+            encrypted_output: encrypted_output.clone(),
+            gvk_ciphertext: None,
+        }])?;
+
+        let mut derive = |account: &AccountKeys,
+                          row: &PoolCommitmentRow|
+         -> Result<Option<DerivedUserNoteRow>> {
+            let opt = crate::zk::notes::try_decrypt_and_derive_user_note(
+                &account.keys.note_keypair,
+                &account.keys.encryption_keypair.private,
+                &row.commitment,
+                row.leaf_index,
+                &row.encrypted_output,
+            )?;
+            Ok(opt.map(|d| DerivedUserNoteRow {
+                amount: d.amount,
+                blinding: d.blinding,
+                expected_nullifier: d.expected_nullifier,
+            }))
+        };
+        assert!(storage.scan_commitments_for_user_notes(100, &mut derive)?);
+
+        let result = storage.get_unspent_user_note_by_commitment(
+            "CPOOL",
+            "GTESTACCOUNT",
+            "tests",
+            &commitment,
+        )?;
+        assert!(result.is_some());
+        let (got_amount, got_blinding, got_leaf_index) = result.expect("just checked is_some");
+        assert_eq!(got_amount, amount);
+        assert_eq!(got_blinding, blinding);
+        assert_eq!(got_leaf_index, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_unspent_user_note_by_commitment_rejects_spent_note() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let sig = KeyDerivationSignature(vec![1u8; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(sig.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&sig, "testnet")?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+
+        let amount = NoteAmount::from(5);
+        let mut blinding_le = [0u8; 32];
+        blinding_le[0] = 7;
+        let blinding = Field::try_from_le_bytes(blinding_le)?;
+
+        let amount_field_le = Field::from(amount).to_le_bytes();
+        let commitment_le = crypto::compute_commitment(
+            &amount_field_le,
+            note_keypair.public.as_ref(),
+            &blinding.to_le_bytes(),
+        )?;
+        let commitment_le: [u8; 32] = commitment_le.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("commitment: expected 32 bytes, got {}", v.len())
+        })?;
+        let commitment = Field::try_from_le_bytes(commitment_le)?;
+
+        let encrypted_output =
+            encryption::encrypt_output_note(&enc_keypair.public, amount, &blinding)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-commit")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![NewCommitmentEvent {
+            id: "evt-commit".to_string(),
+            commitment,
+            index: 3,
+            encrypted_output: encrypted_output.clone(),
+            gvk_ciphertext: None,
+        }])?;
+
+        let mut derive = |account: &AccountKeys,
+                          row: &PoolCommitmentRow|
+         -> Result<Option<DerivedUserNoteRow>> {
+            let opt = crate::zk::notes::try_decrypt_and_derive_user_note(
+                &account.keys.note_keypair,
+                &account.keys.encryption_keypair.private,
+                &row.commitment,
+                row.leaf_index,
+                &row.encrypted_output,
+            )?;
+            Ok(opt.map(|d| DerivedUserNoteRow {
+                amount: d.amount,
+                blinding: d.blinding,
+                expected_nullifier: d.expected_nullifier,
+            }))
+        };
+        storage.scan_commitments_for_user_notes(100, &mut derive)?;
+
+        // Spend the note via nullifier.
+        let leaf_index: u32 = 3;
+        let mut path_indices_le = [0u8; 32];
+        path_indices_le[..8].copy_from_slice(&(u64::from(leaf_index)).to_le_bytes());
+        let signature = crypto::compute_signature(
+            &note_keypair.private.0,
+            &commitment.to_le_bytes(),
+            &path_indices_le,
+        )?;
+        let nullifier_le =
+            crypto::compute_nullifier(&commitment.to_le_bytes(), &path_indices_le, &signature)?;
+        let nullifier_le: [u8; 32] = nullifier_le.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("nullifier: expected 32 bytes, got {}", v.len())
+        })?;
+        let nullifier = Field::try_from_le_bytes(nullifier_le)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-null")],
+            cursor: "cur2".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_nullifier_events_batch(&vec![NewNullifierEvent {
+            id: "evt-null".to_string(),
+            nullifier,
+            gvk_ciphertext: None,
+        }])?;
+        storage.reconcile_nullifiers(100)?;
+
+        let result = storage.get_unspent_user_note_by_commitment(
+            "CPOOL",
+            "GTESTACCOUNT",
+            "tests",
+            &commitment,
+        )?;
+        assert!(result.is_none(), "spent note should not be returned");
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_unspent_user_note_by_commitment_rejects_wrong_commitment() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let sig = KeyDerivationSignature(vec![1u8; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(sig.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&sig, "testnet")?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+
+        let amount = NoteAmount::from(5);
+        let mut blinding_le = [0u8; 32];
+        blinding_le[0] = 7;
+        let blinding = Field::try_from_le_bytes(blinding_le)?;
+
+        let encrypted_output =
+            encryption::encrypt_output_note(&enc_keypair.public, amount, &blinding)?;
+
+        let mut commitment_le = [0u8; 32];
+        commitment_le[0] = 1;
+        let commitment = Field::try_from_le_bytes(commitment_le)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-commit")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![NewCommitmentEvent {
+            id: "evt-commit".to_string(),
+            commitment,
+            index: 0,
+            encrypted_output: encrypted_output.clone(),
+            gvk_ciphertext: None,
+        }])?;
+
+        let mut derive = |account: &AccountKeys,
+                          row: &PoolCommitmentRow|
+         -> Result<Option<DerivedUserNoteRow>> {
+            let opt = crate::zk::notes::try_decrypt_and_derive_user_note(
+                &account.keys.note_keypair,
+                &account.keys.encryption_keypair.private,
+                &row.commitment,
+                row.leaf_index,
+                &row.encrypted_output,
+            )?;
+            Ok(opt.map(|d| DerivedUserNoteRow {
+                amount: d.amount,
+                blinding: d.blinding,
+                expected_nullifier: d.expected_nullifier,
+            }))
+        };
+        storage.scan_commitments_for_user_notes(100, &mut derive)?;
+
+        let wrong_commitment = Field::try_from_le_bytes([
+            2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ])?;
+        let result = storage.get_unspent_user_note_by_commitment(
+            "CPOOL",
+            "GTESTACCOUNT",
+            "tests",
+            &wrong_commitment,
+        )?;
+        assert!(result.is_none(), "wrong commitment should not match");
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_user_note_by_commitment_finds_unspent_note() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let sig = KeyDerivationSignature(vec![1u8; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(sig.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&sig, "testnet")?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+
+        let amount = NoteAmount::from(5);
+        let mut blinding_le = [0u8; 32];
+        blinding_le[0] = 7;
+        let blinding = Field::try_from_le_bytes(blinding_le)?;
+
+        let amount_field_le = Field::from(amount).to_le_bytes();
+        let commitment_le = crypto::compute_commitment(
+            &amount_field_le,
+            note_keypair.public.as_ref(),
+            &blinding.to_le_bytes(),
+        )?;
+        let commitment_le: [u8; 32] = commitment_le.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("commitment: expected 32 bytes, got {}", v.len())
+        })?;
+        let commitment = Field::try_from_le_bytes(commitment_le)?;
+
+        let encrypted_output =
+            encryption::encrypt_output_note(&enc_keypair.public, amount, &blinding)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-commit")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![NewCommitmentEvent {
+            id: "evt-commit".to_string(),
+            commitment,
+            index: 3,
+            encrypted_output: encrypted_output.clone(),
+            gvk_ciphertext: None,
+        }])?;
+
+        let mut derive = |account: &AccountKeys,
+                          row: &PoolCommitmentRow|
+         -> Result<Option<DerivedUserNoteRow>> {
+            let opt = crate::zk::notes::try_decrypt_and_derive_user_note(
+                &account.keys.note_keypair,
+                &account.keys.encryption_keypair.private,
+                &row.commitment,
+                row.leaf_index,
+                &row.encrypted_output,
+            )?;
+            Ok(opt.map(|d| DerivedUserNoteRow {
+                amount: d.amount,
+                blinding: d.blinding,
+                expected_nullifier: d.expected_nullifier,
+            }))
+        };
+        assert!(storage.scan_commitments_for_user_notes(100, &mut derive)?);
+
+        let result =
+            storage.get_user_note_by_commitment("CPOOL", "GTESTACCOUNT", "tests", &commitment)?;
+        assert!(result.is_some());
+        let (got_amount, got_blinding, got_leaf_index) = result.expect("just checked is_some");
+        assert_eq!(got_amount, amount);
+        assert_eq!(got_blinding, blinding);
+        assert_eq!(got_leaf_index, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_user_note_by_commitment_finds_spent_note() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let sig = KeyDerivationSignature(vec![1u8; 64]);
+        let (note_keypair, enc_keypair) =
+            encryption::derive_encryption_and_note_keypairs(sig.clone())?;
+        let membership_blinding = encryption::derive_membership_blinding(&sig, "testnet")?;
+        storage.save_encryption_and_note_keypairs(
+            "GTESTACCOUNT",
+            "tests",
+            &note_keypair,
+            &enc_keypair,
+            &membership_blinding,
+        )?;
+
+        let amount = NoteAmount::from(5);
+        let mut blinding_le = [0u8; 32];
+        blinding_le[0] = 7;
+        let blinding = Field::try_from_le_bytes(blinding_le)?;
+
+        let amount_field_le = Field::from(amount).to_le_bytes();
+        let commitment_le = crypto::compute_commitment(
+            &amount_field_le,
+            note_keypair.public.as_ref(),
+            &blinding.to_le_bytes(),
+        )?;
+        let commitment_le: [u8; 32] = commitment_le.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("commitment: expected 32 bytes, got {}", v.len())
+        })?;
+        let commitment = Field::try_from_le_bytes(commitment_le)?;
+
+        let encrypted_output =
+            encryption::encrypt_output_note(&enc_keypair.public, amount, &blinding)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-commit")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![NewCommitmentEvent {
+            id: "evt-commit".to_string(),
+            commitment,
+            index: 3,
+            encrypted_output: encrypted_output.clone(),
+            gvk_ciphertext: None,
+        }])?;
+
+        let mut derive = |account: &AccountKeys,
+                          row: &PoolCommitmentRow|
+         -> Result<Option<DerivedUserNoteRow>> {
+            let opt = crate::zk::notes::try_decrypt_and_derive_user_note(
+                &account.keys.note_keypair,
+                &account.keys.encryption_keypair.private,
+                &row.commitment,
+                row.leaf_index,
+                &row.encrypted_output,
+            )?;
+            Ok(opt.map(|d| DerivedUserNoteRow {
+                amount: d.amount,
+                blinding: d.blinding,
+                expected_nullifier: d.expected_nullifier,
+            }))
+        };
+        storage.scan_commitments_for_user_notes(100, &mut derive)?;
+
+        // Spend the note via nullifier.
+        let leaf_index: u32 = 3;
+        let mut path_indices_le = [0u8; 32];
+        path_indices_le[..8].copy_from_slice(&(u64::from(leaf_index)).to_le_bytes());
+        let signature = crypto::compute_signature(
+            &note_keypair.private.0,
+            &commitment.to_le_bytes(),
+            &path_indices_le,
+        )?;
+        let nullifier_le =
+            crypto::compute_nullifier(&commitment.to_le_bytes(), &path_indices_le, &signature)?;
+        let nullifier_le: [u8; 32] = nullifier_le.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("nullifier: expected 32 bytes, got {}", v.len())
+        })?;
+        let nullifier = Field::try_from_le_bytes(nullifier_le)?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-null")],
+            cursor: "cur2".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_nullifier_events_batch(&vec![NewNullifierEvent {
+            id: "evt-null".to_string(),
+            nullifier,
+            gvk_ciphertext: None,
+        }])?;
+        storage.reconcile_nullifiers(100)?;
+
+        // The unspent-only lookup rejects it, but the spent-tolerant lookup
+        // returns it.
+        assert!(
+            storage
+                .get_unspent_user_note_by_commitment("CPOOL", "GTESTACCOUNT", "tests", &commitment)?
+                .is_none(),
+            "sanity: note is spent"
+        );
+
+        let result =
+            storage.get_user_note_by_commitment("CPOOL", "GTESTACCOUNT", "tests", &commitment)?;
+        assert!(result.is_some(), "spent note should still be returned");
+        let (got_amount, got_blinding, got_leaf_index) = result.expect("just checked is_some");
+        assert_eq!(got_amount, amount);
+        assert_eq!(got_blinding, blinding);
+        assert_eq!(got_leaf_index, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_pool_commitment_leaves_ordered_returns_ordered_leaves() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let leaf0 = Field::try_from_le_bytes([0u8; 32])?;
+        let leaf1 = Field::try_from_le_bytes([1u8; 32])?;
+        let leaf2 = Field::try_from_le_bytes([2u8; 32])?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![
+                dummy_event("evt-0"),
+                dummy_event("evt-1"),
+                dummy_event("evt-2"),
+            ],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![
+            NewCommitmentEvent {
+                id: "evt-0".to_string(),
+                commitment: leaf0,
+                index: 0,
+                encrypted_output: vec![],
+                gvk_ciphertext: None,
+            },
+            NewCommitmentEvent {
+                id: "evt-1".to_string(),
+                commitment: leaf1,
+                index: 1,
+                encrypted_output: vec![],
+                gvk_ciphertext: None,
+            },
+            NewCommitmentEvent {
+                id: "evt-2".to_string(),
+                commitment: leaf2,
+                index: 2,
+                encrypted_output: vec![],
+                gvk_ciphertext: None,
+            },
+        ])?;
+
+        let leaves = storage.get_pool_commitment_leaves_ordered("CPOOL")?;
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(leaves[0], leaf0);
+        assert_eq!(leaves[1], leaf1);
+        assert_eq!(leaves[2], leaf2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_pool_commitment_leaves_ordered_detects_gaps() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+
+        let leaf0 = Field::try_from_le_bytes([0u8; 32])?;
+        let leaf2 = Field::try_from_le_bytes([2u8; 32])?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-0"), dummy_event("evt-2")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![
+            NewCommitmentEvent {
+                id: "evt-0".to_string(),
+                commitment: leaf0,
+                index: 0,
+                encrypted_output: vec![],
+                gvk_ciphertext: None,
+            },
+            NewCommitmentEvent {
+                id: "evt-2".to_string(),
+                commitment: leaf2,
+                index: 2,
+                encrypted_output: vec![],
+                gvk_ciphertext: None,
+            },
+        ])?;
+
+        let err = storage
+            .get_pool_commitment_leaves_ordered("CPOOL")
+            .expect_err("gap should error");
+        assert!(err.to_string().contains("gap/out-of-order"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_leaves_keep_a_repeated_commitment() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+        let c = Field::try_from_le_bytes([1u8; 32])?;
+        let d = Field::try_from_le_bytes([2u8; 32])?;
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![
+                dummy_event("evt-0"),
+                dummy_event("evt-1"),
+                dummy_event("evt-2"),
+            ],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![
+            commitment_event("evt-0", c, 0),
+            commitment_event("evt-1", c, 1),
+            commitment_event("evt-2", d, 2),
+        ])?;
+
+        assert_eq!(
+            storage.get_pool_commitment_leaves_ordered("CPOOL")?,
+            [c, c, d]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resaving_a_commitment_event_changes_nothing() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+        let first = commitment_event("evt-0", Field::try_from_le_bytes([1u8; 32])?, 0);
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-0"), dummy_event("evt-1")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![
+            first.clone(),
+            commitment_event("evt-1", Field::try_from_le_bytes([2u8; 32])?, 1),
+        ])?;
+        storage.save_commitment_events_batch(&vec![first])?;
+
+        let rows: Vec<(i64, i64)> = storage
+            .conn
+            .prepare("SELECT id, leaf_index FROM pool_commitments ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(rows, [(1, 0), (2, 1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn nullifier_repeated_across_pools_keeps_both_rows() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+        let n = Field::try_from_le_bytes([1u8; 32])?;
+        let spent = |id: &str| NewNullifierEvent {
+            id: id.to_string(),
+            nullifier: n,
+            gvk_ciphertext: None,
+        };
+
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![
+                dummy_event("evt-0"),
+                ContractEvent {
+                    contract_id: "CPOOL2".to_string(),
+                    ..dummy_event("evt-1")
+                },
+            ],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_nullifier_events_batch(&vec![spent("evt-0"), spent("evt-1")])?;
+        storage.save_nullifier_events_batch(&vec![spent("evt-0")])?;
+
+        assert!(storage.get_unprocessed_events(10)?.is_empty());
+        let rows: Vec<(i64, String)> = storage
+            .conn
+            .prepare("SELECT id, event_id FROM pool_nullifiers ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(rows, [(1, "evt-0".to_string()), (2, "evt-1".to_string())]);
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_repeated_commitment_heals_after_migration() -> Result<()> {
+        let c = Field(crate::types::U256::from(1));
+        let d = Field(crate::types::U256::from(2));
+        let mut conn = Connection::open_in_memory()?;
+        MIGRATIONS.to_version(&mut conn, 5)?;
+        let mut v5 = Storage { conn };
+        v5.save_events_batch(&ContractsEventData {
+            events: vec![
+                test_events::commitment_event("evt-0", 1, test_events::commitment_entries(0)?)?,
+                test_events::commitment_event("evt-1", 1, test_events::commitment_entries(1)?)?,
+                test_events::commitment_event("evt-2", 2, test_events::commitment_entries(2)?)?,
+                dummy_event("evt-3"),
+            ],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        // The unique constraint dropped `evt-1`, which repeats `c`, and the
+        // processor marked it anyway. The rows carry ids 7, 3, and 5, so a
+        // rebuild that renumbers them breaks the spent note's links to `evt-2`
+        // and `evt-3`.
+        v5.conn.execute(
+            "INSERT INTO pool_commitments
+                (id, commitment, leaf_index, encrypted_output, event_id, gvk_ciphertext)
+             VALUES (7, ?1, 0, x'', 'evt-0', NULL), (3, ?2, 2, x'', 'evt-2', 'ct')",
+            params![c, d],
+        )?;
+        v5.conn.execute_batch(
+            "INSERT INTO pool_nullifiers (id, nullifier, event_id, gvk_ciphertext)
+                 VALUES (5, zeroblob(32), 'evt-3', 'nct');
+             INSERT INTO accounts (id, address, kdf_domain) VALUES (1, 'GUSER', 'tests');",
+        )?;
+        v5.conn.execute(
+            "INSERT INTO user_notes (
+                id, account_id, commitment_id, nullifier_id, expected_nullifier, blinding, amount
+             ) VALUES (?1, 1, 3, 5, zeroblob(32), zeroblob(32), '1')",
+            params![d],
+        )?;
+        v5.save_processed_event_ids(&["evt-0", "evt-1", "evt-2", "evt-3"].map(String::from))?;
+
+        let mut storage = Storage::connect_with_connection(v5.conn)?;
+        let commitments: Vec<(i64, i64, Option<String>)> = storage
+            .conn
+            .prepare("SELECT id, leaf_index, gvk_ciphertext FROM pool_commitments ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(commitments, [(3, 2, Some("ct".to_string())), (7, 0, None)]);
+        let nullifier: (i64, Option<String>) = storage.conn.query_row(
+            "SELECT id, gvk_ciphertext FROM pool_nullifiers",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(nullifier, (5, Some("nct".to_string())));
+        let note = storage.get_user_note_by_commitment("CPOOL", "GUSER", "tests", &d)?;
+        assert_eq!(note.map(|(_, _, leaf_index)| leaf_index), Some(2));
+
+        crate::state::processor::process_events(&mut storage, 10)?;
+        assert!(storage.get_unprocessed_events(10)?.is_empty());
+        assert_eq!(
+            storage.get_pool_commitment_leaves_ordered("CPOOL")?,
+            [c, c, d]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_repeated_nullifier_heals_after_migration() -> Result<()> {
+        let n = Field(crate::types::U256::from(5));
+        let d = Field(crate::types::U256::from(2));
+        let in_pool2 = |event: ContractEvent| ContractEvent {
+            contract_id: "CPOOL2".to_string(),
+            ..event
+        };
+        let spent = |id| {
+            test_events::raw_event(
+                id,
+                &[
+                    test_events::symbol("new_nullifier_event")?,
+                    test_events::u256(5),
+                ],
+                vec![],
+            )
+        };
+        let mut conn = Connection::open_in_memory()?;
+        MIGRATIONS.to_version(&mut conn, 5)?;
+        let mut v5 = Storage { conn };
+        v5.save_events_batch(&ContractsEventData {
+            events: vec![
+                spent("evt-0")?,
+                in_pool2(spent("evt-1")?),
+                in_pool2(test_events::commitment_event(
+                    "evt-2",
+                    2,
+                    test_events::commitment_entries(0)?,
+                )?),
+            ],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+        // The unique key dropped `evt-1`, which repeats `n` in a second pool,
+        // and the processor marked it anyway.
+        v5.conn.execute(
+            "INSERT INTO pool_nullifiers (id, nullifier, event_id, gvk_ciphertext)
+             VALUES (1, ?1, 'evt-0', NULL)",
+            params![n],
+        )?;
+        v5.conn.execute(
+            "INSERT INTO pool_commitments
+                (id, commitment, leaf_index, encrypted_output, event_id, gvk_ciphertext)
+             VALUES (1, ?1, 0, x'', 'evt-2', NULL)",
+            params![d],
+        )?;
+        v5.conn.execute(
+            "INSERT INTO accounts (id, address, kdf_domain) VALUES (1, 'GUSER', 'tests')",
+            [],
+        )?;
+        v5.conn.execute(
+            "INSERT INTO user_notes (
+                id, account_id, commitment_id, nullifier_id, expected_nullifier, blinding, amount
+             ) VALUES (?1, 1, 1, NULL, ?2, zeroblob(32), '1')",
+            params![d, n],
+        )?;
+        v5.save_processed_event_ids(&["evt-0", "evt-1", "evt-2"].map(String::from))?;
+
+        let mut storage = Storage::connect_with_connection(v5.conn)?;
+        crate::state::processor::process_events(&mut storage, 10)?;
+        storage.reconcile_nullifiers(10)?;
+
+        let rows: Vec<(i64, String)> = storage
+            .conn
+            .prepare("SELECT id, event_id FROM pool_nullifiers ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(rows, [(1, "evt-0".to_string()), (2, "evt-1".to_string())]);
+        let spent_by: Option<i64> =
+            storage
+                .conn
+                .query_row("SELECT nullifier_id FROM user_notes", [], |row| row.get(0))?;
+        assert_eq!(spent_by, Some(2));
+        Ok(())
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn gvk_ciphertext_persists_and_audits() -> Result<()> {
+        use crate::{
+            types::BabyJubJubPoint,
+            zk::gvk::{GvkNote, generate_gvk_nonce},
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "spp-gvk-storage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut storage = crate::state::test_storage(&path)?;
+        let d_priv = Field(crate::types::U256::from(0xAD00));
+        let admin = BabyJubJubPoint::from_priv_scalar(&d_priv).expect("valid admin key");
+        let note = GvkNote::new(
+            Field(crate::types::U256::from(0xBEEF)),
+            NoteAmount::from(99u128),
+            Field(crate::types::U256::from(0x1234)),
+            Field(crate::types::U256::from(5)),
+        );
+        let ct = note.encrypt(&admin, &generate_gvk_nonce()?, 0)?;
+
+        let commitment_le = crypto::compute_commitment(
+            &note.amount.to_le_bytes(),
+            &note.pk.to_le_bytes(),
+            &note.blinding.to_le_bytes(),
+        )?;
+        let commitment = Field::try_from_le_bytes(
+            commitment_le
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("commitment hash is not 32 bytes"))?,
+        )?;
+
+        let event_id = "0000000000000000004-0000000000";
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event(event_id)],
+            cursor: "cur-gvk".to_string(),
+            latest_ledger: 1,
+        })?;
+        storage.save_commitment_events_batch(&vec![NewCommitmentEvent {
+            id: event_id.to_string(),
+            commitment,
+            index: 0,
+            encrypted_output: vec![],
+            gvk_ciphertext: Some(ct.clone()),
+        }])?;
+
+        storage.conn.execute(
+            "INSERT INTO accounts (address, kdf_domain) VALUES (?1, 'tests')",
+            params!["GUSER"],
+        )?;
+        let account_id: i64 = storage.conn.query_row(
+            "SELECT id FROM accounts WHERE address = ?1",
+            params!["GUSER"],
+            |row| row.get(0),
+        )?;
+        let commitment_id: i64 = storage.conn.query_row(
+            "SELECT id FROM pool_commitments WHERE commitment = ?1",
+            params![commitment],
+            |row| row.get(0),
+        )?;
+        storage.conn.execute(
+            "INSERT INTO user_notes (
+                id, account_id, commitment_id, nullifier_id,
+                expected_nullifier, blinding, amount
+             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+            params![
+                commitment,
+                account_id,
+                commitment_id,
+                Field(crate::types::U256::from(1)),
+                Field(crate::types::U256::from(2)),
+                NoteAmount::from(99u128).to_string(),
+            ],
+        )?;
+        let notes = storage.list_pool_user_notes("CPOOL", "GUSER", "tests")?;
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].gvk_ciphertext.as_ref(), Some(&ct));
+
+        drop(storage);
+
+        let rows = crate::state::test_storage(&path)?.list_pool_gvk_events("CPOOL", None, 10)?;
+        assert_eq!(rows.len(), 1);
+
+        let local = crate::state::test_local_storage(path.to_str().expect("temp path utf-8"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut audit =
+            crate::gvk::GvkAudit::new(crate::StorageHandle::from(local), "CPOOL", d_priv);
+        let tx = audit.next_tx().await?.expect("one tx");
+        assert_eq!(tx.outputs.len(), 1);
+        assert_eq!(tx.outputs[0].commitment, commitment);
+        let output = tx.outputs[0].note.as_ref().expect("recovered output note");
+        assert_eq!(output.note.amount()?, NoteAmount::from(99u128));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn processed_event_ids_are_not_returned_as_unprocessed() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+        storage.save_events_batch(&ContractsEventData {
+            events: vec![dummy_event("evt-marked"), dummy_event("evt-other")],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        })?;
+
+        storage.save_processed_event_ids(&["evt-marked".to_string()])?;
+
+        let ids: Vec<String> = storage
+            .get_unprocessed_events(10)?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, vec!["evt-other".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn opening_a_v3_database_applies_the_processed_events_migration() -> Result<()> {
+        let mut conn = Connection::open_in_memory()?;
+        MIGRATIONS.to_version(&mut conn, 3)?;
+        assert!(
+            !table_exists(&conn, "processed_events")?,
+            "v3 must predate the table"
+        );
+
+        let storage = Storage::connect_with_connection(conn)?;
+
+        assert!(table_exists(&storage.conn, "processed_events")?);
+        Ok(())
+    }
+
+    fn two_allowlist_events() -> ContractsEventData {
+        ContractsEventData {
+            events: vec![
+                ContractEvent {
+                    contract_id: "CASP1".to_string(),
+                    ..dummy_event("evt-a")
+                },
+                ContractEvent {
+                    contract_id: "CASP2".to_string(),
+                    ..dummy_event("evt-b")
+                },
+            ],
+            cursor: "cur".to_string(),
+            latest_ledger: 1,
+        }
+    }
+
+    #[test]
+    fn two_allowlists_keep_their_own_leaf_zero() -> Result<()> {
+        let mut storage = Storage::connect_in_memory()?;
+        let leaf_a = Field::try_from_le_bytes([1u8; 32])?;
+        let leaf_b = Field::try_from_le_bytes([2u8; 32])?;
+        storage.save_events_batch(&two_allowlist_events())?;
+
+        storage.save_leaf_added_events_batch(&vec![
+            LeafAddedEvent {
+                id: "evt-a".to_string(),
+                leaf: leaf_a,
+                index: 0,
+                root: leaf_a,
+            },
+            LeafAddedEvent {
+                id: "evt-b".to_string(),
+                leaf: leaf_b,
+                index: 0,
+                root: leaf_b,
+            },
+        ])?;
+
+        assert_eq!(
+            storage.get_all_asp_membership_leaves_ordered("CASP1")?,
+            vec![leaf_a]
+        );
+        assert_eq!(
+            storage.get_all_asp_membership_leaves_ordered("CASP2")?,
+            vec![leaf_b]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn opening_a_v4_database_files_leaves_under_their_tree() -> Result<()> {
+        let mut conn = Connection::open_in_memory()?;
+        MIGRATIONS.to_version(&mut conn, 4)?;
+        let mut v4 = Storage { conn };
+        v4.save_events_batch(&two_allowlist_events())?;
+        v4.conn.execute(
+            "INSERT INTO asp_membership_leaves (leaf_index, leaf, root, event_id)
+                VALUES (0, ?1, ?1, 'evt-a'), (1, ?2, ?2, 'evt-b')",
+            params![
+                Field::try_from_le_bytes([1u8; 32])?,
+                Field::try_from_le_bytes([2u8; 32])?
+            ],
+        )?;
+
+        let storage = Storage::connect_with_connection(v4.conn)?;
+
+        let rows = storage
+            .conn
+            .prepare(
+                "SELECT c.address, l.leaf_index
+                 FROM asp_membership_leaves l
+                 JOIN contracts c ON c.contract_id = l.contract_id
+                 ORDER BY l.leaf_index",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<(String, u32)>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![("CASP1".to_string(), 0), ("CASP2".to_string(), 1)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_leaf_dropped_before_the_migration_is_replayed() -> Result<()> {
+        let mut conn = Connection::open_in_memory()?;
+        MIGRATIONS.to_version(&mut conn, 4)?;
+        let mut v4 = Storage { conn };
+        v4.save_events_batch(&two_allowlist_events())?;
+        v4.conn.execute(
+            "INSERT INTO asp_membership_leaves (leaf_index, leaf, root, event_id)
+                VALUES (0, ?1, ?1, 'evt-a'), (0, ?2, ?2, 'evt-b')
+                ON CONFLICT(leaf_index) DO NOTHING",
+            params![
+                Field::try_from_le_bytes([1u8; 32])?,
+                Field::try_from_le_bytes([2u8; 32])?
+            ],
+        )?;
+        v4.save_processed_event_ids(&["evt-a".to_string(), "evt-b".to_string()])?;
+
+        let storage = Storage::connect_with_connection(v4.conn)?;
+
+        let ids: Vec<String> = storage
+            .get_unprocessed_events(10)?
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, vec!["evt-b".to_string()]);
+        Ok(())
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+}

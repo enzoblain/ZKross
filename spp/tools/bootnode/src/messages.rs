@@ -1,0 +1,341 @@
+use serde::{Deserialize, Deserializer, Serialize};
+use stellar_private_payments::chain::MAX_CONTRACT_IDS_PER_FILTER;
+
+pub type SegmentFilter = String;
+pub type TopicFilter = Vec<SegmentFilter>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetEventsParams {
+    #[serde(default)]
+    pub filters: Vec<ContractEventFilter>,
+    #[serde(default)]
+    pub pagination: PaginationParams,
+    #[serde(rename = "startLedger", default)]
+    pub start_ledger: Option<u32>,
+    #[serde(rename = "endLedger", default)]
+    pub end_ledger: Option<u32>,
+    #[serde(rename = "xdrFormat", default)]
+    pub xdr_format: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractEventFilter {
+    #[serde(rename = "type")]
+    pub filter_type: String,
+    pub topics: Vec<TopicFilter>,
+    #[serde(rename = "contractIds")]
+    pub contract_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaginationParams {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedGetEvents {
+    pub start_ledger: Option<u32>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+pub struct GetLatestLedgerResponse {
+    pub id: String,
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: u32,
+    pub sequence: u32,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+pub struct GetEventsResponse {
+    #[serde(deserialize_with = "deserialize_default_from_null")]
+    pub events: Vec<Event>,
+    #[serde(rename = "latestLedger")]
+    pub latest_ledger: u32,
+    #[serde(rename = "latestLedgerCloseTime")]
+    pub latest_ledger_close_time: String,
+    #[serde(rename = "oldestLedger")]
+    pub oldest_ledger: u32,
+    #[serde(rename = "oldestLedgerCloseTime")]
+    pub oldest_ledger_close_time: String,
+    pub cursor: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+pub struct Event {
+    #[serde(rename = "type")]
+    pub event_type: String,
+
+    pub ledger: u32,
+    #[serde(rename = "ledgerClosedAt")]
+    pub ledger_closed_at: String,
+    #[serde(rename = "contractId")]
+    pub contract_id: String,
+
+    pub id: String,
+
+    #[serde(
+        rename = "operationIndex",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub operation_index: Option<u32>,
+    #[serde(
+        rename = "transactionIndex",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transaction_index: Option<u32>,
+    #[serde(rename = "txHash", default, skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(
+        rename = "inSuccessfulContractCall",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub is_successful_contract_call: Option<bool>,
+
+    pub topic: Vec<String>,
+    pub value: String,
+}
+
+fn deserialize_default_from_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let opt = Option::<T>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+impl GetEventsParams {
+    pub fn parsed(&self) -> anyhow::Result<ParsedGetEvents> {
+        match (self.start_ledger, self.pagination.cursor.as_deref()) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "getEvents params must include either startLedger or pagination.cursor, not both"
+            ),
+            (None, None) => anyhow::bail!(
+                "getEvents params must include either startLedger or pagination.cursor"
+            ),
+            _ => Ok(ParsedGetEvents {
+                start_ledger: self.start_ledger,
+                cursor: self.pagination.cursor.clone(),
+                limit: self.pagination.limit,
+            }),
+        }
+    }
+
+    /// Returns the contract IDs the filters name.
+    pub fn contract_ids(&self) -> impl Iterator<Item = &String> {
+        self.filters.iter().flat_map(|filter| &filter.contract_ids)
+    }
+
+    /// Reports whether every filter asks for all events of a non-empty contract
+    /// list.
+    pub fn is_contract_filter(&self) -> bool {
+        !self.filters.is_empty()
+            && self.filters.iter().all(|filter| {
+                filter.filter_type == "contract"
+                    && filter.topics == [vec!["**".to_string()]]
+                    && !filter.contract_ids.is_empty()
+            })
+    }
+
+    pub fn is_allowed_filters(&self, allowed_contract_ids: &[String]) -> bool {
+        // RPC filters are OR-ed, so every filter is checked. A client built
+        // from an older manifest asks for a subset of the archived
+        // contracts.
+        self.is_contract_filter()
+            && self
+                .contract_ids()
+                .all(|id| allowed_contract_ids.contains(id))
+    }
+
+    pub fn for_contracts(
+        contract_ids: &[String],
+        start_ledger: Option<u32>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Self {
+        Self {
+            filters: contract_ids
+                .chunks(MAX_CONTRACT_IDS_PER_FILTER)
+                .map(|chunk| ContractEventFilter {
+                    filter_type: "contract".to_string(),
+                    topics: vec![vec!["**".to_string()]],
+                    contract_ids: chunk.to_vec(),
+                })
+                .collect(),
+            pagination: PaginationParams {
+                limit,
+                cursor: cursor.map(str::to_owned),
+            },
+            start_ledger,
+            end_ledger: None,
+            xdr_format: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn for_contracts_shape() {
+        let ids = vec!["CABC".to_string(), "CDEF".to_string()];
+        let params = GetEventsParams::for_contracts(&ids, Some(100), Some("cursor-1"), Some(1000));
+
+        assert_eq!(params.start_ledger, Some(100));
+        assert_eq!(params.pagination.limit, Some(1000));
+        assert_eq!(params.pagination.cursor.as_deref(), Some("cursor-1"));
+        assert_eq!(params.filters[0].filter_type, "contract");
+        assert_eq!(params.filters[0].topics, vec![vec!["**".to_string()]]);
+        assert_eq!(params.filters[0].contract_ids, ids);
+    }
+
+    #[test]
+    fn for_contracts_serializes_roundtrip() {
+        let params = GetEventsParams::for_contracts(&["CA".to_string()], Some(1), None, Some(10));
+        let value = serde_json::to_value(params).expect("params should serialize");
+        let roundtrip: GetEventsParams =
+            serde_json::from_value(value).expect("params should deserialize");
+        assert_eq!(roundtrip.start_ledger, Some(1));
+    }
+
+    #[test]
+    fn parsed_start_ledger() {
+        let params: GetEventsParams =
+            serde_json::from_value(json!({"startLedger": 42, "pagination": {"limit": 100}}))
+                .expect("params should deserialize");
+        let parsed = params.parsed().expect("startLedger params should parse");
+        assert_eq!(parsed.start_ledger, Some(42));
+        assert!(parsed.cursor.is_none());
+        assert_eq!(parsed.limit, Some(100));
+    }
+
+    #[test]
+    fn parsed_cursor() {
+        let params: GetEventsParams =
+            serde_json::from_value(json!({"pagination": {"cursor": "abc", "limit": 50}}))
+                .expect("params should deserialize");
+        let parsed = params.parsed().expect("cursor params should parse");
+        assert!(parsed.start_ledger.is_none());
+        assert_eq!(parsed.cursor.as_deref(), Some("abc"));
+        assert_eq!(parsed.limit, Some(50));
+    }
+
+    #[test]
+    fn parsed_rejects_ambiguous_params() {
+        let both: GetEventsParams =
+            serde_json::from_value(json!({"startLedger": 1, "pagination": {"cursor": "x"}}))
+                .expect("params should deserialize");
+        assert!(both.parsed().is_err());
+
+        let neither: GetEventsParams = serde_json::from_value(json!({"pagination": {"limit": 10}}))
+            .expect("params should deserialize");
+        assert!(neither.parsed().is_err());
+    }
+
+    fn sample_filters(ids: &[&str]) -> GetEventsParams {
+        serde_json::from_value(json!({
+            "filters": [{
+                "type": "contract",
+                "topics": [["**"]],
+                "contractIds": ids
+            }]
+        }))
+        .expect("filters should deserialize")
+    }
+
+    fn six_contract_ids() -> Vec<String> {
+        (0..6).map(|i| format!("C{i}")).collect()
+    }
+
+    #[test]
+    fn is_allowed_filters_match_exact_contract_set() {
+        let allowed = vec!["CB".to_string(), "CA".to_string()];
+        let params = sample_filters(&["CA", "CB"]);
+        assert!(params.is_allowed_filters(&allowed));
+    }
+
+    #[test]
+    fn is_allowed_filters_reject_wrong_contract_ids_or_topics() {
+        let allowed = vec!["CA".to_string()];
+        assert!(!sample_filters(&["CA", "CB"]).is_allowed_filters(&allowed));
+        let params: GetEventsParams = serde_json::from_value(json!({
+            "filters": [{"type": "contract", "topics": [["deposit"]], "contractIds": ["CA"]}]
+        }))
+        .expect("params should deserialize");
+        assert!(!params.is_allowed_filters(&allowed));
+    }
+
+    #[test]
+    fn grouped_filters_cover_only_the_archived_contracts() {
+        let ids = six_contract_ids();
+        let params = GetEventsParams::for_contracts(&ids, Some(1), None, Some(10));
+        assert_eq!(params.filters.len(), 2);
+        assert_eq!(params.filters[0].contract_ids.len(), 5);
+        assert!(params.is_allowed_filters(&ids));
+        for change in 0..3 {
+            let mut invalid = params.clone();
+            match change {
+                0 => invalid.filters[1].topics = vec![vec!["deposit".into()]],
+                1 => invalid.filters[1].filter_type = "system".into(),
+                _ => invalid.filters[1].contract_ids = vec!["UNARCHIVED".into()],
+            }
+            assert!(!invalid.is_allowed_filters(&ids));
+        }
+        // An otherwise valid first filter must not hide additional filters.
+        let mut extra = params.clone();
+        let mut forbidden = params.filters[1].clone();
+        forbidden.contract_ids = vec!["UNARCHIVED".into()];
+        extra.filters.push(forbidden);
+        assert!(!extra.is_allowed_filters(&ids));
+    }
+
+    #[test]
+    fn a_subset_of_the_contract_set_is_allowed() {
+        let ids = six_contract_ids();
+        let params = GetEventsParams::for_contracts(&ids[1..], Some(1), None, None);
+        assert!(params.is_allowed_filters(&ids));
+    }
+
+    #[test]
+    fn an_id_outside_the_contract_set_is_refused() {
+        let ids = six_contract_ids();
+        let mut params = GetEventsParams::for_contracts(&ids, Some(1), None, None);
+        params.filters[1].contract_ids.push("CX".to_string());
+        assert!(!params.is_allowed_filters(&ids));
+
+        // The RPC reads a filter with no contract IDs as every contract.
+        params.filters[1].contract_ids.clear();
+        assert!(!params.is_allowed_filters(&ids));
+
+        // It reads a request with no filters as every contract's events too.
+        params.filters.clear();
+        assert!(!params.is_allowed_filters(&ids));
+    }
+
+    #[test]
+    fn get_events_response_deserializes_null_events() {
+        let response: GetEventsResponse = serde_json::from_value(json!({
+            "events": null,
+            "latestLedger": 10,
+            "latestLedgerCloseTime": "t",
+            "oldestLedger": 1,
+            "oldestLedgerCloseTime": "t",
+            "cursor": "c",
+        }))
+        .expect("response should deserialize");
+        assert!(response.events.is_empty());
+    }
+}
