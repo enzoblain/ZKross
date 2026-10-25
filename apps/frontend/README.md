@@ -6,10 +6,12 @@ Ethereum Sepolia → Stellar Testnet bridge.
 ## Experience
 
 - Public product site with an implementation-aware privacy and compliance narrative
-- Focused bridge flow with MetaMask and Freighter demo connection states
+- Focused bridge flow with injected MetaMask and Freighter wallet connections
+- Liquidity-providing workspace with a balanced allocation intent and local positions draft
 - Review dialog and explicitly simulated proof/bridge progress
 - Privacy-first activity screen with loading, empty, table, mobile list, search, and detail states
 - Separate institutional interface demo for registry, disclosure, and audit-log concepts
+- Regulated admin prototype with role separation and transaction-scoped decryption grants
 - Dark and light themes, keyboard focus states, responsive layouts, and reduced-motion support
 
 ## Stack and UI sources
@@ -19,6 +21,7 @@ Ethereum Sepolia → Stellar Testnet bridge.
 - shadcn/ui-style components backed by Radix UI for buttons, dialog, and switch primitives
 - Lucide icons
 - Motion and one restrained Aceternity-inspired spotlight treatment
+- MetaMask EIP-1193 provider and the pinned official Freighter API browser bundle
 
 No paid template or runtime UI package was added. The layout and visual identity
 are original to Zkross.
@@ -45,19 +48,29 @@ npm run lint --workspace=apps/frontend
 
 The frontend uses src/lib/mock-bridge.ts.
 
+Implemented wallet boundary:
+
+- MetaMask account request through the injected EIP-1193 provider
+- Automatic request to switch or add Ethereum Sepolia
+- Freighter extension detection, account authorization, and Stellar Testnet validation
+- Shared wallet state across Bridge and Liquidity pages
+
+Wallet signing and blockchain actions are not implemented.
+
 Not connected or implemented:
 
-- MetaMask, Freighter, wagmi, viem, or Stellar SDK wallet sessions
 - Ethereum or Stellar transaction submission
 - Bridge contracts, relayers, quotes, balances, or settlement
+- Liquidity pool contracts, approvals, deposits, withdrawals, LP shares, or yield
 - ZK proof generation or verification
 - Confidential transaction storage, owner authorization, or decryption
 - Institutional authentication, MFA, server-side permissions, disclosure, or immutable audit logging
 
-All addresses, activity rows, institutional records, fees, and progress states
-are local fixtures and are labeled as prototype or demo data. No private key,
-seed phrase, secret, signature, transaction, proof, or asset is requested or
-created.
+Wallet addresses are read from the user's approved browser extensions. Activity
+rows, institutional records, liquidity data, fees, progress states, permissions,
+and decrypted-field examples are local fixtures and are labeled as prototype or
+demo data. No private key, seed phrase, secret, signature, transaction, proof,
+decryption key, or asset is requested or created.
 
 Privacy claims must remain aligned with implemented and independently audited
 circuit behavior when production adapters are introduced. Zero-knowledge proofs

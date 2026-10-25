@@ -1,10 +1,20 @@
-import { Activity, ArrowLeftRight, Building2, Moon, Sun, WalletCards } from 'lucide-react'
+import {
+  Activity,
+  ArrowLeftRight,
+  Building2,
+  Droplets,
+  Moon,
+  ShieldCheck,
+  Sun,
+  WalletCards,
+} from 'lucide-react'
 import type { ReactNode } from 'react'
 
 import type { PageId, Theme } from '../App'
 import { cn } from '../lib/utils'
 import { BrandMark } from './brand-mark'
 import { Button } from './ui/button'
+import { useWallets } from './wallet-context'
 
 type AppShellProps = {
   activePage: PageId
@@ -16,8 +26,10 @@ type AppShellProps = {
 
 const appNavigation = [
   { id: 'bridge', label: 'Bridge', icon: ArrowLeftRight },
+  { id: 'liquidity', label: 'Liquidity', icon: Droplets },
   { id: 'activity', label: 'Activity', icon: Activity },
   { id: 'institutional', label: 'Institutions', icon: Building2 },
+  { id: 'admin', label: 'Admin', icon: ShieldCheck },
 ] satisfies Array<{
   id: Exclude<PageId, 'landing'>
   label: string
@@ -51,6 +63,8 @@ function AppShell({
   children,
 }: AppShellProps) {
   const isLanding = activePage === 'landing'
+  const { wallets } = useWallets()
+  const walletCount = Object.keys(wallets).length
 
   const scrollToSection = (id: string) => {
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -127,7 +141,7 @@ function AppShell({
                 className="hidden sm:inline-flex"
               >
                 <WalletCards aria-hidden="true" />
-                Wallets · mock
+                Wallets · {walletCount}/2
               </Button>
             )}
           </div>

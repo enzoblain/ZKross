@@ -19,6 +19,7 @@ import { useEffect, useMemo, useState } from 'react'
 
 import { Spotlight } from '../components/aceternity/spotlight'
 import { Button } from '../components/ui/button'
+import { useWallets } from '../components/wallet-context'
 import {
   Dialog,
   DialogClose,
@@ -32,16 +33,15 @@ import {
   networkMeta,
   type NetworkId,
   type TransferProgressStep,
-  type WalletConnection,
 } from '../lib/mock-bridge'
 import { cn } from '../lib/utils'
+import { truncateAddress } from '../lib/wallet-adapters'
 
 const compactNumber = new Intl.NumberFormat('en-US', {
   minimumFractionDigits: 2,
   maximumFractionDigits: 2,
 })
 
-type Wallets = Partial<Record<NetworkId, WalletConnection>>
 type RunStatus = 'idle' | 'running' | 'complete'
 
 function NetworkMark({ network }: { network: NetworkId }) {
@@ -63,11 +63,9 @@ function NetworkMark({ network }: { network: NetworkId }) {
 function BridgePage() {
   const from: NetworkId = 'ethereum'
   const to: NetworkId = 'stellar'
+  const { wallets, connecting, errors, connectWallet, disconnectWallet } = useWallets()
   const [amount, setAmount] = useState('250')
   const [recipient, setRecipient] = useState('')
-  const [wallets, setWallets] = useState<Wallets>({})
-  const [connecting, setConnecting] = useState<NetworkId | null>(null)
-  const [walletError, setWalletError] = useState('')
   const [reviewOpen, setReviewOpen] = useState(false)
   const [runStatus, setRunStatus] = useState<RunStatus>('idle')
   const [progress, setProgress] = useState<TransferProgressStep[]>(() =>
@@ -115,21 +113,6 @@ function BridgePage() {
     return () => window.clearInterval(interval)
   }, [runStatus, progress.length])
 
-  const connectWallet = async (network: NetworkId) => {
-    if (wallets[network] || connecting) return
-    setWalletError('')
-    setConnecting(network)
-
-    try {
-      const wallet = await mockBridgeAdapter.connectWallet(network)
-      setWallets((current) => ({ ...current, [network]: wallet }))
-    } catch {
-      setWalletError('Could not create the ' + networkMeta[network].wallet + ' demo connection.')
-    } finally {
-      setConnecting(null)
-    }
-  }
-
   const beginSimulation = () => {
     setProgress(
       mockBridgeAdapter.createProgress().map((step, index) => ({
@@ -158,8 +141,8 @@ function BridgePage() {
           One transfer. Clear boundaries.
         </h1>
         <p className="mx-auto mt-5 max-w-xl text-sm leading-6 text-muted">
-          Explore the intended private bridge workflow on test networks. This prototype
-          does not connect wallets, generate proofs, or move assets.
+          Connect MetaMask and Freighter on test networks, then explore the intended
+          bridge workflow. Proof generation and asset movement are not connected.
         </p>
       </div>
 
@@ -185,7 +168,7 @@ function BridgePage() {
             <div>
               <div className="mb-3 flex items-center justify-between">
                 <span className="text-xs font-medium text-muted">Wallet connections</span>
-                <span className="text-[10px] text-subtle">Demo addresses only</span>
+                <span className="text-[10px] text-subtle">Injected extensions · public addresses only</span>
               </div>
               <div className="grid gap-2 sm:grid-cols-2">
                 {(['ethereum', 'stellar'] as NetworkId[]).map((network) => {
@@ -196,8 +179,12 @@ function BridgePage() {
                     <button
                       key={network}
                       type="button"
-                      onClick={() => void connectWallet(network)}
-                      disabled={Boolean(connection) || Boolean(connecting)}
+                      onClick={() =>
+                        connection
+                          ? disconnectWallet(network)
+                          : void connectWallet(network)
+                      }
+                      disabled={Boolean(connecting)}
                       className="focus-ring flex min-h-17 items-center gap-3 rounded-2xl border border-border bg-background/55 px-3.5 text-left transition-colors hover:border-border-strong disabled:cursor-default disabled:opacity-100"
                     >
                       <NetworkMark network={network} />
@@ -206,8 +193,11 @@ function BridgePage() {
                           {networkMeta[network].wallet} · {networkMeta[network].name}
                         </span>
                         <span className="mt-1 block truncate text-xs font-medium text-foreground">
-                          {connection?.address ??
-                            (isConnecting ? 'Creating demo…' : 'Connect demo wallet')}
+                          {connection
+                            ? truncateAddress(connection.address)
+                            : isConnecting
+                              ? 'Waiting for wallet…'
+                              : 'Connect wallet'}
                         </span>
                       </span>
                       {isConnecting ? (
@@ -221,7 +211,12 @@ function BridgePage() {
                   )
                 })}
               </div>
-              {walletError && <p role="alert" className="mt-2 text-xs text-danger">{walletError}</p>}
+              {(errors.ethereum || errors.stellar) && (
+                <div role="alert" className="mt-3 space-y-1 text-xs text-danger">
+                  {errors.ethereum && <p>MetaMask: {errors.ethereum}</p>}
+                  {errors.stellar && <p>Freighter: {errors.stellar}</p>}
+                </div>
+              )}
             </div>
 
             <div className="relative space-y-2">
@@ -367,7 +362,7 @@ function BridgePage() {
 
             <Button variant="accent" size="lg" className="w-full" disabled={!canReview} onClick={() => setReviewOpen(true)}>
               <ShieldCheck aria-hidden="true" />
-              {wallets.stellar && wallets.ethereum ? 'Start test transfer' : 'Connect both demo wallets'}
+              {wallets.stellar && wallets.ethereum ? 'Start test transfer' : 'Connect both wallets'}
             </Button>
             <p className="text-center text-[10px] leading-4 text-subtle">
               Never enter a private key or seed phrase. This prototype never requests one.
@@ -470,7 +465,7 @@ function BridgePage() {
           <DialogHeader>
             <DialogTitle>Review test transfer</DialogTitle>
             <DialogDescription>
-              This starts a timed interface simulation only. No wallet prompt, signature,
+              This starts a timed interface simulation only. No additional wallet prompt, signature,
               proof, transaction, or asset movement will occur.
             </DialogDescription>
           </DialogHeader>

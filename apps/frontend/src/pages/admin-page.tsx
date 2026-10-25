@@ -1,140 +1,452 @@
 import {
-  Activity,
-  AlertTriangle,
+  ArrowRight,
   CheckCircle2,
-  Clock3,
+  Eye,
+  EyeOff,
+  FileKey2,
   KeyRound,
   LockKeyhole,
-  Radio,
   ShieldAlert,
+  ShieldCheck,
+  UserCheck,
+  UsersRound,
 } from 'lucide-react'
 import { useState } from 'react'
 
-import { Switch } from '../components/ui/switch'
+import { Button } from '../components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog'
+import { cn } from '../lib/utils'
 
-const operations = [
-  { id: 'MX-1048', route: 'Stellar → Ethereum', amount: '12,500 USDC', status: 'Attesting', age: '18s' },
-  { id: 'MX-1047', route: 'Ethereum → Stellar', amount: '8,200 USDC', status: 'Finalized', age: '2m' },
-  { id: 'MX-1046', route: 'Stellar → Ethereum', amount: '2,750 USDC', status: 'Finalized', age: '4m' },
+type AdminRole = 'platform-admin' | 'compliance' | 'auditor' | 'custodian'
+type AdminTab = 'requests' | 'roles' | 'access-log'
+
+type DecryptionRequest = {
+  id: string
+  transaction: string
+  institution: string
+  fields: string[]
+  approvals: number
+  authorization: string
+  expires: string
+}
+
+const roles: Array<{
+  id: AdminRole
+  label: string
+  canRequest: boolean
+  canApprove: boolean
+  canReveal: boolean
+}> = [
+  { id: 'platform-admin', label: 'Platform administrator', canRequest: false, canApprove: false, canReveal: false },
+  { id: 'compliance', label: 'Compliance officer', canRequest: true, canApprove: false, canReveal: false },
+  { id: 'auditor', label: 'Authorized auditor', canRequest: false, canApprove: false, canReveal: true },
+  { id: 'custodian', label: 'Key custodian', canRequest: false, canApprove: true, canReveal: false },
+]
+
+const requests: DecryptionRequest[] = [
+  {
+    id: 'DEC-DEMO-021',
+    transaction: 'ZK-DEMO-4A81',
+    institution: 'Example Financial Authority',
+    fields: ['Amount', 'Asset'],
+    approvals: 2,
+    authorization: 'MANDATE-DEMO-A42',
+    expires: 'Oct 26 · 18:00',
+  },
+  {
+    id: 'DEC-DEMO-020',
+    transaction: 'ZK-DEMO-3C20',
+    institution: 'Example Bank Audit',
+    fields: ['Verification metadata'],
+    approvals: 1,
+    authorization: 'MANDATE-DEMO-B18',
+    expires: 'Oct 27 · 09:30',
+  },
+  {
+    id: 'DEC-DEMO-019',
+    transaction: 'ZK-DEMO-19B7',
+    institution: 'Example Compliance Unit',
+    fields: ['Amount', 'Source', 'Destination'],
+    approvals: 0,
+    authorization: 'MANDATE-DEMO-C07',
+    expires: 'Oct 28 · 12:00',
+  },
+]
+
+const accessLog = [
+  {
+    actor: 'Auditor demo profile',
+    request: 'DEC-DEMO-018',
+    action: 'Viewed authorized fixture fields',
+    time: 'Oct 24 · 14:08',
+  },
+  {
+    actor: 'Custodian demo profile',
+    request: 'DEC-DEMO-020',
+    action: 'Recorded demo approval 1/2',
+    time: 'Oct 24 · 11:42',
+  },
 ]
 
 function AdminPage() {
-  const [deposits, setDeposits] = useState(true)
-  const [settlements, setSettlements] = useState(true)
-  const [relayer, setRelayer] = useState(true)
+  const [enteredDemo, setEnteredDemo] = useState(false)
+  const [role, setRole] = useState<AdminRole>('platform-admin')
+  const [tab, setTab] = useState<AdminTab>('requests')
+  const [selected, setSelected] = useState<DecryptionRequest | null>(null)
+  const [revealed, setRevealed] = useState(false)
+
+  const activeRole = roles.find((item) => item.id === role) ?? roles[0]
+  const canRevealSelected =
+    activeRole.canReveal && Boolean(selected && selected.approvals >= 2)
+
+  if (!enteredDemo) {
+    return (
+      <div className="page-enter mx-auto grid min-h-[calc(100vh-11rem)] max-w-[920px] place-items-center py-4">
+        <section className="grid overflow-hidden rounded-[2rem] border border-border bg-surface lg:grid-cols-[0.9fr_1.1fr]">
+          <div className="border-b border-border bg-background/40 p-7 lg:border-b-0 lg:border-r lg:p-10">
+            <span className="grid size-12 place-items-center rounded-2xl bg-accent text-white">
+              <ShieldCheck aria-hidden="true" className="size-5" />
+            </span>
+            <p className="mt-8 text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
+              Administration
+            </p>
+            <h1 className="mt-4 text-3xl font-medium tracking-[-0.045em]">
+              Operations without universal access.
+            </h1>
+            <p className="mt-4 text-sm leading-6 text-muted">
+              Platform administration, approval custody, and confidential disclosure are
+              separate responsibilities. No role receives every permission.
+            </p>
+          </div>
+
+          <div className="p-7 lg:p-10">
+            <p className="text-sm font-semibold">Role-gated administration</p>
+            <p className="mt-2 text-xs leading-5 text-muted">
+              Production requires institutional identity, MFA, server-side RBAC, scoped key
+              release, and an immutable audit log.
+            </p>
+            <div className="mt-7 space-y-3">
+              {[
+                'Platform admins cannot view confidential transaction fields.',
+                'Decryption is granted per transaction and per field.',
+                'Threshold approval is required before an auditor can view data.',
+                'Every access event must be written to a protected audit log.',
+              ].map((item) => (
+                <div key={item} className="flex items-start gap-3 text-xs leading-5 text-muted">
+                  <CheckCircle2 aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />
+                  {item}
+                </div>
+              ))}
+            </div>
+            <Button variant="accent" size="lg" className="mt-8 w-full" onClick={() => setEnteredDemo(true)}>
+              <KeyRound aria-hidden="true" />
+              Open RBAC interface demo
+            </Button>
+            <p className="mt-3 text-center text-[10px] text-subtle">
+              No authentication or cryptographic key is created.
+            </p>
+          </div>
+        </section>
+      </div>
+    )
+  }
 
   return (
     <div className="page-enter">
-      <div className="flex flex-col justify-between gap-6 sm:flex-row sm:items-end">
+      <div className="flex flex-col justify-between gap-6 lg:flex-row lg:items-end">
         <div className="max-w-2xl">
-          <div className="mb-4 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
-            <span className="h-px w-6 bg-accent/60" />
-            Operations
-          </div>
-          <h1 className="text-[2.4rem] font-medium leading-[1.04] tracking-[-0.055em] text-foreground sm:text-5xl">Admin control plane.</h1>
-          <p className="mt-5 max-w-xl text-sm leading-6 text-muted sm:text-[15px]">A restrained operating surface for bridge health, queues and safeguards. Controls below affect this browser demo only.</p>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-accent">
+            Regulated administration
+          </p>
+          <h1 className="mt-4 text-4xl font-medium tracking-[-0.055em] sm:text-5xl">
+            Least privilege, transaction by transaction.
+          </h1>
+          <p className="mt-5 max-w-xl text-sm leading-6 text-muted">
+            A control-plane prototype for role separation, threshold approval, and
+            field-scoped transaction disclosure.
+          </p>
         </div>
-        <div className="flex items-center gap-2 self-start rounded-full border border-success/20 bg-success/[0.055] px-3 py-1.5 text-[10px] font-medium text-success sm:self-end">
-          <span className="size-1.5 rounded-full bg-success" />
-          Mock services nominal
+        <div className="w-full rounded-2xl border border-border bg-surface p-3 lg:w-72">
+          <label htmlFor="role-simulator" className="block text-[9px] font-semibold uppercase tracking-[0.14em] text-subtle">
+            Demo role
+          </label>
+          <select
+            id="role-simulator"
+            value={role}
+            onChange={(event) => {
+              setRole(event.target.value as AdminRole)
+              setRevealed(false)
+            }}
+            className="mt-2 w-full bg-transparent text-xs font-medium outline-none"
+          >
+            {roles.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+          </select>
         </div>
       </div>
 
-      <div className="mt-10 grid gap-3 sm:grid-cols-3">
+      <div className="mt-8 flex items-start gap-3 rounded-2xl border border-warning/25 bg-warning/[0.055] p-4 text-[11px] leading-5 text-muted">
+        <ShieldAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
+        <p>
+          <strong className="font-semibold text-foreground">Policy simulation only.</strong>{' '}
+          Controls on this page run in browser state. They do not authenticate users,
+          approve mandates, release keys, decrypt transactions, or write immutable logs.
+        </p>
+      </div>
+
+      <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {[
-          { label: 'Relayer heartbeat', value: '1.2s', detail: 'Mock latency', icon: Radio, tone: 'text-success' },
-          { label: 'Pending intents', value: '04', detail: 'Local fixtures', icon: Clock3, tone: 'text-accent' },
-          { label: 'Alert policy', value: 'Clear', detail: 'No active incidents', icon: ShieldAlert, tone: 'text-success' },
-        ].map((metric) => {
-          const Icon = metric.icon
+          { label: 'Can manage platform', value: role === 'platform-admin' ? 'Yes' : 'No', icon: UsersRound },
+          { label: 'Can request disclosure', value: activeRole.canRequest ? 'Yes' : 'No', icon: FileKey2 },
+          { label: 'Can approve key release', value: activeRole.canApprove ? 'Yes' : 'No', icon: UserCheck },
+          { label: 'Can view granted fields', value: activeRole.canReveal ? 'Scoped' : 'No', icon: Eye },
+        ].map((item) => {
+          const Icon = item.icon
           return (
-            <article key={metric.label} className="rounded-3xl border border-border bg-surface p-5 sm:p-6">
-              <div className="flex items-center justify-between">
-                <Icon aria-hidden="true" className={`size-4 ${metric.tone}`} />
-                <span className="text-[9px] uppercase tracking-wider text-subtle">Sandbox</span>
-              </div>
-              <p className="mt-6 text-[11px] text-subtle">{metric.label}</p>
-              <p className="mt-1 text-2xl font-medium tracking-[-0.04em] text-foreground">{metric.value}</p>
-              <p className="mt-1.5 text-[11px] text-subtle">{metric.detail}</p>
+            <article key={item.label} className="rounded-3xl border border-border bg-surface p-5">
+              <Icon aria-hidden="true" className="size-4 text-accent" />
+              <p className="mt-6 text-[10px] text-subtle">{item.label}</p>
+              <p className="mt-1 text-xl font-medium tracking-[-0.035em]">{item.value}</p>
             </article>
           )
         })}
       </div>
 
-      <div className="mt-5 grid items-start gap-5 xl:grid-cols-[1.25fr_0.75fr]">
-        <section className="overflow-hidden rounded-3xl border border-border bg-surface-raised" aria-labelledby="queue-title">
-          <div className="flex items-center justify-between border-b border-border px-5 py-5 sm:px-6">
-            <div>
-              <h2 id="queue-title" className="text-sm font-semibold text-foreground">Operation queue</h2>
-              <p className="mt-1 text-[11px] text-subtle">Illustrative relayer events</p>
-            </div>
-            <Activity aria-hidden="true" className="size-4 text-accent" />
+      <section className="mt-5 overflow-hidden rounded-[2rem] border border-border bg-surface">
+        <div className="flex flex-col gap-4 border-b border-border px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-7">
+          <div role="tablist" aria-label="Administration sections" className="flex w-fit rounded-xl border border-border bg-background p-1">
+            {[
+              ['requests', 'Decryption requests'],
+              ['roles', 'Role matrix'],
+              ['access-log', 'Access log'],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={tab === id}
+                onClick={() => setTab(id as AdminTab)}
+                className={cn(
+                  'focus-ring rounded-lg px-3 py-2 text-[10px] font-medium',
+                  tab === id ? 'bg-surface-raised text-foreground' : 'text-muted',
+                )}
+              >
+                {label}
+              </button>
+            ))}
           </div>
+          <span className="text-[10px] text-subtle">
+            Viewing as <strong className="font-medium text-foreground">{activeRole.label}</strong>
+          </span>
+        </div>
 
-          <div className="divide-y divide-border">
-            {operations.map((operation) => (
-              <article key={operation.id} className="grid gap-3 px-5 py-4 sm:grid-cols-[80px_1fr_130px_90px_45px] sm:items-center sm:px-6">
-                <span className="font-mono text-[11px] text-subtle">{operation.id}</span>
+        {tab === 'requests' && (
+          <div role="tabpanel" className="divide-y divide-border">
+            {requests.map((request) => (
+              <article
+                key={request.id}
+                className="grid gap-4 px-5 py-5 sm:px-7 lg:grid-cols-[120px_1fr_1fr_100px_115px_40px] lg:items-center"
+              >
                 <div>
-                  <p className="text-xs font-medium text-foreground">{operation.route}</p>
-                  <p className="mt-1 text-[10px] text-subtle sm:hidden">{operation.amount}</p>
+                  <p className="font-mono text-[10px] text-subtle">{request.id}</p>
+                  <p className="mt-1 font-mono text-[10px]">{request.transaction}</p>
                 </div>
-                <span className="hidden font-mono text-[11px] text-muted sm:block">{operation.amount}</span>
-                <span className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-2 py-1 text-[9px] font-medium ${operation.status === 'Finalized' ? 'border-success/20 bg-success/[0.05] text-success' : 'border-accent/25 bg-accent/[0.06] text-accent'}`}>
-                  {operation.status === 'Finalized' ? <CheckCircle2 aria-hidden="true" className="size-3" /> : <span className="dot-pulse size-1.5 rounded-full bg-accent" />}
-                  {operation.status}
-                </span>
-                <span className="font-mono text-[10px] text-subtle">{operation.age}</span>
+                <div>
+                  <p className="text-[9px] text-subtle">Institution</p>
+                  <p className="mt-1 text-xs">{request.institution}</p>
+                </div>
+                <div>
+                  <p className="text-[9px] text-subtle">Field scope</p>
+                  <p className="mt-1 text-xs">{request.fields.join(' · ')}</p>
+                </div>
+                <div>
+                  <p className="text-[9px] text-subtle">Approvals</p>
+                  <p className={cn('mt-1 text-xs', request.approvals >= 2 ? 'text-success' : 'text-warning')}>
+                    {request.approvals}/2
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[9px] text-subtle">Grant expiry</p>
+                  <p className="mt-1 text-xs">{request.expires}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelected(request)
+                    setRevealed(false)
+                  }}
+                  className="focus-ring grid size-9 place-items-center rounded-lg text-subtle hover:bg-background hover:text-foreground"
+                  aria-label={'Review ' + request.id}
+                >
+                  <ArrowRight aria-hidden="true" className="size-4" />
+                </button>
               </article>
             ))}
           </div>
-        </section>
+        )}
 
-        <section className="rounded-3xl border border-border bg-surface p-5 sm:p-6" aria-labelledby="safeguards-title">
-          <div className="flex items-center gap-3">
-            <span className="grid size-9 place-items-center rounded-xl border border-border bg-background/50 text-accent">
-              <LockKeyhole aria-hidden="true" className="size-4" />
-            </span>
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">Sandbox only</p>
-              <h2 id="safeguards-title" className="mt-1 text-sm font-semibold text-foreground">Safeguards</h2>
-            </div>
+        {tab === 'roles' && (
+          <div role="tabpanel" className="overflow-x-auto">
+            <table className="w-full min-w-[680px] border-collapse text-left">
+              <thead>
+                <tr className="border-b border-border text-[9px] font-semibold uppercase tracking-[0.14em] text-subtle">
+                  <th className="px-7 py-4">Role</th>
+                  <th className="px-5 py-4">Platform management</th>
+                  <th className="px-5 py-4">Request disclosure</th>
+                  <th className="px-5 py-4">Approve release</th>
+                  <th className="px-7 py-4">View granted fields</th>
+                </tr>
+              </thead>
+              <tbody>
+                {roles.map((item) => (
+                  <tr key={item.id} className="border-b border-border last:border-b-0 text-xs">
+                    <td className="px-7 py-5 font-medium">{item.label}</td>
+                    <td className="px-5 py-5 text-muted">{item.id === 'platform-admin' ? 'Yes' : 'No'}</td>
+                    <td className="px-5 py-5 text-muted">{item.canRequest ? 'Yes' : 'No'}</td>
+                    <td className="px-5 py-5 text-muted">{item.canApprove ? 'Yes' : 'No'}</td>
+                    <td className="px-7 py-5 text-muted">{item.canReveal ? 'Scoped grants only' : 'No'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
+        )}
 
-          <div className="mt-6 divide-y divide-border rounded-2xl border border-border bg-background/30 px-4">
-            {[
-              { label: 'Accept mock deposits', value: deposits, setter: setDeposits },
-              { label: 'Simulate settlements', value: settlements, setter: setSettlements },
-              { label: 'Relayer heartbeat', value: relayer, setter: setRelayer },
-            ].map((control) => (
-              <div key={control.label} className="flex items-center justify-between gap-4 py-4">
-                <span className="text-xs text-muted">{control.label}</span>
-                <Switch checked={control.value} onCheckedChange={control.setter} aria-label={control.label} />
-              </div>
+        {tab === 'access-log' && (
+          <div role="tabpanel" className="divide-y divide-border">
+            {accessLog.map((entry) => (
+              <article key={entry.request + entry.time} className="grid gap-4 px-5 py-5 sm:px-7 lg:grid-cols-[1fr_130px_1.2fr_130px] lg:items-center">
+                <div><p className="text-[9px] text-subtle">Actor</p><p className="mt-1 text-xs">{entry.actor}</p></div>
+                <div><p className="text-[9px] text-subtle">Request</p><p className="mt-1 font-mono text-[10px]">{entry.request}</p></div>
+                <div><p className="text-[9px] text-subtle">Action</p><p className="mt-1 text-xs">{entry.action}</p></div>
+                <div><p className="text-[9px] text-subtle">Time</p><p className="mt-1 text-xs">{entry.time}</p></div>
+              </article>
             ))}
-          </div>
-
-          <div className="mt-5 flex items-start gap-2.5 rounded-2xl border border-warning/20 bg-warning/[0.05] p-4 text-[11px] leading-5 text-muted">
-            <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
-            These switches modify presentation state only. They are not connected to contracts, relayers or infrastructure.
-          </div>
-        </section>
-      </div>
-
-      <section className="mt-5 rounded-3xl border border-border bg-surface p-5 sm:p-6" aria-labelledby="access-title">
-        <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
-          <div className="flex items-start gap-3">
-            <span className="grid size-10 shrink-0 place-items-center rounded-2xl bg-foreground text-background">
-              <KeyRound aria-hidden="true" className="size-4" />
-            </span>
-            <div>
-              <h2 id="access-title" className="text-sm font-semibold text-foreground">Production access is not configured</h2>
-              <p className="mt-1.5 max-w-xl text-xs leading-5 text-muted">Role-based authentication, hardware-backed signing and an immutable action log are required before admin operations can be enabled.</p>
+            <div className="flex items-start gap-3 bg-background/35 px-5 py-5 text-[11px] leading-5 text-muted sm:px-7">
+              <LockKeyhole aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-accent" />
+              Local fixtures only. Production logs must be append-only, integrity-protected,
+              and unavailable for administrator modification.
             </div>
           </div>
-          <span className="shrink-0 rounded-full border border-border px-3 py-1.5 text-[10px] font-medium text-subtle">Read-only prototype</span>
-        </div>
+        )}
       </section>
+
+      <Dialog
+        open={Boolean(selected)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setSelected(null)
+            setRevealed(false)
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Transaction decryption grant</DialogTitle>
+            <DialogDescription>
+              Every grant is limited to one transaction, one institution, approved fields,
+              and a short validity window.
+            </DialogDescription>
+          </DialogHeader>
+
+          {selected && (
+            <>
+              <dl className="divide-y divide-border rounded-2xl border border-border bg-background/50 px-4 text-xs">
+                {[
+                  ['Request', selected.id],
+                  ['Transaction', selected.transaction],
+                  ['Institution', selected.institution],
+                  ['Authorized fields', selected.fields.join(', ')],
+                  ['Threshold approvals', selected.approvals + '/2'],
+                  ['Authorization', selected.authorization],
+                  ['Expires', selected.expires],
+                  ['Current role', activeRole.label],
+                ].map(([label, value]) => (
+                  <div key={label} className="flex justify-between gap-5 py-3">
+                    <dt className="text-subtle">{label}</dt>
+                    <dd className="text-right text-muted">{value}</dd>
+                  </div>
+                ))}
+              </dl>
+
+              {revealed ? (
+                <div className="rounded-2xl border border-accent/25 bg-accent/[0.055] p-5">
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="text-xs font-semibold">Authorized fixture fields</p>
+                    <span className="rounded-md border border-warning/25 px-2 py-1 text-[8px] font-semibold uppercase tracking-wider text-warning">
+                      Demo values
+                    </span>
+                  </div>
+                  <dl className="mt-4 space-y-3 text-xs">
+                    {selected.fields.map((field) => (
+                      <div key={field} className="flex justify-between gap-4">
+                        <dt className="text-subtle">{field}</dt>
+                        <dd className="font-mono">
+                          {field === 'Amount'
+                            ? '125,000.00'
+                            : field === 'Asset'
+                              ? 'USDC'
+                              : 'Example fixture value'}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                  <p className="mt-4 text-[10px] leading-4 text-muted">
+                    These values are static UI fixtures. No ciphertext or transaction data was decrypted.
+                  </p>
+                </div>
+              ) : (
+                <div className="flex items-start gap-3 rounded-2xl border border-border p-4 text-[11px] leading-5 text-muted">
+                  <EyeOff aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-subtle" />
+                  Confidential fields remain hidden until role, scope, approval threshold,
+                  authorization reference, and expiry all pass server-side validation.
+                </div>
+              )}
+
+              {role === 'platform-admin' && (
+                <div className="rounded-2xl border border-danger/20 bg-danger/[0.05] p-4 text-[11px] leading-5 text-muted">
+                  Platform administrators cannot request, approve, or view decrypted transaction fields.
+                </div>
+              )}
+
+              {role === 'compliance' && (
+                <Button variant="secondary" disabled={!activeRole.canRequest} className="w-full">
+                  <FileKey2 aria-hidden="true" />
+                  Request already staged · demo
+                </Button>
+              )}
+
+              {role === 'custodian' && (
+                <Button variant="secondary" disabled={!activeRole.canApprove} className="w-full">
+                  <UserCheck aria-hidden="true" />
+                  Approval recording requires backend
+                </Button>
+              )}
+
+              {role === 'auditor' && (
+                <Button
+                  variant={canRevealSelected ? 'accent' : 'secondary'}
+                  disabled={!canRevealSelected}
+                  className="w-full"
+                  onClick={() => setRevealed((current) => !current)}
+                >
+                  {revealed ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}
+                  {canRevealSelected
+                    ? revealed
+                      ? 'Hide authorized fixture fields'
+                      : 'Preview authorized fixture fields'
+                    : 'Waiting for 2/2 approvals'}
+                </Button>
+              )}
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -5,7 +5,9 @@ export type WalletConnection = {
   network: NetworkId
   address: string
   provider: string
-  simulated: true
+  networkLabel: string
+  isExpectedNetwork: boolean
+  mode: 'injected'
 }
 
 export type MockQuote = {
@@ -44,25 +46,7 @@ export const networkMeta: Record<
   },
 }
 
-const walletAddresses: Record<NetworkId, string> = {
-  stellar: 'GB7A…D94K',
-  ethereum: '0x71F3…89A2',
-}
-
-const wait = (milliseconds: number) =>
-  new Promise((resolve) => window.setTimeout(resolve, milliseconds))
-
 export const mockBridgeAdapter = {
-  async connectWallet(network: NetworkId): Promise<WalletConnection> {
-    await wait(520)
-    return {
-      network,
-      address: walletAddresses[network],
-      provider: networkMeta[network].wallet,
-      simulated: true,
-    }
-  },
-
   getQuote(amount: number): MockQuote {
     const safeAmount = Number.isFinite(amount) ? Math.max(amount, 0) : 0
     const protocolFee = safeAmount * 0.0005
