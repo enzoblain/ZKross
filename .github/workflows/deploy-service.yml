@@ -2,8 +2,9 @@
 # scripts/deploy/server-setup.sh) on every push to main that touches it.
 # The testnet keys stay in the VM's .env; GitHub only holds an SSH key.
 # Repository settings → Secrets and variables → Actions:
-#   secrets:   VM_SSH_KEY (a key dedicated to deploys), VM_KNOWN_HOSTS (output of
-#              `ssh-keyscan <vm>`, so the VM's identity is checked)
+#   secrets:   VM_SSH_KEY (a key dedicated to deploys), VM_KNOWN_HOSTS (lines
+#              "<VM_HOST> <key type> <key>", so the VM's identity is checked;
+#              without it the key the VM presents is trusted, with a warning)
 #   variables: VM_HOST, VM_USER (e.g. ubuntu), VM_REPO_DIR (default: ZKross,
 #              relative to the user's home)
 name: Deploy service
@@ -37,10 +38,10 @@ jobs:
     steps:
       - name: Check the configuration
         env:
-          HAS_KEY: ${{ secrets.VM_SSH_KEY != '' && secrets.VM_KNOWN_HOSTS != '' }}
+          HAS_KEY: ${{ secrets.VM_SSH_KEY != '' }}
         run: |
           if [ "$HAS_KEY" != true ] || [ -z "$VM_HOST" ] || [ -z "$VM_USER" ]; then
-            echo "::error::Set the VM_SSH_KEY and VM_KNOWN_HOSTS secrets and the VM_HOST and VM_USER variables."; exit 1
+            echo "::error::Set the VM_SSH_KEY secret and the VM_HOST and VM_USER variables."; exit 1
           fi
       - name: SSH key
         env:
@@ -50,15 +51,25 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           # Secrets pasted from Windows carry \r line endings, which SSH cannot read.
           printf '%s\n' "$VM_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
-          printf '%s\n' "$VM_KNOWN_HOSTS" | tr -d '\r' > ~/.ssh/known_hosts
-          # Host key fingerprints are public: show what is trusted, for diagnosis.
-          echo "Trusted host keys for $VM_HOST:"
-          ssh-keygen -F "$VM_HOST" -f ~/.ssh/known_hosts -l | grep -v '^#' ||
-            { echo "::error::VM_KNOWN_HOSTS has no line starting with $VM_HOST (one line per key: '$VM_HOST ssh-ed25519 AAAA…')."; exit 1; }
+          printf '%s\n' "$VM_KNOWN_HOSTS" | tr -d '\r' | sed 's/^[[:space:]]*//' | grep -v '^$' > ~/.ssh/known_hosts || true
+          # Hosts and fingerprints are public: show them, for diagnosis.
+          echo "VM_KNOWN_HOSTS: $(wc -l < ~/.ssh/known_hosts) line(s), for host(s): $(cut -d' ' -f1 ~/.ssh/known_hosts | sort -u | paste -sd' ' -)"
+          if ssh-keygen -F "$VM_HOST" -f ~/.ssh/known_hosts >/dev/null; then
+            echo "Trusted host keys for $VM_HOST:"
+            ssh-keygen -F "$VM_HOST" -f ~/.ssh/known_hosts -l | grep -v '^#'
+          else
+            # Fallback: trust what the VM presents now, and show its fingerprint
+            # (compare it with: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on the VM).
+            ssh-keyscan -t ed25519 "$VM_HOST" 2>/dev/null > ~/.ssh/known_hosts
+            [ -s ~/.ssh/known_hosts ] || { echo "::error::Cannot reach $VM_HOST on port 22."; exit 1; }
+            echo "::warning::VM_KNOWN_HOSTS has no line for $VM_HOST; trusting the key it presents: $(ssh-keygen -lf ~/.ssh/known_hosts | cut -d' ' -f2). Fix the secret (lines starting with $VM_HOST) to check it."
+          fi
       - name: Pull, install and restart
         run: |
           ssh -i ~/.ssh/deploy -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" bash -s -- "$VM_REPO_DIR" "$GITHUB_SHA" <<'EOF'
           set -euo pipefail
+          systemctl cat zkross-bridge >/dev/null 2>&1 ||
+            { echo "The service is not installed on this VM yet: run bash scripts/deploy/server-setup.sh <site origin> there once." >&2; exit 1; }
           cd "$1"
           git fetch -q origin main
           git checkout -q main
