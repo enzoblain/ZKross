@@ -4,10 +4,11 @@
 // (bridge-flow.ts), the three steps can happen at different times and for
 // different amounts, so a deposit and a withdrawal are harder to match.
 // Both use the note key of the identity wallet (keys.ts); a withdrawal goes
-// through the relayer and needs no wallet. Each operation saves what it
+// through the relayer and needs no wallet, and merges the notes first when it
+// needs more than two (a proof spends at most two). Each operation saves what it
 // creates before sending, so `runMovement` resumes after a reload.
 import { formatNote } from './amounts'
-import { dummy, resumeDeposit, salts, selectNotes, settleNotes } from './bridge-flow'
+import { dummy, mergeNotes, resumeDeposit, salts, selectNotes, settleNotes } from './bridge-flow'
 import { protocol } from './config'
 import { type IdentityWallet, noteKey } from './keys'
 import { type NetworkId, networkMeta } from './networks'
@@ -121,6 +122,8 @@ async function withdraw(m: Movement, update: (message: string) => void) {
     }
     throw new Error('The Stellar recipient has no USDC trustline: add one from that account, then retry.')
   }
+  // More than two notes needed: merge them first (bridge-flow.ts).
+  if (!m.inputs) await mergeNotes(m.network, key, amount, update)
   // A retry spends the same notes as the first attempt, so a withdrawal that
   // landed unseen cannot be paid twice.
   const available = store.notes(m.network, key.pk)

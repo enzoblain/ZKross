@@ -30,7 +30,7 @@ import {
 import { WalletConnectDialog } from '../components/wallet-connect-dialog'
 import { useWallets } from '../components/wallet-context'
 import { formatMessage, formatNote, parseUnits, toNoteAmount } from '../lib/amounts'
-import { createProgress, createTransfer, identityOf, runTransfer, settleWatched, type FlowStepId } from '../lib/bridge-flow'
+import { createProgress, createTransfer, identityOf, mergeSteps, runTransfer, settleWatched, type FlowStepId } from '../lib/bridge-flow'
 import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { chainId, explorer, isDeployed, poolAddress, protocol } from '../lib/config'
 import { networkMeta, otherNetwork, validAddress, type NetworkId, type TransferProgressStep } from '../lib/networks'
@@ -120,6 +120,8 @@ function BridgePage() {
   const readError = liveReads.key === readKey ? liveReads.error : ''
   // The source wallet is needed only to deposit what the private balance lacks.
   const needsDeposit = Boolean(messageAmount && toNoteAmount(from, messageAmount) > privateBalance)
+  // Paid from the private balance: notes merged first when two do not cover it.
+  const merges = id && messageAmount && messageAmount > 0n && !needsDeposit ? mergeSteps(store.notes(from, id.pk), toNoteAmount(from, messageAmount)) : null
   const needsSource = needsDeposit || via === 'wallet'
   const canReview = Boolean(
     identityReady &&
@@ -401,6 +403,7 @@ function BridgePage() {
                 <p className="text-[10px] font-medium text-subtle">Account visible on-chain as the sender</p>
                 <dl className="mt-3 space-y-2 text-[11px]">
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{needsDeposit ? `Your wallet${sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}` : 'None: private balance'}</dd></div>
+                  {Boolean(merges) && <div className="flex justify-between gap-4"><dt className="text-subtle">Note merges first · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{merges} · {relayerName(from)}</dd></div>}
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Bridge out · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{submitter(from, sourceWallet?.address)}</dd></div>
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Claim + withdrawal · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{relayerName(to)}</dd></div>
                 </dl>

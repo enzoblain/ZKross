@@ -7,7 +7,7 @@ import { WalletConnectDialog } from '../components/wallet-connect-dialog'
 import { useWallets } from '../components/wallet-context'
 import { formatNote, parseUnits } from '../lib/amounts'
 import { createMovement, runMovement } from '../lib/balance-flow'
-import { settleWatched } from '../lib/bridge-flow'
+import { mergeSteps, settleWatched } from '../lib/bridge-flow'
 import { explorer, isDeployed, protocol } from '../lib/config'
 import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { networkMeta, validAddress, type NetworkId } from '../lib/networks'
@@ -52,6 +52,7 @@ function BalanceCard({
   const identityWallet = id ? wallets[id.network] : wallet
   const identityReady = Boolean(identityWallet && (!id || identityWallet.address === id.address))
   const deployed = isDeployed(network)
+  const merges = id && value && value > 0n && value <= privateBalance ? mergeSteps(store.notes(network, id.pk), value) : null
   const walletBalance = publicBalance && wallet && publicBalance.address === wallet.address ? publicBalance.value : null
 
   useEffect(() => store.subscribe(() => setAllMovements(store.movements())), [])
@@ -144,6 +145,9 @@ function BalanceCard({
             ? `Public USDC moves from your ${meta.wallet} wallet into the pool as a hidden note. The deposit is public; what you do with the note next is not.`
             : `A proof spends your private notes and pays any public ${meta.shortName} address; the relayer sends it. The change stays private.`}
         </p>
+        {kind === 'withdraw' && Boolean(merges) && (
+          <p className="text-[10px] leading-4 text-muted">Your balance is spread over several notes and a proof spends at most two: {merges} merge{merges === 1 ? '' : 's'} first (a proof each, about 10 to 30 s), sent by the relayer. You still receive one payment.</p>
+        )}
 
         <div>
           <label htmlFor={`amount-${network}`} className="text-[10px] font-medium text-subtle">Amount</label>

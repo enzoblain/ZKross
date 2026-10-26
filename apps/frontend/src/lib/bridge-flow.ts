@@ -13,7 +13,7 @@
 // (t.via). If the relayer does not answer the bridge out, the step fails with
 // `relayerFailed` and the user can send it themselves.
 import { formatNote, toNoteAmount } from './amounts'
-import { chainId, protocol } from './config'
+import { chainId, poolAddress, protocol } from './config'
 import { type IdentityWallet, type NoteKey, noteKey } from './keys'
 import { type NetworkId, type ProgressState, type TransferProgressStep, networkMeta } from './networks'
 import { type Via, pools } from './pools'
@@ -167,6 +167,92 @@ export function selectNotes(available: Note[], amount: bigint): Note[] | null {
   return top.length === 2 && BigInt(top[0].amount) + BigInt(top[1].amount) >= amount ? top : null
 }
 
+// Merging notes. A proof spends at most two notes, so a balance spread over
+// more notes cannot be spent in one operation. Before a withdrawal or a
+// bridge out that needs more than two notes, mergeNotes folds the smallest
+// of them, two at a time, into one note through private transactions
+// (no public amount, sent by the relayer) until two notes cover the amount.
+// Each merge is recorded and its new note watched before sending, so a
+// reload never loses it.
+
+/** The notes to fold into one (smallest first) so that two notes then cover
+ * `amount`: [] when two already do, null when the balance is short. */
+function mergePlan(available: Note[], amount: bigint): Note[] | null {
+  if (selectNotes(available, amount)) return []
+  const largest = available.slice().sort((x, y) => (BigInt(y.amount) > BigInt(x.amount) ? 1 : BigInt(y.amount) < BigInt(x.amount) ? -1 : 0))
+  const used: Note[] = []
+  let sum = 0n
+  for (const n of largest) {
+    used.push(n)
+    sum += BigInt(n.amount)
+    if (sum >= amount) return used.slice(1).reverse()
+  }
+  return null
+}
+
+/** How many merges spending `amount` takes first (0: none), or null when the balance is short. */
+export function mergeSteps(available: Note[], amount: bigint): number | null {
+  const plan = mergePlan(available, amount)
+  return plan === null ? null : Math.max(plan.length - 1, 0)
+}
+
+/** Records merges that landed unseen: their inputs are spent, their note joins. */
+async function settleMerges(network: NetworkId) {
+  for (const m of store.pendingMerges(network)) {
+    if (!(await pools[network].isSpent(m.nullifier))) continue
+    store.markSpent(network, m.inputs)
+    store.removeMerge(network, m.nullifier)
+  }
+  await settleWatched(network)
+}
+
+/** Merges notes of `key` on `network` until two of them cover `amount`. */
+export async function mergeNotes(network: NetworkId, key: NoteKey, amount: bigint, update: (message: string) => void) {
+  await settleMerges(network)
+  const total = mergeSteps(store.notes(network, key.pk), amount)
+  if (total === null) {
+    throw new Error(`Your private ${networkMeta[network].shortName} balance does not cover ${formatNote(network, amount)} USDC.`)
+  }
+  for (let step = 1; ; step++) {
+    const plan = mergePlan(store.notes(network, key.pk), amount)
+    if (!plan?.length) return
+    update(`Merging your notes (${Math.min(step, total)} of ${total}), through the relayer…`)
+    await merge(network, key, plan[0], plan[1])
+  }
+}
+
+async function merge(network: NetworkId, key: NoteKey, a: Note, b: Note) {
+  const pool = pools[network]
+  const value = BigInt(a.amount) + BigInt(b.amount)
+  const blinding = randomField()
+  const output: PendingNote = { network, pk: key.pk, amount: value.toString(), blinding, commitment: await prover.commitment(value, key.pk, blinding) }
+  // No public amount: nothing is paid, so the pool itself is the recipient.
+  const recipient = poolAddress(network)!
+  const asInput = (n: Note): InNote => ({ leaf_index: n.leafIndex, sk: key.sk, amount: n.amount, blinding: n.blinding })
+  const built = await prover.buildTransact({
+    levels: protocol.levels,
+    leaves: await pool.noteLeaves(),
+    d: await pool.adminViewKey(),
+    ext_data_hash: await pool.transactExtHash(recipient, 0n),
+    public_amount: '0',
+    inputs: [asInput(a), asInput(b)],
+    outputs: [
+      { pk: key.pk, amount: output.amount, blinding },
+      { pk: key.pk, amount: '0', blinding: randomField() },
+    ],
+    in_salts: salts(),
+    out_salts: salts(),
+  })
+  const inputs = [a.commitment, b.commitment]
+  store.watchNote(output)
+  store.putMerge({ network, inputs, nullifier: built.nullifiers[0], output })
+  const proof = await prover.prove(built)
+  await pool.transact('', proof, recipient, 0n, undefined, 'relayer')
+  store.markSpent(network, inputs)
+  store.removeMerge(network, built.nullifiers[0])
+  if (!(await settleNotes(network, [output]))) throw new Error('The merge landed, but its note is not indexed yet. Retry shortly.')
+}
+
 const nowHour = () => BigInt(Math.floor(Date.now() / 3_600_000))
 
 /** The identity wallet of `t`; older transfers derived their key from the source wallet. */
@@ -230,7 +316,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     if (await resumeDeposit(t.from, t.depositNote, t.txs.deposit, t.depositUnseen, () => save(t, { depositUnseen: true }))) {
       return save(t, { status: 'deposited', error: undefined })
     }
-    if (selectNotes(store.notes(t.from, key.pk), amountFrom)) return save(t, { status: 'deposited', error: undefined })
+    // The private balance covers it (its notes are merged at the bridge out if needed).
+    if (store.balanceOf(t.from, key.pk) >= amountFrom) return save(t, { status: 'deposited', error: undefined })
     if (!t.sender) {
       throw new Error(`Your private balance does not cover this amount: connect your ${networkMeta[t.from].wallet} wallet to deposit.`)
     }
@@ -279,6 +366,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       }
       return save(t, { status: 'sent', error: undefined })
     }
+    await mergeNotes(t.from, key, amountFrom, (message) => update('bridgeOut', 'active', message))
     const chosen = selectNotes(store.notes(t.from, key.pk), amountFrom)
     if (!chosen) throw new Error('Your private balance no longer covers this amount.')
     if (via === 'wallet' && !t.sender) throw new Error(`Connect your ${networkMeta[t.from].wallet} wallet to send the bridge out yourself.`)

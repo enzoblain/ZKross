@@ -88,7 +88,8 @@ vi.mock('./pools', async () => {
 })
 
 const { createMovement, runMovement } = await import('./balance-flow')
-const { createTransfer, runTransfer, settleWatched } = await import('./bridge-flow')
+const { createTransfer, mergeSteps, runTransfer, settleWatched } = await import('./bridge-flow')
+const { poolAddress } = await import('./config')
 const store = await import('./store')
 
 const USDC: Record<NetworkId, bigint> = { ethereum: 10n ** 6n, stellar: 10n ** 7n }
@@ -263,4 +264,75 @@ it('resumes an interrupted bridge deposit without depositing twice', async () =>
   await runTransfer(t, () => {})
   expect(t.status).toBe('withdrawn')
   expect(h.calls.filter((c) => c.fn === 'transact' && c.amount! > 0n)).toEqual([])
+})
+
+// More notes than a proof can spend: merged first, two at a time, by the relayer.
+
+const note = (amount: bigint, i: number) => ({ network: 'ethereum' as NetworkId, pk: KEY.pk, amount: amount.toString(), blinding: '0x1' as Hex, commitment: `0xa${i}` as Hex, leafIndex: i, spent: false })
+
+it('counts the merges an amount needs', () => {
+  const ones = [1n, 1n, 1n, 1n].map(note)
+  expect(mergeSteps(ones, 2n)).toBe(0)
+  expect(mergeSteps(ones, 3n)).toBe(1)
+  expect(mergeSteps(ones, 4n)).toBe(2)
+  expect(mergeSteps(ones, 5n)).toBeNull()
+  expect(mergeSteps([5n, 1n, 1n].map(note), 6n)).toBe(0)
+})
+
+const merges = () => h.calls.filter((c) => c.fn === 'transact' && c.amount === 0n)
+
+it('withdraws a balance spread over three notes in one payment, after one merge', async () => {
+  for (let i = 0; i < 3; i++) await deposit('ethereum', USDC.ethereum)
+  h.calls = []
+
+  const out = withdraw('ethereum', 3n * USDC.ethereum)
+  await runMovement(out)
+
+  expect(out.status).toBe('done')
+  expect(merges()).toEqual([{ network: 'ethereum', fn: 'transact', account: '', via: 'relayer', recipient: poolAddress('ethereum'), amount: 0n }])
+  expect(h.calls.filter((c) => c.amount! < 0n)).toEqual([expect.objectContaining({ recipient: TYPED.ethereum, amount: -(3n * USDC.ethereum), via: 'relayer' })])
+  expect(store.balanceOf('ethereum', KEY.pk)).toBe(0n)
+})
+
+it('merges as many times as needed, and no more', async () => {
+  for (let i = 0; i < 4; i++) await deposit('ethereum', USDC.ethereum)
+  h.calls = []
+
+  await runMovement(withdraw('ethereum', 4n * USDC.ethereum))
+  expect(merges()).toHaveLength(2)
+
+  for (let i = 0; i < 4; i++) await deposit('ethereum', USDC.ethereum)
+  h.calls = []
+  await runMovement(withdraw('ethereum', 2n * USDC.ethereum))
+  expect(merges()).toHaveLength(0)
+})
+
+it('bridges from a private balance spread over three notes without depositing again', async () => {
+  for (let i = 0; i < 3; i++) await deposit('stellar', USDC.stellar)
+  h.calls = []
+
+  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 3n * USDC.ethereum, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
+  await runTransfer(t, () => {})
+
+  expect(t.status).toBe('withdrawn')
+  expect(t.txs.deposit).toBeUndefined()
+  expect(h.calls.filter((c) => c.network === 'stellar').map((c) => [c.fn, c.amount])).toEqual([['transact', 0n], ['bridgeOut', undefined]])
+  expect(store.balanceOf('stellar', KEY.pk)).toBe(0n)
+})
+
+it('picks up a merge that landed after its page closed', async () => {
+  for (let i = 0; i < 3; i++) await deposit('ethereum', USDC.ethereum)
+  const out = withdraw('ethereum', 3n * USDC.ethereum)
+  h.closeOnSend = true
+  await expect(runMovement(out)).rejects.toThrow('page closed')
+  h.closeOnSend = false
+  // It was sent after all: its inputs are spent on chain.
+  h.spent.add(store.pendingMerges('ethereum')[0].nullifier)
+  h.calls = []
+
+  await runMovement(out)
+  expect(out.status).toBe('done')
+  expect(merges()).toEqual([])
+  expect(h.calls).toEqual([expect.objectContaining({ amount: -(3n * USDC.ethereum) })])
+  expect(store.pendingMerges('ethereum')).toEqual([])
 })

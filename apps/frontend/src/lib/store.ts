@@ -114,7 +114,19 @@ const KEY = 'zkross:v1'
 // `watched`: deposit notes saved before sending and not yet seen on chain.
 // A deposit may land after the page that sent it closed; its note is kept
 // here until it shows up in the pool, so it is never lost.
-type Data = { notes: Note[]; transfers: Transfer[]; movements?: Movement[]; watched?: PendingNote[] }
+// `merges`: merges sent or about to be sent (see bridge-flow.ts mergeNotes),
+// kept until their inputs are seen spent on chain.
+type Data = { notes: Note[]; transfers: Transfer[]; movements?: Movement[]; watched?: PendingNote[]; merges?: PendingMerge[] }
+
+/** A merge of two notes into one, recorded before it is sent. */
+export type PendingMerge = {
+  network: NetworkId
+  /** Commitments of the two notes it spends. */
+  inputs: Hex[]
+  /** Nullifier of the first input: spent on chain once the merge landed. */
+  nullifier: Hex
+  output: PendingNote
+}
 
 function load(): Data {
   try {
@@ -174,6 +186,21 @@ export function watchNote(note: PendingNote) {
   data.watched.push(note)
   save(data)
 }
+
+export function putMerge(m: PendingMerge) {
+  const data = load()
+  data.merges = (data.merges ?? []).filter((x) => !(x.network === m.network && x.nullifier === m.nullifier))
+  data.merges.push(m)
+  save(data)
+}
+
+export function removeMerge(network: NetworkId, nullifier: Hex) {
+  const data = load()
+  data.merges = (data.merges ?? []).filter((x) => !(x.network === network && x.nullifier === nullifier))
+  save(data)
+}
+
+export const pendingMerges = (network: NetworkId) => (load().merges ?? []).filter((m) => m.network === network)
 
 export const watchedNotes = (network: NetworkId) => (load().watched ?? []).filter((n) => n.network === network)
 
