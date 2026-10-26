@@ -82,15 +82,42 @@ export async function ensureAllowance(owner: Address, amount: bigint) {
 
 const LOG_CHUNK = 50_000n
 
-/** The pool's logs for one event from the deploy block on, in chunks. */
-async function poolLogs(eventName: 'NewCommitment' | 'BridgeOut' | 'LiquidityAdded') {
-  const event = getAbiItem({ abi: shieldedPoolAbi, name: eventName })
+// The public RPC spreads requests over nodes a block or two apart, so a range
+// ending at the head one node reported can be "beyond current head block" on
+// the next. Such a range is retried while that node catches up (a block is
+// ~12 s), then shortened by two blocks.
+const behindHead = (error: unknown) =>
+  /beyond current head|after last accepted block|header not found|unknown block/i.test(error instanceof Error ? error.message : String(error))
+
+export async function getLogsCaughtUp(args: { event?: unknown; fromBlock: bigint; toBlock: bigint }, pause = 2000) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await publicClient.getLogs({ address: pool(), ...args } as never)
+    } catch (error) {
+      if (!behindHead(error) || attempt === 5) throw error
+      if (attempt === 4) {
+        if (args.toBlock - 2n < args.fromBlock) return []
+        args = { ...args, toBlock: args.toBlock - 2n }
+      }
+      await new Promise((resolve) => setTimeout(resolve, pause * (attempt + 1)))
+    }
+  }
+}
+
+/** The pool's logs (one event, or all) from the deploy block on, in chunks. */
+async function chunkedLogs(event?: unknown) {
   const latest = await publicClient.getBlockNumber()
   const logs = []
   for (let from = sepoliaConfig.deployBlock; from <= latest; from += LOG_CHUNK) {
     const to = from + LOG_CHUNK - 1n < latest ? from + LOG_CHUNK - 1n : latest
-    logs.push(...(await publicClient.getLogs({ address: pool(), event, fromBlock: from, toBlock: to } as never)))
+    logs.push(...(await getLogsCaughtUp({ event, fromBlock: from, toBlock: to })))
   }
+  return logs
+}
+
+/** The pool's logs for one event from the deploy block on. */
+async function poolLogs(eventName: 'NewCommitment' | 'BridgeOut' | 'LiquidityAdded') {
+  const logs = await chunkedLogs(getAbiItem({ abi: shieldedPoolAbi, name: eventName }))
   return parseEventLogs({ abi: shieldedPoolAbi, logs, eventName })
 }
 
@@ -136,13 +163,7 @@ export type PoolLog = {
 
 /** Every pool event from the deploy block on, in chain order. */
 export async function allPoolLogs(): Promise<PoolLog[]> {
-  const latest = await publicClient.getBlockNumber()
-  const logs = []
-  for (let from = sepoliaConfig.deployBlock; from <= latest; from += LOG_CHUNK) {
-    const to = from + LOG_CHUNK - 1n < latest ? from + LOG_CHUNK - 1n : latest
-    logs.push(...(await publicClient.getLogs({ address: pool(), fromBlock: from, toBlock: to })))
-  }
-  return parseEventLogs({ abi: shieldedPoolAbi, logs }) as unknown as PoolLog[]
+  return parseEventLogs({ abi: shieldedPoolAbi, logs: await chunkedLogs() }) as unknown as PoolLog[]
 }
 
 export type TxDetails = { sender: string; time: number; usdc: { from: string; to: string; amount: bigint }[] }
