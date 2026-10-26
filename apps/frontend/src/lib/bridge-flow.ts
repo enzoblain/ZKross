@@ -14,13 +14,14 @@
 import { formatNote, toNoteAmount } from './amounts'
 import { chainId, poolAddress, protocol } from './config'
 import { type IdentityWallet, type NoteKey, noteKey } from './keys'
+import { sealBridge, sealNote, sealOutputs } from './note-delivery'
 import { type NetworkId, type ProgressState, type TransferProgressStep, networkMeta } from './networks'
 import { pools } from './pools'
 import * as stellar from './stellar'
 import * as store from './store'
 import type { Note, PendingNote, Transfer } from './store'
 import { fieldNeg, prover, randomField } from './zk/prover'
-import type { Hex, InNote } from './zk/types'
+import type { Hex, InNote, OutNote } from './zk/types'
 
 export type FlowStepId = 'keys' | 'deposit' | 'bridgeOut' | 'root' | 'claim' | 'withdraw'
 
@@ -224,17 +225,19 @@ async function merge(network: NetworkId, key: NoteKey, a: Note, b: Note) {
   // No public amount: nothing is paid, so the pool itself is the recipient.
   const recipient = poolAddress(network)!
   const asInput = (n: Note): InNote => ({ leaf_index: n.leafIndex, sk: key.sk, amount: n.amount, blinding: n.blinding })
+  const outputs = [
+    { pk: key.pk, amount: output.amount, blinding },
+    { pk: key.pk, amount: '0', blinding: randomField() },
+  ] as [OutNote, OutNote]
+  const enc = await sealOutputs(key.encPk, outputs)
   const built = await prover.buildTransact({
     levels: protocol.levels,
     leaves: await pool.noteLeaves(),
     d: await pool.adminViewKey(),
-    ext_data_hash: await pool.transactExtHash(recipient, 0n),
+    ext_data_hash: await pool.transactExtHash(recipient, 0n, enc),
     public_amount: '0',
     inputs: [asInput(a), asInput(b)],
-    outputs: [
-      { pk: key.pk, amount: output.amount, blinding },
-      { pk: key.pk, amount: '0', blinding: randomField() },
-    ],
+    outputs,
     in_salts: salts(),
     out_salts: salts(),
   })
@@ -242,7 +245,7 @@ async function merge(network: NetworkId, key: NoteKey, a: Note, b: Note) {
   store.watchNote(output)
   store.putMerge({ network, inputs, nullifier: built.nullifiers[0], output })
   const proof = await prover.prove(built)
-  await pool.transact('', proof, recipient, 0n, undefined, 'relayer')
+  await pool.transact('', proof, recipient, 0n, enc, undefined, 'relayer')
   store.markSpent(network, inputs)
   store.removeMerge(network, built.nullifiers[0])
   if (!(await settleNotes(network, [output]))) throw new Error('The merge landed, but its note is not indexed yet. Retry shortly.')
@@ -332,23 +335,25 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     store.watchNote(note)
     save(t, { depositNote: note, depositUnseen: undefined })
     update('deposit', 'active', 'Building the deposit proof in your browser…')
+    const outputs = [
+      { pk: key.pk, amount: topUp.toString(), blinding },
+      { pk: key.pk, amount: '0', blinding: randomField() },
+    ] as [OutNote, OutNote]
+    const enc = await sealOutputs(key.encPk, outputs)
     const built = await prover.buildTransact({
       levels: protocol.levels,
       leaves: await src.noteLeaves(),
       d: await src.adminViewKey(),
-      ext_data_hash: await src.transactExtHash(t.sender, topUp),
+      ext_data_hash: await src.transactExtHash(t.sender, topUp, enc),
       public_amount: topUp.toString(),
       inputs: [dummy(), dummy()],
-      outputs: [
-        { pk: key.pk, amount: topUp.toString(), blinding },
-        { pk: key.pk, amount: '0', blinding: randomField() },
-      ],
+      outputs,
       in_salts: salts(),
       out_salts: salts(),
     })
     const proof = await prover.prove(built)
     update('deposit', 'active', `Confirm the deposit in ${networkMeta[t.from].wallet}…`)
-    const sent = await src.transact(t.sender, proof, t.sender, topUp, (hash) => save(t, { txs: { ...t.txs, approve: hash } }))
+    const sent = await src.transact(t.sender, proof, t.sender, topUp, enc, (hash) => save(t, { txs: { ...t.txs, approve: hash } }))
     save(t, { txs: { ...t.txs, deposit: sent.hash } })
     if (!(await settleNotes(t.from, [note]))) throw new Error('The deposit landed but its note is not indexed yet; retry shortly.')
     save(t, { status: 'deposited', error: undefined })
@@ -374,11 +379,18 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     const asInput = (n: Note): InNote => ({ leaf_index: n.leafIndex, sk: key.sk, amount: n.amount, blinding: n.blinding })
     const deadline = nowHour() + protocol.deadlineHours
     update('bridgeOut', 'active', 'Building the bridge-out proof in your browser…')
+    // The change notes, the refund note and the bridge message, encrypted to the
+    // identity, so a lost browser can still claim or be refunded (recovery.ts).
+    const enc = {
+      ...(await sealOutputs(key.encPk, change)),
+      refund: await sealNote(key.encPk, amountFrom, t.refundBlinding),
+      message: await sealBridge(key.encPk, amount, t.claimSecret, deadline),
+    }
     const built = await prover.buildBridgeOut({
       levels: protocol.levels,
       leaves: await src.noteLeaves(),
       d: await src.adminViewKey(),
-      ext_data_hash: await src.bridgeOutExtHash(),
+      ext_data_hash: await src.bridgeOutExtHash(enc),
       inputs: [asInput(chosen[0]), chosen[1] ? asInput(chosen[1]) : dummy()],
       outputs: [
         { pk: key.pk, amount: change[0].amount, blinding: change[0].blinding },
@@ -409,7 +421,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     })
     const proof = await prover.prove(built)
     update('bridgeOut', 'active', relaying)
-    const sent = await src.bridgeOut('', proof, 'relayer')
+    const sent = await src.bridgeOut('', proof, enc, 'relayer')
     save(t, { txs: { ...t.txs, bridgeOut: sent.hash } })
     store.markSpent(t.from, t.inputs ?? [])
     if (!(await settleNotes(t.from, change))) {
@@ -457,12 +469,13 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       commitment: '0x',
     }))
     update('claim', 'active', 'Building the claim proof in your browser…')
+    const enc = await sealOutputs(key.encPk, claim)
     const built = await prover.buildBridgeIn({
       levels: protocol.levels,
       outbox_leaves: leaves,
       index,
       d: await dst.adminViewKey(),
-      ext_data_hash: await dst.bridgeInExtHash(),
+      ext_data_hash: await dst.bridgeInExtHash(enc),
       amount: amount.toString(),
       scale: protocol.scale[t.to].toString(),
       asset_id: protocol.assetId.toString(),
@@ -481,7 +494,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     save(t, { claimNotes: claim })
     const proof = await prover.prove(built)
     update('claim', 'active', relaying)
-    const sent = await dst.bridgeIn('', proof, 'relayer')
+    const sent = await dst.bridgeIn('', proof, enc, 'relayer')
     save(t, { txs: { ...t.txs, bridgeIn: sent.hash } })
     if (!(await settleNotes(t.to, claim))) {
       throw new Error('The claim landed, but its destination note is not indexed yet. Retry shortly.')
@@ -505,24 +518,26 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     const note = store.notes(t.to, key.pk).find((n) => n.commitment === t.claimNotes![0].commitment)
     if (!note) throw new Error('The claimed note is not in this browser.')
     update('withdraw', 'active', 'Building the withdrawal proof in your browser…')
+    const outputs = [
+      { pk: key.pk, amount: '0', blinding: randomField() },
+      { pk: key.pk, amount: '0', blinding: randomField() },
+    ] as [OutNote, OutNote]
+    const enc = await sealOutputs(key.encPk, outputs)
     const built = await prover.buildTransact({
       levels: protocol.levels,
       leaves: await dst.noteLeaves(),
       d: await dst.adminViewKey(),
-      ext_data_hash: await dst.transactExtHash(t.recipient, -amountTo),
+      ext_data_hash: await dst.transactExtHash(t.recipient, -amountTo, enc),
       public_amount: fieldNeg(amountTo),
       inputs: [{ leaf_index: note.leafIndex, sk: key.sk, amount: note.amount, blinding: note.blinding }, dummy()],
-      outputs: [
-        { pk: key.pk, amount: '0', blinding: randomField() },
-        { pk: key.pk, amount: '0', blinding: randomField() },
-      ],
+      outputs,
       in_salts: salts(),
       out_salts: salts(),
     })
     save(t, { withdrawNullifier: built.nullifiers[0] })
     const proof = await prover.prove(built)
     update('withdraw', 'active', relaying)
-    const sent = await dst.transact('', proof, t.recipient, -amountTo, undefined, 'relayer')
+    const sent = await dst.transact('', proof, t.recipient, -amountTo, enc, undefined, 'relayer')
     store.markSpent(t.to, [note.commitment])
     save(t, { status: 'withdrawn', txs: { ...t.txs, withdraw: sent.hash }, error: undefined })
   })

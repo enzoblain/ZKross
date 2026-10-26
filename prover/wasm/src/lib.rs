@@ -56,6 +56,27 @@ pub fn tree_root(req: &str) -> Result<String, JsError> {
 
 /// The admin's Global View Key `D` for a pasted private scalar (Admin page
 /// only; the page keeps the scalar in memory and never sends or stores it).
+#[wasm_bindgen(js_name = encryptionKey)]
+pub fn encryption_key(signature: &str) -> Result<String, JsError> {
+    js(zkross_prover::encryption_key_of(signature))
+}
+
+#[wasm_bindgen(js_name = encryptTo)]
+pub fn encrypt_to(pk: &str, plaintext: &str) -> Result<String, JsError> {
+    js(zkross_prover::encrypt_to(pk, plaintext))
+}
+
+#[wasm_bindgen(js_name = decryptFrom)]
+pub fn decrypt_from(sk: &str, data: &str) -> Result<String, JsError> {
+    js(zkross_prover::decrypt_from(sk, data))
+}
+
+#[wasm_bindgen]
+pub fn nullifier(sk: &str, commitment: &str, leaf_index: &str) -> Result<String, JsError> {
+    let index = leaf_index.parse::<u64>().map_err(|_| JsError::new("leaf_index must be a number"))?;
+    js(zkross_prover::nullifier_of(sk, commitment, index))
+}
+
 #[wasm_bindgen(js_name = adminKey)]
 pub fn admin_key(d_priv: &str) -> Result<String, JsError> {
     js(zkross_prover::admin_key_of(d_priv))

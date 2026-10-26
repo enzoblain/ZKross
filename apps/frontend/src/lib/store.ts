@@ -2,10 +2,10 @@
 // standalone deposits and withdrawals of the private balance. They
 // hold note blindings and claim secrets but no spending key (keys.ts derives
 // it from the wallet), so they alone cannot spend or claim anything.
-// TODO(B10): notes are kept only here; the encrypted_output and
-// encrypted_bridge_message fields carry placeholders until SPEC.md B10 note
-// delivery exists. Clearing site data loses access to unspent notes (the
-// admin can still decrypt them with the Global View Key).
+// This is a cache: every note is also published on-chain encrypted to its
+// owner (SPEC.md B10, note-delivery.ts), and recovery.ts rebuilds these
+// records from the chain after site data is cleared. Notes made before note
+// delivery carry placeholders and live only here.
 import type { NetworkId } from './networks'
 import type { Hex } from './zk/types'
 

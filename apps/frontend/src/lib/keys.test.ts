@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 vi.mock('@stellar/freighter-api', () => ({ signMessage: vi.fn() }))
 vi.mock('./zk/prover', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./zk/prover')>()),
-  prover: { pubkey: async (sk: string) => `0xpk${sk.slice(-6)}` },
+  prover: { pubkey: async (sk: string) => `0xpk${sk.slice(-6)}`, encryptionKey: async (sig: string) => ({ sk: `0xes${sig.slice(-6)}`, pk: `0xep${sig.slice(-6)}` }) },
 }))
 
 const { chooseIdentity, identity, noteKey } = await import('./keys')
@@ -30,6 +30,9 @@ describe('identity', () => {
     expect(chosen).toEqual({ network: 'ethereum', address: '0xA11CE', pk: (await noteKey('ethereum', '0xA11CE')).pk })
     const { sk } = await noteKey('ethereum', '0xA11CE')
     expect([...storage.values()].join()).not.toContain(sk.slice(2))
+    // Nor the encryption secret derived from the same signature.
+    const { encSk } = await noteKey('ethereum', '0xA11CE')
+    expect([...storage.values()].join()).not.toContain(encSk.slice(2))
   })
 
   it('signs the v1 message, so the wallet keeps its existing notes', async () => {

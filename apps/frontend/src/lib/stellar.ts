@@ -132,6 +132,28 @@ export function noteLeaves(events: PoolEvent[]): Hex[] {
   return leaves
 }
 
+const eventBytes = (v: unknown): Hex => bytesHex(v instanceof Uint8Array ? v : new Uint8Array(v as ArrayLike<number>))
+
+/** Notes with their encrypted outputs (SPEC.md B10), for recovery. */
+export function publishedNotes(events: PoolEvent[]) {
+  return events
+    .filter((e) => e.name === 'new_commitment_event')
+    .map((e) => ({ index: Number(e.data.index), commitment: hex32(e.topics[1] as bigint), data: eventBytes(e.data.encrypted_output) }))
+}
+
+/** Bridge outs with their encrypted payloads (SPEC.md B10), for recovery. */
+export function publishedBridgeOuts(events: PoolEvent[]) {
+  return events
+    .filter((e) => e.name === 'bridge_out_event')
+    .map((e) => ({
+      message: hex32(e.topics[1] as bigint),
+      deadline: BigInt(e.data.deadline_bucket as bigint),
+      refundCommitment: hex32(e.data.refund_commitment as bigint),
+      refund: eventBytes(e.data.encrypted_refund),
+      data: eventBytes(e.data.encrypted_bridge_message),
+    }))
+}
+
 /** Outbox leaves (pairs (C, 0), SPEC.md B6), from BridgeOutEvent. */
 export function outboxLeaves(events: PoolEvent[]): Hex[] {
   const leaves: Hex[] = []

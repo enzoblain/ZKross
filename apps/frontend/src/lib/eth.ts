@@ -133,6 +133,22 @@ export async function noteLeaves(): Promise<Hex[]> {
   return leaves
 }
 
+/** Notes with their encrypted outputs (SPEC.md B10), for recovery. */
+export async function publishedNotes() {
+  return (await poolLogs('NewCommitment')).map((log) => {
+    const { index, commitment, encryptedOutput } = log.args as { index: number; commitment: bigint; encryptedOutput: Hex }
+    return { index: Number(index), commitment: hex32(commitment), data: encryptedOutput }
+  })
+}
+
+/** Bridge outs with their encrypted payloads (SPEC.md B10), for recovery. */
+export async function publishedBridgeOuts() {
+  return (await poolLogs('BridgeOut')).map((log) => {
+    const a = log.args as { bridgeMessage: bigint; deadlineBucket: bigint; refundCommitment: bigint; encryptedRefund: Hex; encryptedBridgeMessage: Hex }
+    return { message: hex32(a.bridgeMessage), deadline: BigInt(a.deadlineBucket), refundCommitment: hex32(a.refundCommitment), refund: a.encryptedRefund, data: a.encryptedBridgeMessage }
+  })
+}
+
 /** Outbox leaves (pairs (C, 0), SPEC.md B6) in index order. */
 export async function outboxLeaves(): Promise<Hex[]> {
   const leaves: Hex[] = []

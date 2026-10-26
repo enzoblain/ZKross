@@ -4161,11 +4161,15 @@ dependencies = [
  "ark-bn254",
  "ark-ff 0.6.0",
  "circuits",
+ "crypto_secretbox",
+ "getrandom 0.2.17",
  "num-bigint",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "stellar-private-payments",
  "taceo-poseidon2",
+ "x25519-dalek",
 ]
 
 [[package]]

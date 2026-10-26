@@ -16,6 +16,10 @@ export type ProverWasm = {
   treeRoot: (req: string) => string
   adminKey: (dPriv: string) => string
   decrypt: (req: string) => string
+  encryptionKey: (signature: string) => string
+  encryptTo: (pk: string, plaintext: string) => string
+  decryptFrom: (sk: string, data: string) => string
+  nullifier: (sk: string, commitment: string, leafIndex: string) => string
 }
 
 export type ProverOp = Exclude<keyof ProverWasm, 'default'>

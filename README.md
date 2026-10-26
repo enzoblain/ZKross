@@ -159,8 +159,12 @@ every 2 hours per address and chain). Stellar accounts need a USDC trustline.
 4. Confirm the deposit in your wallet if one is needed. Everything else is
    proven in your browser (10 to 30 s per proof) and sent by the relayer.
 
-> Your notes live in this browser's storage. Clearing site data loses access
-> to unspent notes: export a backup from **Activity**.
+> Your notes are kept in this browser and also published on-chain, encrypted
+> to your identity's key. On a new device, or after clearing site data, use
+> **Recover from chain** on the Balance page: one signature from your identity
+> wallet rebuilds your balance and any transfer waiting for its claim. (Notes
+> made before this feature, and Stellar notes older than about 7 days, which
+> the public Stellar RPC no longer serves, can only come from an Activity backup.)
 
 ## Privacy model
 

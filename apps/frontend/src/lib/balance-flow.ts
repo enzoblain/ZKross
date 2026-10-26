@@ -12,12 +12,13 @@ import { dummy, mergeNotes, resumeDeposit, salts, selectNotes, settleNotes } fro
 import { protocol } from './config'
 import { type IdentityWallet, noteKey } from './keys'
 import { type NetworkId, networkMeta } from './networks'
+import { sealOutputs } from './note-delivery'
 import { pools } from './pools'
 import * as stellar from './stellar'
 import * as store from './store'
 import type { Movement, Note, PendingNote } from './store'
 import { fieldNeg, prover, randomField } from './zk/prover'
-import type { InNote } from './zk/types'
+import type { InNote, OutNote } from './zk/types'
 
 type NewMovement = {
   kind: Movement['kind']
@@ -83,23 +84,25 @@ async function deposit(m: Movement, update: (message: string) => void) {
   store.watchNote(note)
   save(m, { note, depositUnseen: undefined })
   update('Building the deposit proof in your browser…')
+  const outputs = [
+    { pk: key.pk, amount: amount.toString(), blinding },
+    { pk: key.pk, amount: '0', blinding: randomField() },
+  ] as [OutNote, OutNote]
+  const enc = await sealOutputs(key.encPk, outputs)
   const built = await prover.buildTransact({
     levels: protocol.levels,
     leaves: await pool.noteLeaves(),
     d: await pool.adminViewKey(),
-    ext_data_hash: await pool.transactExtHash(m.account, amount),
+    ext_data_hash: await pool.transactExtHash(m.account, amount, enc),
     public_amount: amount.toString(),
     inputs: [dummy(), dummy()],
-    outputs: [
-      { pk: key.pk, amount: amount.toString(), blinding },
-      { pk: key.pk, amount: '0', blinding: randomField() },
-    ],
+    outputs,
     in_salts: salts(),
     out_salts: salts(),
   })
   const proof = await prover.prove(built)
   update(`Confirm the deposit in ${networkMeta[m.network].wallet}…`)
-  const sent = await pool.transact(m.account, proof, m.account, amount, (hash) => save(m, { txs: { ...m.txs, approve: hash } }))
+  const sent = await pool.transact(m.account, proof, m.account, amount, enc, (hash) => save(m, { txs: { ...m.txs, approve: hash } }))
   save(m, { txs: { ...m.txs, transact: sent.hash } })
   if (!(await settleNotes(m.network, [note]))) throw new Error('The deposit landed but its note is not indexed yet; retry shortly.')
 }
@@ -141,11 +144,12 @@ async function withdraw(m: Movement, update: (message: string) => void) {
   }
   const asInput = (n: Note): InNote => ({ leaf_index: n.leafIndex, sk: key.sk, amount: n.amount, blinding: n.blinding })
   update('Building the withdrawal proof in your browser…')
+  const enc = await sealOutputs(key.encPk, change)
   const built = await prover.buildTransact({
     levels: protocol.levels,
     leaves: await pool.noteLeaves(),
     d: await pool.adminViewKey(),
-    ext_data_hash: await pool.transactExtHash(m.account, -amount),
+    ext_data_hash: await pool.transactExtHash(m.account, -amount, enc),
     public_amount: fieldNeg(amount),
     inputs: [asInput(chosen[0]), chosen[1] ? asInput(chosen[1]) : dummy()],
     outputs: [
@@ -158,7 +162,7 @@ async function withdraw(m: Movement, update: (message: string) => void) {
   save(m, { inputs: chosen.map((n) => n.commitment), changeNotes: change, nullifier: built.nullifiers[0] })
   const proof = await prover.prove(built)
   update('Sending through the relayer…')
-  const sent = await pool.transact('', proof, m.account, -amount, undefined, 'relayer')
+  const sent = await pool.transact('', proof, m.account, -amount, enc, undefined, 'relayer')
   save(m, { txs: { ...m.txs, transact: sent.hash } })
   await settle()
 }

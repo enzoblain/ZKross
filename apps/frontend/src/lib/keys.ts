@@ -18,7 +18,8 @@ import type { NetworkId } from './networks'
 import { R, hex32, prover } from './zk/prover'
 import type { Hex } from './zk/types'
 
-export type NoteKey = { sk: Hex; pk: Hex }
+/** The note spending key, and the X25519 key notes are encrypted to on-chain (note-delivery.ts). */
+export type NoteKey = { sk: Hex; pk: Hex; encSk: Hex; encPk: Hex }
 
 const cache = new Map<string, NoteKey>()
 
@@ -53,8 +54,11 @@ export async function noteKey(network: NetworkId, address: string): Promise<Note
   const id = `${network}:${address}`
   const known = cache.get(id)
   if (known) return known
-  const sk = hex32(BigInt(keccak256(await signature(network, address))) % R)
-  const key = { sk, pk: await prover.pubkey(sk) }
+  const signed = await signature(network, address)
+  const sk = hex32(BigInt(keccak256(signed)) % R)
+  // The same signature also derives the encryption key: one signature, as in SPP.
+  const enc = await prover.encryptionKey(toHex(signed))
+  const key = { sk, pk: await prover.pubkey(sk), encSk: enc.sk, encPk: enc.pk }
   cache.set(id, key)
   return key
 }

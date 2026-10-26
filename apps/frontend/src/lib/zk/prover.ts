@@ -80,6 +80,14 @@ export const prover = {
   /** Admin page only: GVK decryption; `commitment` is recomputed from the plaintext. */
   decrypt: (dPriv: string, ciphertexts: GvkCiphertextHex[]) =>
     json<{ notes: DecryptedNote[] }>('decrypt', JSON.stringify({ d_priv: dPriv, ciphertexts })),
+  /** The X25519 note-delivery key pair of an identity, from its wallet's key signature. */
+  encryptionKey: (signature: Hex) => json<{ sk: Hex; pk: Hex }>('encryptionKey', signature),
+  /** X25519-XSalsa20-Poly1305 to `pk`, as SPP's note delivery (SPEC.md A, B10). */
+  encryptTo: async (pk: Hex, plaintext: Hex) => (await json<{ ciphertext: Hex }>('encryptTo', pk, plaintext)).ciphertext,
+  /** The plaintext, or null when `data` is not addressed to `sk`. */
+  decryptFrom: async (sk: Hex, data: Hex) => (await json<{ plaintext: Hex | null }>('decryptFrom', sk, data)).plaintext,
+  nullifier: async (sk: Hex, commitment: Hex, leafIndex: number) =>
+    (await json<{ nullifier: Hex }>('nullifier', sk, commitment, String(leafIndex))).nullifier,
   bridgeMessage: (req: BridgeMessageRequest) =>
     json<{ bridge_message: Hex; claim_nullifier: Hex }>('bridgeMessage', JSON.stringify(req)),
 }

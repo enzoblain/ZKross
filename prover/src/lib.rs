@@ -488,6 +488,79 @@ pub fn bridge_message_of(req: &str) -> Result<Value> {
     Ok(json!({ "bridge_message": hex(&c), "claim_nullifier": hex(&claim_nullifier(secret)) }))
 }
 
+// ========== Note delivery (SPEC.md A "Note delivery", B10) ==========
+//
+// X25519-XSalsa20-Poly1305 exactly as SPP's sdk (zk/encryption.rs):
+// `ephemeral_pk (32) ‖ nonce (24) ‖ ciphertext ‖ tag (16)`, the cipher keyed
+// with the raw X25519 shared secret. A 48-byte plaintext is SPP's note format
+// (`amount (16 LE) ‖ blinding (32 LE)`), so SPP's decrypt_output_note reads it.
+
+const ENCRYPTION_KEY_DOMAIN: &[u8] = b"zkross/encryption-key/v1";
+
+fn parse_bytes(s: &str) -> Result<Vec<u8>> {
+    let h = s.strip_prefix("0x").unwrap_or(s);
+    ensure!(h.len() % 2 == 0, "odd-length hex");
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).context("bad hex")).collect()
+}
+
+fn bytes_hex(b: &[u8]) -> String {
+    format!("0x{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+}
+
+fn bytes32(s: &str) -> Result<[u8; 32]> {
+    parse_bytes(s)?.try_into().map_err(|_| anyhow::anyhow!("expected 32 bytes"))
+}
+
+/// The X25519 key pair of an identity: SHA-256(domain ‖ the wallet's
+/// key-derivation signature), as SPP derives its own encryption key.
+pub fn encryption_key_of(signature: &str) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(ENCRYPTION_KEY_DOMAIN);
+    hasher.update(parse_bytes(signature)?);
+    let seed: [u8; 32] = hasher.finalize().into();
+    let secret = x25519_dalek::StaticSecret::from(seed);
+    let public = x25519_dalek::PublicKey::from(&secret);
+    Ok(json!({ "sk": bytes_hex(&secret.to_bytes()), "pk": bytes_hex(public.as_bytes()) }))
+}
+
+pub fn encrypt_to(pk: &str, plaintext: &str) -> Result<Value> {
+    use crypto_secretbox::{KeyInit, Nonce, XSalsa20Poly1305, aead::Aead};
+    let mut ephemeral = [0u8; 32];
+    let mut nonce = [0u8; 24];
+    getrandom::getrandom(&mut ephemeral).map_err(|e| anyhow::anyhow!("randomness: {e}"))?;
+    getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("randomness: {e}"))?;
+    let ephemeral = x25519_dalek::StaticSecret::from(ephemeral);
+    let shared = ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(bytes32(pk)?));
+    let sealed = XSalsa20Poly1305::new(shared.as_bytes().into())
+        .encrypt(&Nonce::from(nonce), parse_bytes(plaintext)?.as_slice())
+        .map_err(|_| anyhow::anyhow!("encryption failed"))?;
+    let mut out = x25519_dalek::PublicKey::from(&ephemeral).as_bytes().to_vec();
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&sealed);
+    Ok(json!({ "ciphertext": bytes_hex(&out) }))
+}
+
+/// The plaintext, or null when the data is not addressed to `sk` (scans try
+/// every event, so foreign or malformed payloads are not errors).
+pub fn decrypt_from(sk: &str, data: &str) -> Result<Value> {
+    use crypto_secretbox::{KeyInit, Nonce, XSalsa20Poly1305, aead::Aead};
+    let data = parse_bytes(data)?;
+    if data.len() < 32 + 24 + 16 {
+        return Ok(json!({ "plaintext": null }));
+    }
+    let ephemeral: [u8; 32] = data[..32].try_into()?;
+    let nonce: [u8; 24] = data[32..56].try_into()?;
+    let shared = x25519_dalek::StaticSecret::from(bytes32(sk)?).diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral));
+    let plain = XSalsa20Poly1305::new(shared.as_bytes().into()).decrypt(&Nonce::from(nonce), &data[56..]).ok();
+    Ok(json!({ "plaintext": plain.map(|p| bytes_hex(&p)) }))
+}
+
+/// A note's nullifier at `leaf_index` (to check on-chain whether it is spent).
+pub fn nullifier_of(sk: &str, commitment: &str, leaf_index: u64) -> Result<Value> {
+    Ok(json!({ "nullifier": hex(&nullifier(fe(sk)?, fe(commitment)?, Fr::from(leaf_index))) }))
+}
+
 pub fn admin_key_of(d_priv: &str) -> Result<Value> {
     let d = admin_key(fe(d_priv)?)?;
     Ok(json!({ "x": hex(&d.0), "y": hex(&d.1) }))
@@ -533,5 +606,46 @@ mod private_pool_tests {
     fn private_builder_refuses_noncanonical_external_hash() {
         let mut req=request(); req["ext_data_hash"]=json!("21888242871839275222246405745257275088548364400416034343698204186575808495617");
         assert!(build_private_transact(&req.to_string()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod note_delivery_tests {
+    use super::*;
+    use stellar_private_payments::{
+        types::{EncryptionPrivateKey, NoteAmount},
+        zk::encryption::decrypt_output_note,
+    };
+
+    #[test]
+    fn a_48_byte_note_is_read_by_spps_own_decryption() {
+        let key = encryption_key_of("0x1234").unwrap();
+        let mut note = vec![0u8; 48];
+        note[..16].copy_from_slice(&123_456_789u128.to_le_bytes());
+        note[16] = 7; // blinding = 7, little endian
+        let ct = encrypt_to(key["pk"].as_str().unwrap(), &bytes_hex(&note)).unwrap();
+        let ct = parse_bytes(ct["ciphertext"].as_str().unwrap()).unwrap();
+        assert_eq!(ct.len(), 32 + 24 + 48 + 16);
+        let sk = EncryptionPrivateKey(bytes32(key["sk"].as_str().unwrap()).unwrap());
+        let (amount, blinding) = decrypt_output_note(&sk, &ct).unwrap().unwrap();
+        assert_eq!(amount, NoteAmount::from(123_456_789u128));
+        assert_eq!(blinding.to_le_bytes()[0], 7);
+    }
+
+    #[test]
+    fn decrypts_its_own_payloads_and_nothing_else() {
+        let me = encryption_key_of("0xaa").unwrap();
+        let other = encryption_key_of("0xbb").unwrap();
+        let ct = encrypt_to(me["pk"].as_str().unwrap(), "0x0102030405").unwrap();
+        let ct = ct["ciphertext"].as_str().unwrap();
+        assert_eq!(decrypt_from(me["sk"].as_str().unwrap(), ct).unwrap()["plaintext"], "0x0102030405");
+        assert!(decrypt_from(other["sk"].as_str().unwrap(), ct).unwrap()["plaintext"].is_null());
+        assert!(decrypt_from(me["sk"].as_str().unwrap(), "0x01").unwrap()["plaintext"].is_null());
+    }
+
+    #[test]
+    fn the_key_is_deterministic_per_signature() {
+        assert_eq!(encryption_key_of("0x01").unwrap(), encryption_key_of("0x01").unwrap());
+        assert_ne!(encryption_key_of("0x01").unwrap()["pk"], encryption_key_of("0x02").unwrap()["pk"]);
     }
 }

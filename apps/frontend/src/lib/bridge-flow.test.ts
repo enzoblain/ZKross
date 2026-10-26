@@ -11,9 +11,9 @@ import type { Hex } from './zk/types'
 
 const WALLET: Record<NetworkId, string> = { ethereum: '0xA11CE', stellar: 'GALICE' }
 const TYPED: Record<NetworkId, string> = { ethereum: '0xF4E5', stellar: 'GFRESH' }
-const KEYS: Record<string, { sk: Hex; pk: Hex }> = {
-  [WALLET.ethereum]: { sk: '0x5e', pk: '0x9b' },
-  [WALLET.stellar]: { sk: '0x5f', pk: '0x9c' },
+const KEYS: Record<string, { sk: Hex; pk: Hex; encSk: Hex; encPk: Hex }> = {
+  [WALLET.ethereum]: { sk: '0x5e', pk: '0x9b', encSk: '0xe5', encPk: '0xe6' },
+  [WALLET.stellar]: { sk: '0x5f', pk: '0x9c', encSk: '0xf5', encPk: '0xf6' },
 }
 /** The identity: the MetaMask wallet, used whichever chain the transfer starts from. */
 const IDENTITY = { network: 'ethereum' as NetworkId, address: WALLET.ethereum }
@@ -55,6 +55,7 @@ vi.mock('./zk/prover', async (importOriginal) => {
         return { commitments: [fresh(), fresh()] }
       },
       prove: async () => ({}),
+      encryptTo: async (pk: string, plaintext: string) => `0xenc:${pk}:${plaintext}`,
       treeRoot: async () => '0x7007',
     },
   }
@@ -82,14 +83,14 @@ vi.mock('./pools', async () => {
       bridgeOutExtHash: async () => '0xe2' as Hex,
       bridgeInExtHash: async () => '0xe3' as Hex,
       usdcBalance: async () => 10n ** 12n,
-      transact: async (account, _proof, recipient, extAmount, _onApprove, via) =>
+      transact: async (account, _proof, recipient, extAmount, _enc, _onApprove, via) =>
         sent(network, 'transact', account, via, recipient, extAmount),
-      bridgeOut: async (account, _proof, via) => {
+      bridgeOut: async (account, _proof, _enc, via) => {
         const r = sent(network, 'bridgeOut', account, via)
         status = 'pending'
         return r
       },
-      bridgeIn: async (account, _proof, via) => sent(network, 'bridgeIn', account, via),
+      bridgeIn: async (account, _proof, _enc, via) => sent(network, 'bridgeIn', account, via),
     }
   }
   return { pools: { ethereum: pool('ethereum'), stellar: pool('stellar') } }

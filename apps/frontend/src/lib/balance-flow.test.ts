@@ -10,7 +10,7 @@ import type { Hex } from './zk/types'
 
 const WALLET: Record<NetworkId, string> = { ethereum: '0xA11CE', stellar: 'GALICE' }
 const TYPED: Record<NetworkId, string> = { ethereum: '0xF4E5', stellar: 'GFRESH' }
-const KEY = { sk: '0x5e' as Hex, pk: '0x9b' as Hex }
+const KEY = { sk: '0x5e' as Hex, pk: '0x9b' as Hex, encSk: '0xe5' as Hex, encPk: '0xe6' as Hex }
 const IDENTITY = { network: 'ethereum' as NetworkId, address: WALLET.ethereum }
 
 const h = vi.hoisted(() => ({
@@ -48,6 +48,7 @@ vi.mock('./zk/prover', async (importOriginal) => {
       buildBridgeOut: async () => ({ bridge_message: '0xc0de', claim_nullifier: '0xc1a1', change_commitments: [fresh(), fresh()] }),
       buildBridgeIn: async () => ({ commitments: [fresh(), fresh()] }),
       prove: async () => ({}),
+      encryptTo: async (pk: string, plaintext: string) => `0xenc:${pk}:${plaintext}`,
       treeRoot: async () => '0x7007',
     },
   }
@@ -74,14 +75,14 @@ vi.mock('./pools', async () => {
       bridgeOutExtHash: async () => '0xe2' as Hex,
       bridgeInExtHash: async () => '0xe3' as Hex,
       usdcBalance: async () => (network === 'stellar' && !h.trustline ? null : 10n ** 12n),
-      transact: async (account, _proof, recipient, extAmount, _onApprove, via) =>
+      transact: async (account, _proof, recipient, extAmount, _enc, _onApprove, via) =>
         sent(network, 'transact', account, via, recipient, extAmount),
-      bridgeOut: async (account, _proof, via) => {
+      bridgeOut: async (account, _proof, _enc, via) => {
         const r = sent(network, 'bridgeOut', account, via)
         status = 'pending'
         return r
       },
-      bridgeIn: async (account, _proof, via) => sent(network, 'bridgeIn', account, via),
+      bridgeIn: async (account, _proof, _enc, via) => sent(network, 'bridgeIn', account, via),
     }
   }
   return { pools: { ethereum: pool('ethereum'), stellar: pool('stellar') } }

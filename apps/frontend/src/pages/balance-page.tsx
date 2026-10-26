@@ -11,6 +11,7 @@ import { mergeSteps, settleWatched } from '../lib/bridge-flow'
 import { explorer, isDeployed, protocol } from '../lib/config'
 import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { networkMeta, validAddress, type NetworkId } from '../lib/networks'
+import { recoverFromChain } from '../lib/recovery'
 import { pools } from '../lib/pools'
 import * as store from '../lib/store'
 import type { Movement } from '../lib/store'
@@ -207,6 +208,8 @@ function BalancePage() {
   const [id, setId] = useState<Identity | null>(() => identity())
   const [walletDialogNetwork, setWalletDialogNetwork] = useState<NetworkId | null>(null)
   const [identityError, setIdentityError] = useState('')
+  const [recovering, setRecovering] = useState('')
+  const [recovered, setRecovered] = useState('')
 
   const makeIdentity = async (network: NetworkId) => {
     const wallet = wallets[network]
@@ -222,12 +225,35 @@ function BalancePage() {
     }
   }
 
+  // Rebuilds the balance from the chain: the notes are published encrypted to
+  // the identity's key, so a new browser only needs that wallet's signature.
+  const recover = async (network: NetworkId) => {
+    setRecovered('')
+    setIdentityError('')
+    const chosen = id ?? (await makeIdentity(network))
+    if (!chosen) return
+    setRecovering('Unlocking your note key…')
+    try {
+      const r = await recoverFromChain(chosen, setRecovering)
+      const amounts = NETWORKS.filter((n) => r.balance[n] > 0n).map((n) => `${formatNote(n, r.balance[n])} USDC on ${networkMeta[n].shortName}`)
+      setRecovered(
+        `Found ${r.notes} unspent note${r.notes === 1 ? '' : 's'}${amounts.length ? ` (${amounts.join(', ')})` : ''}` +
+          (r.transfers ? ` and ${r.transfers} bridge transfer${r.transfers === 1 ? '' : 's'} waiting for their claim: resume ${r.transfers === 1 ? 'it' : 'them'} from Activity.` : '.'),
+      )
+    } catch (error) {
+      setIdentityError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setRecovering('')
+    }
+  }
+  const recoverWith: NetworkId[] = id ? [id.network] : NETWORKS.filter((n) => wallets[n])
+
   return (
     <div className="page-enter">
       <div className="mx-auto mb-10 max-w-2xl text-center">
         <h1 className="text-balance text-4xl font-medium tracking-[-0.055em] sm:text-5xl">Your private balance</h1>
         <p className="mx-auto mt-5 max-w-xl text-sm leading-6 text-muted">
-          Deposit, bridge and withdraw are three separate steps. Deposit when you like, bridge with “Keep it private” on, and withdraw later, any amount, to any address. Spreading them over time and amounts makes a deposit harder to match with a withdrawal.
+          Deposit, bridge and withdraw are three separate steps. Deposit when you like, bridge with “Keep in my private balance”, and withdraw later, any amount, to any address. Spreading them over time and amounts makes a deposit harder to match with a withdrawal.
         </p>
       </div>
 
@@ -243,8 +269,20 @@ function BalancePage() {
           {id
             ? <>Your note key comes from your {networkMeta[id.network].wallet} wallet {truncateAddress(id.address)}; it owns your private balance on both chains.</>
             : <>Your first deposit makes its wallet your identity: it signs your note key, the same on both chains.</>}{' '}
-          Notes are kept in this browser only: back them up from the Activity page. The administrator can decrypt every note with the Global View Key.
+          New notes are also published on-chain, encrypted to your key, so this balance can be rebuilt on any device. The administrator can decrypt every note with the Global View Key.
         </p>
+        <div className="flex flex-wrap items-center gap-2 pt-1">
+          {recoverWith.map((network) => (
+            <button key={network} type="button" disabled={Boolean(recovering) || (id ? !wallets[id.network] || wallets[id.network]!.address !== id.address : false)} onClick={() => void recover(network)} className="focus-ring inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-[10px] font-medium text-accent hover:border-accent/40 disabled:opacity-50">
+              {recovering ? <LoaderCircle aria-hidden="true" className="size-3 animate-spin" /> : <RotateCcw aria-hidden="true" className="size-3" />}
+              Recover from chain{id ? '' : ` with ${networkMeta[network].wallet}`}
+            </button>
+          ))}
+          {!recoverWith.length && <span>Connect your identity wallet to recover your balance from the chain.</span>}
+          {id && wallets[id.network]?.address !== id.address && <span>Connect your identity wallet ({networkMeta[id.network].wallet} {truncateAddress(id.address)}) to recover.</span>}
+          {recovering && <span role="status">{recovering}</span>}
+          {recovered && <span role="status" className="text-success">{recovered}</span>}
+        </div>
       </div>
 
       <WalletConnectDialog network={walletDialogNetwork} open={Boolean(walletDialogNetwork)} onOpenChange={(open) => !open && setWalletDialogNetwork(null)} purpose="required" />
