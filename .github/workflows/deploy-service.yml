@@ -48,8 +48,13 @@ jobs:
           VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
-          printf '%s\n' "$VM_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # Secrets pasted from Windows carry \r line endings, which SSH cannot read.
+          printf '%s\n' "$VM_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$VM_KNOWN_HOSTS" | tr -d '\r' > ~/.ssh/known_hosts
+          # Host key fingerprints are public: show what is trusted, for diagnosis.
+          echo "Trusted host keys for $VM_HOST:"
+          ssh-keygen -F "$VM_HOST" -f ~/.ssh/known_hosts -l | grep -v '^#' ||
+            { echo "::error::VM_KNOWN_HOSTS has no line starting with $VM_HOST (one line per key: '$VM_HOST ssh-ed25519 AAAA…')."; exit 1; }
       - name: Pull, install and restart
         run: |
           ssh -i ~/.ssh/deploy -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" bash -s -- "$VM_REPO_DIR" "$GITHUB_SHA" <<'EOF'
