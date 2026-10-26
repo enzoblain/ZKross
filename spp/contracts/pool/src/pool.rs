@@ -425,12 +425,6 @@ impl PoolContract {
         hash_ext_data(env, ext, token)
     }
 
-    /// Public integration views. Values come from immutable pool configuration.
-    pub fn external_data_hash(env: &Env, ext: ExtData) -> Result<BytesN<32>, Error> {
-        let token = Self::get_token(env)?;
-        Ok(hash_ext_data(env, &ext, &token))
-    }
-
     /// Executes a shielded transaction.
     ///
     /// Tokens move only after every check and the proof pass and the pool's
@@ -610,7 +604,7 @@ impl PoolContract {
     // ========== Storage Getters and Setters ==========
 
     /// Get the token contract address
-    pub fn get_token(env: &Env) -> Result<Address, Error> {
+    fn get_token(env: &Env) -> Result<Address, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Token)
@@ -626,7 +620,7 @@ impl PoolContract {
     }
 
     /// Get the verifier contract address
-    pub fn get_verifier(env: &Env) -> Result<Address, Error> {
+    fn get_verifier(env: &Env) -> Result<Address, Error> {
         env.storage()
             .instance()
             .get(&DataKey::Verifier)

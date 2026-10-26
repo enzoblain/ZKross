@@ -29,5 +29,5 @@ ZK="$M/apps/frontend/public/zk"
 mkdir -p "$ZK"
 bash "$REPO/scripts/build/prover-wasm.sh" "$ZK" >&2
 [ -f "$BUILD/circuits/bridge_out.r1cs" ] || bash "$REPO/scripts/build/collect-circuits.sh" >&2
-cp "$BUILD"/circuits/{policy_tx_2_2,policy_tx_2_2_gvk_T,bridge_out,bridge_in}{_proving_key.bin,.graph.bin,.r1cs} "$ZK/"
+cp "$BUILD"/circuits/{policy_tx_2_2_gvk_T,bridge_out,bridge_in}{_proving_key.bin,.graph.bin,.r1cs} "$ZK/"
 echo "$M"

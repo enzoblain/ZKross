@@ -38,9 +38,9 @@ function WalletConnectDialog({
   const wallet = wallets[network]
   const isConnecting = connecting === network
   const purposeCopy = {
-    required: 'This source wallet authorizes the private intake and the CCTP transfer in live testnet mode.',
-    destination: 'Optional: connect this wallet only when you want to withdraw a private destination note publicly.',
-    optional: 'Optional: use this public address for a later withdrawal. A second wallet is not required to bridge.',
+    required: 'This wallet deposits USDC into the source pool when your private balance does not cover the amount. Your identity wallet signs your note key.',
+    destination: 'Not needed to bridge: you type the destination address and the relayer claims and withdraws to it.',
+    optional: 'Optional: connect it to make it your identity wallet. A second wallet is not required to bridge.',
     liquidity: 'Connect the pool admin wallet for this chain. Only the admin can add liquidity to the pool.',
   }[purpose]
 

@@ -21,6 +21,3 @@ cache/
 
 # Browser prover and circuit files, staged by scripts/build/sync-frontend.sh
 /apps/frontend/public/zk/
-
-# Runtime batch queue (bearer-token hashes and user intents)
-/services/relayer/data/

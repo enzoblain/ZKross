@@ -1,9 +1,7 @@
 import {
   Activity,
   ArrowLeftRight,
-  CircleDollarSign,
   Droplets,
-  FlaskConical,
   KeyRound,
   Moon,
   ScanEye,
@@ -25,8 +23,6 @@ type AppShellProps = {
   onNavigate: (page: PageId) => void
   theme: Theme
   onThemeChange: (theme: Theme) => void
-  experimental: boolean
-  onExperimentalChange: (enabled: boolean) => void
   children: ReactNode
 }
 
@@ -43,38 +39,6 @@ const appNavigation = [
   { id: 'privacy', label: 'Privacy', icon: ScanEye },
   { id: 'compliance', label: 'Compliance', icon: ShieldCheck },
 ] satisfies NavItem[]
-
-// Enzo's CCTP pages, shown only with the experimental setting on.
-const experimentalNavigation = [
-  { id: 'cctp-bridge', label: 'CCTP bridge', icon: FlaskConical },
-  { id: 'private-balance', label: 'Private balance', icon: CircleDollarSign },
-  { id: 'cctp-activity', label: 'CCTP activity', icon: Activity },
-  { id: 'cctp-privacy', label: 'CCTP privacy', icon: ScanEye },
-  { id: 'cctp-compliance', label: 'CCTP compliance', icon: ShieldCheck },
-] satisfies NavItem[]
-
-function ExperimentalButton({
-  experimental,
-  onExperimentalChange,
-}: Pick<AppShellProps, 'experimental' | 'onExperimentalChange'>) {
-  const label = experimental ? 'Hide experimental CCTP pages' : 'Show experimental CCTP pages'
-
-  return (
-    <button
-      type="button"
-      className={cn(
-        'focus-ring grid size-9 place-items-center rounded-xl border bg-surface transition-colors hover:border-border-strong hover:text-foreground',
-        experimental ? 'border-accent/40 text-accent' : 'border-border text-muted',
-      )}
-      onClick={() => onExperimentalChange(!experimental)}
-      aria-pressed={experimental}
-      aria-label={label}
-      title={label}
-    >
-      <FlaskConical aria-hidden="true" className="size-4" />
-    </button>
-  )
-}
 
 function ThemeButton({
   theme,
@@ -100,12 +64,10 @@ function AppShell({
   onNavigate,
   theme,
   onThemeChange,
-  experimental,
-  onExperimentalChange,
   children,
 }: AppShellProps) {
   const isLanding = activePage === 'landing'
-  const navigation: NavItem[] = experimental ? [...appNavigation, ...experimentalNavigation] : appNavigation
+  const navigation: NavItem[] = appNavigation
   const { wallets } = useWallets()
   const walletCount = Object.keys(wallets).length
 
@@ -186,7 +148,6 @@ function AppShell({
                 <KeyRound aria-hidden="true" className="size-4" />
               </button>
             )}
-            {!isLanding && <ExperimentalButton experimental={experimental} onExperimentalChange={onExperimentalChange} />}
             <ThemeButton theme={theme} onThemeChange={onThemeChange} />
             {isLanding ? (
               <Button variant="accent" size="sm" onClick={() => onNavigate('bridge')}>

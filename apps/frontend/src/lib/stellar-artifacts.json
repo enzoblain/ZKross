@@ -1,7 +1,0 @@
-{
-  "asp_membership": "738c6d0746a3d6c6a3e32312776ef453eb0e1ae0034db8cf7d88c7da2a589ea6",
-  "asp_non_membership": "4ffb59047d1452bc5e3ce645ce31ad105dc00d63744374047c8961e798a643c5",
-  "circom_groth16_verifier": "994758f6629b26a0e837e3e357960a4ffd778df189b82b5f3b4f716b04bc545b",
-  "pool": "34d0a07f667c2a544773fab6eb86369c865538e56c0b135028ec720b54f8b59c",
-  "batch_inbox": "dc56fa7fdd3e9786e57a7ae2a7abace9a3fb7644e9c1c2a08d41b6a3dd214adf"
-}

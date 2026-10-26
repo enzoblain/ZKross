@@ -4,7 +4,6 @@ import {
   type ReactNode,
 } from 'react'
 
-import { lockNoteVault } from '../lib/vault-session'
 import type { NetworkId } from '../lib/networks'
 import { connectInjectedWallet } from '../lib/wallet-adapters'
 import { WalletContext, type Wallets } from './wallet-context'
@@ -18,7 +17,6 @@ function WalletProvider({ children }: { children: ReactNode }) {
     const provider = window.ethereum
     if (!provider?.on) return
     const invalidate = () => {
-      lockNoteVault()
       setWallets(current => { const next = { ...current }; delete next.ethereum; return next })
     }
     provider.on('accountsChanged', invalidate)
@@ -33,7 +31,6 @@ function WalletProvider({ children }: { children: ReactNode }) {
 
     try {
       const wallet = await connectInjectedWallet(network)
-      lockNoteVault()
       setWallets((current) => ({ ...current, [network]: wallet }))
     } catch (error) {
       setErrors((current) => ({
@@ -47,7 +44,6 @@ function WalletProvider({ children }: { children: ReactNode }) {
   }
 
   const disconnectWallet = (network: NetworkId) => {
-    lockNoteVault()
     setWallets((current) => {
       const next = { ...current }
       delete next[network]
