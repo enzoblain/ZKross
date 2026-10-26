@@ -39,7 +39,11 @@ async function handle({ op, args }: WorkerRequest): Promise<string> {
     ])
     return prover.prove(args[0], pk, graph, r1cs)
   }
-  const fn = prover[op] as (...a: string[]) => string
+  const fn = prover[op] as ((...a: string[]) => string) | undefined
+  // A site newer than its staged prover (public/zk built before this op existed).
+  if (typeof fn !== 'function') {
+    throw new Error(`The browser prover in public/zk is out of date (no ${op}): rebuild it with bash scripts/build/stage-zk.sh, then reload the page.`)
+  }
   return fn(...args)
 }
 
