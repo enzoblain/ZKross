@@ -17,6 +17,19 @@ target and `wasm-bindgen-cli` 0.2.128, Foundry, the `stellar` CLI, Circom.
 Throwaway testnet keys come from `scripts/testnet/create-accounts.sh` and live
 in the git-ignored `.env`; never use mainnet or keys holding real funds.
 
+### Everything at once
+
+```sh
+npm start                          # the bridge service and the site, in one terminal
+npm start -- --site-only           # or only one of them
+npm start -- --service-only
+```
+
+`scripts/dev.sh` checks what is missing first (`.env`, the Ethereum ABIs, the
+browser prover files, a busy relayer port), reuses a relayer already running,
+prefixes each output with `[service]` / `[site]`, and Ctrl+C stops both.
+Sections 1 and 2 below run them separately.
+
 ### 1. The site
 
 ```sh

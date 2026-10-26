@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "npm run test:frontend",
+    "start": "bash scripts/dev.sh",
     "dev": "npm run dev --workspace=apps/frontend",
     "build:frontend": "npm run build --workspace=apps/frontend",
     "test:ethereum": "forge test --root contracts/ethereum",
