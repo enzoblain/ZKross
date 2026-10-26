@@ -1,7 +1,8 @@
 // The Stellar pool from TypeScript. Calls go through the `stellar` CLI, which
 // converts JSON arguments using the contract's own spec and simulates before
 // sending; events are read with the Stellar SDK's RPC client.
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
+import { promisify } from "node:util";
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import { STELLAR_RPC } from "./config.ts";
 import type { Hex, Proved } from "./prover.ts";
@@ -33,6 +34,7 @@ function big(_k: string, v: unknown) {
 }
 
 const server = new rpc.Server(STELLAR_RPC);
+const execFileAsync = promisify(execFile);
 
 export type StellarEvent = { name: string; topics: any[]; data: any; ledger: number; txHash: string };
 
@@ -140,3 +142,15 @@ export function bridgeInProof(p: Proved) {
 }
 
 export const latestLedger = async () => (await server.getLatestLedger()).sequence;
+
+/** `stellar contract invoke --build-only`: the unsigned, unsimulated
+ * transaction (base64 XDR), with JSON arguments encoded from the contract's
+ * spec. Asynchronous, so it never blocks a long-running service. */
+export async function buildInvoke(source: string, contract: string, fn: string, args: Record<string, unknown>): Promise<string> {
+  const argv = ["contract", "invoke", "--id", contract, "--source", source, "--network", "testnet", "--build-only", "--", fn];
+  for (const [k, v] of Object.entries(args)) argv.push(`--${k}`, typeof v === "string" ? v : JSON.stringify(v, big));
+  const { stdout } = await execFileAsync("stellar", argv, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  return stdout.trim().split("\n").pop() ?? "";
+}
+
+export { server as rpcServer };

@@ -57,8 +57,8 @@ export async function round(): Promise<Posted[]> {
   return out;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const once = process.argv.includes("--once");
+/** Posts roots every ZKROSS_POST_INTERVAL seconds (60), or once. */
+export async function runRootPoster(once = false) {
   const interval = Number(env.ZKROSS_POST_INTERVAL ?? 60) * 1000;
   for (;;) {
     for (const p of await round()) console.log(`[root-poster] ${p.direction} root ${p.root}: ${p.tx}`);
@@ -66,3 +66,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     await new Promise((r) => setTimeout(r, interval));
   }
 }
+
+if (import.meta.url === `file://${process.argv[1]}`) await runRootPoster(process.argv.includes("--once"));

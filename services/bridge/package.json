@@ -5,7 +5,10 @@
   "description": "ZKross root poster, refund attester and the shared chain/prover library (run inside WSL)",
   "scripts": {
     "root-poster": "tsx src/root-poster.ts",
-    "refund-attester": "tsx src/refund-attester.ts"
+    "refund-attester": "tsx src/refund-attester.ts",
+    "service": "tsx src/service.ts",
+    "relayer": "tsx src/service.ts --only=relayer",
+    "test": "node --import tsx --test src/relayer.test.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^13.3.0",
