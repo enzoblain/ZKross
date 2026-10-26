@@ -270,6 +270,27 @@ The browser prover and circuit files must be staged once in
 site loads but cannot generate proofs. The refund attester runs separately:
 `npm run refund-attester` in `services/bridge`.
 
+### Windows (WSL2)
+
+The scripts and the build chain (Rust, circuits, Foundry, Stellar CLI) target
+Linux and macOS, so on Windows use **WSL2** (Ubuntu). Inside WSL, the steps
+are the same as on Linux:
+
+```sh
+npm install
+bash scripts/build/stage-zk.sh   # once: browser prover and circuit files
+npm start
+```
+
+- Clone the repo inside the WSL file system (for example `~/zkross`), not
+  under `C:\` or OneDrive (`/mnt/c/...`): builds there are very slow and
+  OneDrive would sync the generated files. If the repo has to stay on the
+  Windows side, `scripts/build/sync-frontend.sh` and `sync-spp.sh` build in a
+  WSL-native mirror (`~/zkross-build`) instead.
+- Open the site in your Windows browser at <http://127.0.0.1:5173>: WSL2
+  forwards `localhost`, so MetaMask and Freighter work as usual.
+- Native Windows (PowerShell) is not supported.
+
 ### Services in detail
 
 - **Relayer** (`POST /relay`, `GET /status/:hash`, `GET /health`). Relays only
