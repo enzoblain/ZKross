@@ -25,6 +25,14 @@
     "usdc": {
       "address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
       "decimals": 6
+    },
+    "zkross": {
+      "pool": "0xD8fbbCEeeeFb17a6970Eb7e920efb57fFDEe36F6",
+      "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "deployBlock": 11994639,
+      "transactVerifier": "0x762797baF1537EcC9E767Bb5987061f96Fe1930c",
+      "bridgeOutVerifier": "0xef34B9d00B6a247eAfD1989DfC5e35c6E33cDe18",
+      "bridgeInVerifier": "0x2D4BE3179507DdE364dadA61127ad6c621946249"
     }
   }
 }

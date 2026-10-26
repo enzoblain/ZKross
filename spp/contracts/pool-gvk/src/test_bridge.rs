@@ -416,8 +416,40 @@ fn bridge_functions_refuse_before_init_bridge() {
     let env = test_env();
     env.mock_all_auths();
     let (pool, ..) = deploy_pool(&env);
-    assert_eq!(err(pool.try_post_remote_root(&U256::from_u32(&env, 1))), Error::NotInitialized);
+    let one = U256::from_u32(&env, 1);
+    let sender = Address::generate(&env);
+    let sig = BytesN::from_array(&env, &[0u8; 65]);
+    let hash = BytesN::from_array(&env, &[0u8; 32]);
+    let out = BridgeOutProof {
+        proof: mk_mock_groth16_proof(&env),
+        root: pool.get_root(),
+        input_nullifiers: soroban_sdk::vec![&env, one.clone(), U256::from_u32(&env, 2)],
+        change_commitment0: one.clone(),
+        change_commitment1: one.clone(),
+        bridge_message: one.clone(),
+        refund_commitment: one.clone(),
+        deadline_bucket: hour(&env) + 24,
+        ext_data_hash: hash.clone(),
+        ciphertexts: cts(&env, 6, 100),
+    };
+    let inp = BridgeInProof {
+        proof: mk_mock_groth16_proof(&env),
+        remote_root: one.clone(),
+        claim_nullifier: one.clone(),
+        output_commitment0: one.clone(),
+        output_commitment1: one.clone(),
+        deadline_bucket: hour(&env) + 24,
+        ext_data_hash: hash,
+        ciphertexts: cts(&env, 2, 200),
+    };
+    assert_eq!(err(pool.try_post_remote_root(&one)), Error::NotInitialized);
     assert_eq!(err(pool.try_get_outbox_root()), Error::NotInitialized);
+    assert_eq!(err(pool.try_get_bridge_config()), Error::NotInitialized);
+    assert_eq!(err(pool.try_bridge_out(&out, &out_ext(&env), &sender)), Error::NotInitialized);
+    assert_eq!(err(pool.try_bridge_in(&inp, &in_ext(&env), &sender)), Error::NotInitialized);
+    // No message can be pending before init_bridge, so settling refuses earlier.
+    assert_eq!(err(pool.try_finalize(&one, &sig)), Error::NotPending);
+    assert_eq!(err(pool.try_refund(&one, &sig)), Error::NotPending);
 }
 
 // ========== post_remote_root and add_liquidity ==========

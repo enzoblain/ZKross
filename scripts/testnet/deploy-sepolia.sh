@@ -16,7 +16,12 @@ export ZKROSS_REMOTE_CHAIN_ID=$(jq -r .stellarTestnet.chainId "$REPO/deployments
 export ZKROSS_MAX_DEPOSIT=10000000
 
 cd "$REPO/contracts/ethereum"
-forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC" --private-key "$SEPOLIA_DEPLOYER_KEY" --broadcast --slow
+# Sepolia now prices state creation (code, new accounts) far above forge's
+# local simulation (about 1 590 gas per code byte): the gas limits get an 8x
+# margin (only used gas is paid). Fees: Sepolia's base fee is a few wei, so a
+# 0.01 gwei tip is plenty; forge would otherwise tip 1 gwei.
+forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC" --private-key "$SEPOLIA_DEPLOYER_KEY" --broadcast --slow \
+  --gas-estimate-multiplier 800 --priority-gas-price 10000000 --with-gas-price 50000000
 node -e '
 const fs = require("fs");
 const d = JSON.parse(fs.readFileSync(process.argv[1]));
