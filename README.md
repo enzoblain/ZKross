@@ -33,6 +33,7 @@ Built during **HackMeridian** on top of
 - [Testing](#testing)
 - [Repository layout](#repository-layout)
 - [Team and acknowledgements](#team-and-acknowledgements)
+- [License](#license)
 
 ---
 
@@ -354,3 +355,9 @@ Thanks to:
 - [Circle](https://www.circle.com) for testnet USDC on both chains
 - The [Stellar](https://stellar.org) ecosystem and its
   [privacy and ZK resources](https://github.com/stellar/ecosystem-resources/tree/main/privacy-zk)
+
+## License
+
+ZKross is licensed under the [Apache License 2.0](LICENSE). It includes
+Stellar Private Payments under `spp/`, also Apache 2.0, some parts of which
+carry other licenses; see [`NOTICE`](NOTICE).

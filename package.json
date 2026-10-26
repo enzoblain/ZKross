@@ -28,5 +28,6 @@
     "packages/*",
     "services/prover",
     "services/relayer"
-  ]
+  ],
+  "license": "Apache-2.0"
 }

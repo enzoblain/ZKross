@@ -1,0 +1,9 @@
+ZKross
+Copyright 2026 the ZKross contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes Stellar Private Payments (under spp/), Copyright 2025 Stellar
+Development Foundation, licensed under the Apache License, Version 2.0.
+Some parts of spp/ carry other licenses: its circuit compiler tool is GPLv3
+and the compiled circuits are LGPLv3. See the license files under spp/.
