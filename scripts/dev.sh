@@ -52,7 +52,7 @@ if [ "$SERVICE" = 1 ]; then
     echo "→ Building the Ethereum contracts for their ABIs (forge build)…"
     (cd "$REPO/contracts/ethereum" && forge build >/dev/null) || fail "forge build failed."
   fi
-  [ -d "$REPO/services/bridge/node_modules" ] || (echo "→ Installing services/bridge…" && cd "$REPO/services/bridge" && npm install --silent)
+  [ -x "$REPO/node_modules/.bin/tsx" ] || fail "tsx is missing: run npm install at the repo root."
 fi
 
 if [ "$SITE" = 1 ]; then
