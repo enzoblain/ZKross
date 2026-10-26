@@ -5,9 +5,8 @@
 // are recorded as spent; a bridge out still waiting for its claim becomes a
 // transfer to resume, kept in the private balance on arrival (its public
 // recipient is not recorded on-chain).
-// Limits: Stellar RPC keeps about 7 days of events, so older Stellar notes are
-// not found; notes made before note delivery carry placeholders and cannot be
-// recovered this way.
+// Limit: Stellar RPC keeps about 7 days of events, so older Stellar notes are
+// not found.
 import { toNoteAmount } from './amounts'
 import { chainId, isDeployed, protocol } from './config'
 import { type IdentityWallet, type NoteKey, noteKey } from './keys'
@@ -31,8 +30,7 @@ const NETWORKS: NetworkId[] = ['ethereum', 'stellar']
 /**
  * A note of `key` worth exactly `amount` on `network`, published on-chain,
  * unspent and not already some transfer's claim note: the note of a claim
- * made elsewhere (another tab or browser). Null if none (or it predates note
- * delivery).
+ * made elsewhere (another tab or browser). Null if none.
  */
 export async function findPublishedNote(network: NetworkId, key: NoteKey, amount: bigint): Promise<PendingNote | null> {
   const taken = new Set(store.transfers().flatMap((t) => (t.to === network ? (t.claimNotes ?? []).map((n) => BigInt(n.commitment)) : [])))

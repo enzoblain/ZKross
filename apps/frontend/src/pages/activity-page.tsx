@@ -15,7 +15,7 @@ import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
 import { useWallets } from '../components/wallet-context'
 import { formatMessage } from '../lib/amounts'
-import { identityOf, runTransfer } from '../lib/bridge-flow'
+import { runTransfer } from '../lib/bridge-flow'
 import { explorer, isDeployed } from '../lib/config'
 import { networkMeta } from '../lib/networks'
 import * as store from '../lib/store'
@@ -69,7 +69,7 @@ function ActivityPage() {
 
   const canResume = (transfer: Transfer) =>
     !store.isFinished(transfer) &&
-    wallets[identityOf(transfer).network]?.address === identityOf(transfer).address &&
+    wallets[transfer.identity.network]?.address === transfer.identity.address &&
     (!transfer.sender || wallets[transfer.from]?.address === transfer.sender) &&
     isDeployed(transfer.from) &&
     isDeployed(transfer.to)
@@ -123,7 +123,8 @@ function ActivityPage() {
         ) : (
           <div className="divide-y divide-border">
             {transfers.map((transfer) => {
-              const status = statusCopy[transfer.status]
+              // Records from before the identity wallet are shown, never resumed.
+              const status = store.isLegacy(transfer) ? { label: 'Old record · not resumable', tone: 'text-subtle' } : statusCopy[transfer.status]
               const resumable = canResume(transfer)
               const isRunning = runningId === transfer.id
               return (

@@ -30,7 +30,7 @@ import {
 import { WalletConnectDialog } from '../components/wallet-connect-dialog'
 import { useWallets } from '../components/wallet-context'
 import { formatMessage, formatNote, parseUnits, toNoteAmount } from '../lib/amounts'
-import { createProgress, createTransfer, identityOf, mergeSteps, runTransfer, settleWatched, type FlowStepId } from '../lib/bridge-flow'
+import { createProgress, createTransfer, mergeSteps, runTransfer, settleWatched, type FlowStepId } from '../lib/bridge-flow'
 import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { chainId, explorer, isDeployed, poolAddress, protocol } from '../lib/config'
 import { networkMeta, otherNetwork, validAddress, type NetworkId, type TransferProgressStep } from '../lib/networks'
@@ -263,7 +263,7 @@ function BridgePage() {
   const latestCanResume = Boolean(
     transfer &&
       !store.isFinished(transfer) &&
-      wallets[identityOf(transfer).network]?.address === identityOf(transfer).address &&
+      wallets[transfer.identity.network]?.address === transfer.identity.address &&
       (!transfer.sender || sourceWallet?.address === transfer.sender) &&
       deploymentReady &&
       runStatus !== 'running',

@@ -4,8 +4,7 @@
 // it from the wallet), so they alone cannot spend or claim anything.
 // This is a cache: every note is also published on-chain encrypted to its
 // owner (SPEC.md B10, note-delivery.ts), and recovery.ts rebuilds these
-// records from the chain after site data is cleared. Notes made before note
-// delivery carry placeholders and live only here.
+// records from the chain after site data is cleared.
 import type { NetworkId } from './networks'
 import type { Hex } from './zk/types'
 
@@ -46,11 +45,8 @@ export type Transfer = {
   keepPrivate?: boolean
   /** Source-chain wallet that deposits; empty when the private balance covers the amount. */
   sender: string
-  /** The wallet that derives the note key; absent on older transfers, whose
-   * key came from the source wallet (`from`, `sender`). */
-  identity?: { network: NetworkId; address: string }
-  /** Destination wallet of transfers made before the single note key; never set now. */
-  claimer?: string
+  /** The wallet that derives the note key (keys.ts). */
+  identity: { network: NetworkId; address: string }
   deadlineBucket: string
   claimSecret: Hex
   recipientPk: Hex
@@ -71,8 +67,6 @@ export type Transfer = {
   /** The resumed deposit's note was not seen on chain and the user was told;
    * the next retry deposits again (the earlier note stays watched). */
   depositUnseen?: boolean
-  /** Ignored: older transfers could send the bridge out from the wallet; now the relayer always does. */
-  via?: 'relayer' | 'wallet'
   status: TransferStatus
   txs: Partial<Record<'approve' | 'deposit' | 'bridgeOut' | 'bridgeIn' | 'trustline' | 'withdraw', string>>
   error?: string
@@ -207,8 +201,11 @@ export function markSpent(network: NetworkId, commitments: Hex[]) {
   save(data)
 }
 
+/** A record from a version of ZKross before the identity wallet: kept for display, never resumed. */
+export const isLegacy = (t: Transfer) => !t.identity
+
 /** Nothing is left to do for `t`. */
-export const isFinished = (t: Transfer) => t.status === 'withdrawn' || t.status === 'kept' || t.status === 'refunded'
+export const isFinished = (t: Transfer) => isLegacy(t) || t.status === 'withdrawn' || t.status === 'kept' || t.status === 'refunded'
 
 export const transfers = () => load().transfers.slice().sort((a, b) => b.createdAt - a.createdAt)
 

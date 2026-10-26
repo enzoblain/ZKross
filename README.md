@@ -162,9 +162,9 @@ every 2 hours per address and chain). Stellar accounts need a USDC trustline.
 > Your notes are kept in this browser and also published on-chain, encrypted
 > to your identity's key. On a new device, or after clearing site data, use
 > **Recover from chain** on the Balance page: one signature from your identity
-> wallet rebuilds your balance and any transfer waiting for its claim. (Notes
-> made before this feature, and Stellar notes older than about 7 days, which
-> the public Stellar RPC no longer serves, can only come from an Activity backup.)
+> wallet rebuilds your balance and any transfer waiting for its claim. (Stellar
+> notes older than about 7 days, which the public Stellar RPC no longer serves,
+> can only come from an Activity backup.)
 
 ## Privacy model
 

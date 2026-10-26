@@ -254,16 +254,10 @@ async function merge(network: NetworkId, key: NoteKey, a: Note, b: Note) {
 
 const nowHour = () => BigInt(Math.floor(Date.now() / 3_600_000))
 
-/** The identity wallet of `t`; older transfers derived their key from the source wallet. */
-export const identityOf = (t: Transfer): IdentityWallet => t.identity ?? { network: t.from, address: t.sender }
-
 /** The user's note key, from the identity wallet; it owns the notes on both chains. */
 async function identityFor(t: Transfer): Promise<NoteKey> {
-  if (t.recipientPk !== t.refundPk) {
-    throw new Error('This transfer was started with a destination-wallet note key, which this version no longer uses. Start a new transfer.')
-  }
-  const wallet = identityOf(t)
-  const key = await noteKey(wallet.network, wallet.address)
+  if (store.isLegacy(t)) throw new Error('This transfer was made by an older version of ZKross and cannot be resumed.')
+  const key = await noteKey(t.identity.network, t.identity.address)
   if (t.recipientPk !== '0x' && t.recipientPk !== key.pk) {
     throw new Error('Connect the same identity wallet that started this transfer.')
   }
@@ -458,7 +452,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
         // encrypted to this identity, so take it from the chain.
         const found = await findPublishedNote(t.to, key, amountTo)
         if (!found) {
-          throw new Error('This transfer was already claimed elsewhere, and its note is not on-chain for this identity (it predates on-chain note delivery). Finish it in the browser that claimed it, or restore that browser’s Activity backup.')
+          throw new Error('This transfer was already claimed elsewhere, and its note is not on-chain for this identity yet. Retry shortly, or finish it in the browser that claimed it.')
         }
         save(t, { claimNotes: [found] })
       }

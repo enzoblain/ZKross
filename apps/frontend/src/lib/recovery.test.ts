@@ -172,7 +172,7 @@ describe('recovering from the chain', () => {
     await deposit('stellar', 20_000_000n)
     const [, second, third] = h.published.stellar.filter((_, i) => i % 2 === 0)
     // The newest 20 USDC note is already another transfer's claim note.
-    store.putTransfer({ id: 'other', from: 'ethereum', to: 'stellar', createdAt: 0, amount: '2000000', recipient: '', sender: '', deadlineBucket: '0', claimSecret: '0x1', recipientPk: KEY.pk, refundPk: KEY.pk, refundBlinding: '0x1', status: 'claimed', txs: {}, claimNotes: [{ network: 'stellar', pk: KEY.pk, amount: '20000000', blinding: '0x1', commitment: third.commitment }] })
+    store.putTransfer({ id: 'other', from: 'ethereum', to: 'stellar', createdAt: 0, amount: '2000000', recipient: '', sender: '', identity: IDENTITY, deadlineBucket: '0', claimSecret: '0x1', recipientPk: KEY.pk, refundPk: KEY.pk, refundBlinding: '0x1', status: 'claimed', txs: {}, claimNotes: [{ network: 'stellar', pk: KEY.pk, amount: '20000000', blinding: '0x1', commitment: third.commitment }] })
 
     expect((await findPublishedNote('stellar', KEY, 20_000_000n))?.commitment).toBe(second.commitment)
     h.spent.add(await prover.nullifier(KEY.sk, second.commitment, second.index))

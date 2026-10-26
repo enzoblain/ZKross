@@ -202,15 +202,6 @@ it('asks for the source wallet when the private balance does not cover the amoun
   expect(h.calls).toEqual([])
 })
 
-it('resumes an older transfer with the key of its source wallet', async () => {
-  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 1_000_000n, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
-  delete t.identity
-  await runTransfer(t, () => {})
-
-  expect(vi.mocked(noteKey).mock.calls.every(([network, address]) => network === 'stellar' && address === WALLET.stellar)).toBe(true)
-  expect(t.recipientPk).toBe(KEYS[WALLET.stellar].pk)
-})
-
 it('resumes after the relayer failed the bridge out, without depositing again', async () => {
   h.failRelay = 'bridgeOut'
   const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 1_000_000n, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
@@ -224,9 +215,11 @@ it('resumes after the relayer failed the bridge out, without depositing again', 
   expect(h.calls.filter((c) => c.via !== 'relayer')).toEqual([])
 })
 
-it('refuses to resume a transfer started with a destination-wallet key', async () => {
+it('treats a record from before the identity wallet as finished, and never resumes it', async () => {
   const t = createTransfer({ from: 'ethereum', to: 'stellar', amount: 1_000_000n, identity: IDENTITY, sender: WALLET.ethereum, recipient: TYPED.stellar })
-  Object.assign(t, { recipientPk: '0x1111', refundPk: '0x2222', claimer: 'GBOB' })
-  await expect(runTransfer(t, () => {})).rejects.toThrow('destination-wallet note key')
+  const old = { ...t, identity: undefined } as unknown as typeof t
+  expect(store.isFinished(old)).toBe(true)
+  await expect(runTransfer(old, () => {})).rejects.toThrow('older version of ZKross')
   expect(noteKey).not.toHaveBeenCalled()
+  expect(h.calls).toEqual([])
 })
