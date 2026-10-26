@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sets up the bridge service (relayer + root poster) on a fresh Ubuntu VM
-# (22.04 or 24.04, x86_64 or arm64): Oracle Cloud "Always Free", an AWS or
+# (22.04 or later, x86_64 or arm64): Oracle Cloud "Always Free", an AWS or
 # Google Cloud free-tier instance, any VPS. Run it from a checkout of the repo,
 # after copying the testnet .env to the repo root:
 #   bash scripts/deploy/server-setup.sh https://<site origin> [relayer host]
@@ -35,10 +35,19 @@ step "System packages"
 sudo apt-get update -qq
 sudo apt-get install -y -qq curl git ca-certificates caddy >/dev/null
 
-if ! node -v 2>/dev/null | grep -qE '^v(2[0-9]|[3-9][0-9])\.'; then
-  step "Node.js 20"
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null
-  sudo apt-get install -y -qq nodejs >/dev/null
+node_ok() { node -v 2>/dev/null | grep -qE '^v(2[0-9]|[3-9][0-9])\.'; }
+if ! node_ok; then
+  # Ubuntu's own Node.js when it is recent enough (24.04 and later), else
+  # NodeSource's Node.js 22 (Node 20 is no longer maintained).
+  if apt-cache policy nodejs | sed -n 's/^ *Candidate: //p' | grep -qE '^(2[0-9]|[3-9][0-9])\.'; then
+    step "Node.js from Ubuntu"
+    sudo apt-get install -y -qq nodejs npm >/dev/null
+  else
+    step "Node.js 22 from NodeSource"
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null
+    sudo apt-get install -y -qq nodejs >/dev/null
+  fi
+  node_ok || fail "Could not install Node.js 20 or later."
 fi
 
 if ! command -v stellar >/dev/null; then

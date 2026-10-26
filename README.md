@@ -336,7 +336,7 @@ in free plans; check each provider's current terms, as free tiers change.
 Hosts that put free services to sleep do not work for the bridge service:
 while it sleeps, no root is posted and transfers wait.
 
-**1. The bridge service, on an Ubuntu VM** (22.04 or 24.04, x86_64 or arm64)
+**1. The bridge service, on an Ubuntu VM** (22.04 or later, x86_64 or arm64)
 
 ```sh
 git clone https://github.com/enzoblain/ZKross.git && cd ZKross   # main
