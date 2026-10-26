@@ -7,7 +7,7 @@
 // through the relayer and needs no wallet. Each operation saves what it
 // creates before sending, so `runMovement` resumes after a reload.
 import { formatNote } from './amounts'
-import { dummy, salts, selectNotes, settleNotes } from './bridge-flow'
+import { dummy, resumeDeposit, salts, selectNotes, settleNotes } from './bridge-flow'
 import { protocol } from './config'
 import { type IdentityWallet, noteKey } from './keys'
 import { type NetworkId, networkMeta } from './networks'
@@ -65,7 +65,7 @@ export async function runMovement(m: Movement, update: (message: string) => void
 async function deposit(m: Movement, update: (message: string) => void) {
   const pool = pools[m.network]
   const amount = BigInt(m.amount)
-  if (m.note && (await settleNotes(m.network, [m.note], 1))) return
+  if (await resumeDeposit(m.network, m.note, m.txs.transact, m.depositUnseen, () => save(m, { depositUnseen: true }))) return
   const key = await noteKey(m.identity.network, m.identity.address)
   const balance = await pool.usdcBalance(m.account)
   if (balance === null || balance < amount) {
@@ -79,7 +79,8 @@ async function deposit(m: Movement, update: (message: string) => void) {
     blinding,
     commitment: await prover.commitment(amount, key.pk, blinding),
   }
-  save(m, { note })
+  store.watchNote(note)
+  save(m, { note, depositUnseen: undefined })
   update('Building the deposit proof in your browser…')
   const built = await prover.buildTransact({
     levels: protocol.levels,

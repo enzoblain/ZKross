@@ -69,6 +69,9 @@ export type Transfer = {
   remoteLeafCount?: number
   claimNotes?: PendingNote[]
   withdrawNullifier?: Hex
+  /** The resumed deposit's note was not seen on chain and the user was told;
+   * the next retry deposits again (the earlier note stays watched). */
+  depositUnseen?: boolean
   /** Who submits the bridge out (default: the relayer); claims and withdrawals always use it. */
   via?: 'relayer' | 'wallet'
   /** The last step failed because the relayer did not answer. */
@@ -95,6 +98,8 @@ export type Movement = {
   // transaction landed.
   /** The deposit's new note. */
   note?: PendingNote
+  /** See Transfer.depositUnseen. */
+  depositUnseen?: boolean
   /** Commitments of the notes the withdrawal spends. */
   inputs?: Hex[]
   changeNotes?: PendingNote[]
@@ -106,7 +111,10 @@ export type Movement = {
 
 const KEY = 'zkross:v1'
 
-type Data = { notes: Note[]; transfers: Transfer[]; movements?: Movement[] }
+// `watched`: deposit notes saved before sending and not yet seen on chain.
+// A deposit may land after the page that sent it closed; its note is kept
+// here until it shows up in the pool, so it is never lost.
+type Data = { notes: Note[]; transfers: Transfer[]; movements?: Movement[]; watched?: PendingNote[] }
 
 function load(): Data {
   try {
@@ -151,11 +159,23 @@ export const privateBalance = (network: NetworkId) =>
 
 export function addNote(note: Omit<Note, 'spent'>) {
   const data = load()
-  if (!data.notes.some((n) => n.network === note.network && n.commitment === note.commitment)) {
-    data.notes.push({ ...note, spent: false })
-    save(data)
-  }
+  const watched = (data.watched ?? []).filter((n) => !(n.network === note.network && n.commitment === note.commitment))
+  const known = data.notes.some((n) => n.network === note.network && n.commitment === note.commitment)
+  if (known && watched.length === (data.watched ?? []).length) return
+  if (!known) data.notes.push({ ...note, spent: false })
+  data.watched = watched
+  save(data)
 }
+
+/** Keeps a deposit note, saved before sending, until it is seen on chain. */
+export function watchNote(note: PendingNote) {
+  const data = load()
+  if ((data.watched ??= []).some((n) => n.network === note.network && n.commitment === note.commitment)) return
+  data.watched.push(note)
+  save(data)
+}
+
+export const watchedNotes = (network: NetworkId) => (load().watched ?? []).filter((n) => n.network === network)
 
 export function markSpent(network: NetworkId, commitments: Hex[]) {
   const data = load()

@@ -30,7 +30,7 @@ import {
 import { WalletConnectDialog } from '../components/wallet-connect-dialog'
 import { useWallets } from '../components/wallet-context'
 import { formatMessage, formatNote, parseUnits, toNoteAmount } from '../lib/amounts'
-import { createProgress, createTransfer, identityOf, runTransfer, type FlowStepId } from '../lib/bridge-flow'
+import { createProgress, createTransfer, identityOf, runTransfer, settleWatched, type FlowStepId } from '../lib/bridge-flow'
 import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { chainId, explorer, isDeployed, poolAddress, protocol } from '../lib/config'
 import { networkMeta, otherNetwork, validAddress, type NetworkId, type TransferProgressStep } from '../lib/networks'
@@ -134,6 +134,8 @@ function BridgePage() {
   useEffect(() => {
     let cancelled = false
     const load = async () => {
+      // A deposit that landed after its page closed joins the private balance.
+      if (isDeployed(from)) settleWatched(from).catch(() => {})
       const [balanceResult, capacityResult] = await Promise.allSettled([
         sourceWallet ? pools[from].usdcBalance(sourceWallet.address) : Promise.resolve(null),
         isDeployed(to) ? pools[to].poolUsdcBalance() : Promise.resolve(null),

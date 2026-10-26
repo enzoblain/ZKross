@@ -7,6 +7,7 @@ import { WalletConnectDialog } from '../components/wallet-connect-dialog'
 import { useWallets } from '../components/wallet-context'
 import { formatNote, parseUnits } from '../lib/amounts'
 import { createMovement, runMovement } from '../lib/balance-flow'
+import { settleWatched } from '../lib/bridge-flow'
 import { explorer, isDeployed, protocol } from '../lib/config'
 import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { networkMeta, validAddress, type NetworkId } from '../lib/networks'
@@ -54,6 +55,11 @@ function BalanceCard({
   const walletBalance = publicBalance && wallet && publicBalance.address === wallet.address ? publicBalance.value : null
 
   useEffect(() => store.subscribe(() => setAllMovements(store.movements())), [])
+
+  // A deposit that landed after its page closed joins the balance here.
+  useEffect(() => {
+    if (deployed) settleWatched(network).catch(() => {})
+  }, [network, deployed])
 
   useEffect(() => {
     let cancelled = false

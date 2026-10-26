@@ -110,11 +110,13 @@ export const salts = (): [Hex, Hex] => [randomField(), randomField()]
 
 export const dummy = (): InNote => ({ leaf_index: null, sk: randomField(), amount: '0', blinding: randomField() })
 
-/** Finds pending notes in the pool tree (retrying while RPC catches up) and stores them. */
+/** Finds pending notes in the pool tree (retrying while RPC catches up) and
+ * stores them; watched deposit notes that have landed meanwhile join too. */
 export async function settleNotes(network: NetworkId, pending: PendingNote[], tries = 6) {
   const wanted = pending.filter((n) => BigInt(n.amount) > 0n)
   for (let attempt = 0; attempt < tries; attempt++) {
     const leaves = await pools[network].noteLeaves()
+    addLanded(network, leaves)
     const found = wanted.map((n) => leaves.findIndex((l) => l !== undefined && BigInt(l) === BigInt(n.commitment)))
     if (found.every((i) => i >= 0)) {
       wanted.forEach((n, k) => store.addNote({ ...n, leafIndex: found[k] }))
@@ -123,6 +125,33 @@ export async function settleNotes(network: NetworkId, pending: PendingNote[], tr
     await sleep(4000)
   }
   return false
+}
+
+function addLanded(network: NetworkId, leaves: Hex[]) {
+  for (const n of store.watchedNotes(network)) {
+    const i = leaves.findIndex((l) => l !== undefined && BigInt(l) === BigInt(n.commitment))
+    if (i >= 0) store.addNote({ ...n, leafIndex: i })
+  }
+}
+
+/** Adds watched deposit notes that landed after their page closed. */
+export async function settleWatched(network: NetworkId) {
+  if (store.watchedNotes(network).length) addLanded(network, await pools[network].noteLeaves())
+}
+
+/** Resumes a deposit whose note was saved before sending: true once that note
+ * is on chain. A sent deposit (`hash` known) is waited for, never repeated.
+ * When the outcome is unknown (the page closed while the wallet was sending),
+ * the first resume refuses to deposit again and `warn` records that the user
+ * was told; the next retry deposits again. The note stays watched, so a late
+ * landing still joins the private balance. */
+export async function resumeDeposit(network: NetworkId, note: PendingNote | undefined, hash: string | undefined, warned: boolean | undefined, warn: () => void) {
+  if (!note) return false
+  if (await settleNotes(network, [note])) return true
+  if (hash) throw new Error('The deposit landed but its note is not indexed yet; retry shortly.')
+  if (warned) return false
+  warn()
+  throw new Error('Your earlier deposit is not on chain yet. If your wallet sent it, it joins your private balance as soon as it lands. Check your wallet activity, then retry: a retry deposits again.')
 }
 
 /** Up to two unspent notes worth at least `amount` (fewest and smallest first). */
@@ -198,7 +227,9 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
   const key = derivedKey ?? (await identityFor(t))
 
   await step('deposit', async () => {
-    if (t.depositNote && (await settleNotes(t.from, [t.depositNote], 1))) return save(t, { status: 'deposited', error: undefined })
+    if (await resumeDeposit(t.from, t.depositNote, t.txs.deposit, t.depositUnseen, () => save(t, { depositUnseen: true }))) {
+      return save(t, { status: 'deposited', error: undefined })
+    }
     if (selectNotes(store.notes(t.from, key.pk), amountFrom)) return save(t, { status: 'deposited', error: undefined })
     if (!t.sender) {
       throw new Error(`Your private balance does not cover this amount: connect your ${networkMeta[t.from].wallet} wallet to deposit.`)
@@ -215,7 +246,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       blinding,
       commitment: await prover.commitment(amountFrom, key.pk, blinding),
     }
-    save(t, { depositNote: note })
+    store.watchNote(note)
+    save(t, { depositNote: note, depositUnseen: undefined })
     update('deposit', 'active', 'Building the deposit proof in your browser…')
     const built = await prover.buildTransact({
       levels: protocol.levels,

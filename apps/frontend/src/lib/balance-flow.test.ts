@@ -18,6 +18,10 @@ const h = vi.hoisted(() => ({
   calls: [] as { network: string; fn: string; account: string; recipient?: string; amount?: bigint; via?: string }[],
   requests: [] as unknown[],
   spent: new Set<string>(),
+  /** Commitments not visible yet (RPC lag, or a deposit never sent). */
+  hidden: new Set<string>(),
+  /** The page closes while the wallet sends: the call never returns. */
+  closeOnSend: false,
   trustline: true,
   counter: 0,
 }))
@@ -52,6 +56,7 @@ vi.mock('./zk/prover', async (importOriginal) => {
 vi.mock('./pools', async () => {
   const sent = (network: string, fn: string, account: string, via?: string, recipient?: string, amount?: bigint) => {
     h.calls.push({ network, fn, account, via, recipient, amount })
+    if (h.closeOnSend) throw new Error('page closed')
     return { hash: `${network}-${fn}-${h.calls.length}` }
   }
   const pool = (network: NetworkId): Partial<Pool> => {
@@ -59,7 +64,7 @@ vi.mock('./pools', async () => {
     return {
       network,
       adminViewKey: async () => ['0x1', '0x2'] as [Hex, Hex],
-      noteLeaves: async () => h.leaves as Hex[],
+      noteLeaves: async () => h.leaves.filter((l) => !h.hidden.has(l)) as Hex[],
       outboxLeaves: async () => ['0xc0de', '0x0'] as Hex[],
       isKnownRemoteRoot: async () => true,
       isClaimed: async () => false,
@@ -83,7 +88,7 @@ vi.mock('./pools', async () => {
 })
 
 const { createMovement, runMovement } = await import('./balance-flow')
-const { createTransfer, runTransfer } = await import('./bridge-flow')
+const { createTransfer, runTransfer, settleWatched } = await import('./bridge-flow')
 const store = await import('./store')
 
 const USDC: Record<NetworkId, bigint> = { ethereum: 10n ** 6n, stellar: 10n ** 7n }
@@ -98,6 +103,8 @@ beforeEach(() => {
   h.calls = []
   h.requests = []
   h.spent = new Set()
+  h.hidden = new Set()
+  h.closeOnSend = false
   h.trustline = true
 })
 
@@ -182,4 +189,78 @@ it('resumes a withdrawal that landed unseen without paying it twice', async () =
   expect(out.status).toBe('done')
   expect(h.calls).toEqual([])
   expect(store.balanceOf('ethereum', KEY.pk)).toBe(1n * USDC.ethereum)
+})
+
+/** A deposit whose page closed while the wallet was sending: its outcome is unknown. */
+async function interruptedDeposit(network: NetworkId, amount: bigint) {
+  const m = createMovement({ kind: 'deposit', network, amount, account: WALLET[network], identity: IDENTITY })
+  h.closeOnSend = true
+  await expect(runMovement(m)).rejects.toThrow('page closed')
+  h.closeOnSend = false
+  h.hidden.add(m.note!.commitment)
+  h.calls = []
+  return m
+}
+
+it('waits for an interrupted deposit instead of depositing twice', async () => {
+  const m = await interruptedDeposit('ethereum', USDC.ethereum)
+
+  await expect(runMovement(m)).rejects.toThrow('not on chain yet')
+  expect(h.calls).toEqual([])
+
+  // It had been sent after all, and lands.
+  h.hidden.clear()
+  await runMovement(m)
+  expect(m.status).toBe('done')
+  expect(h.calls).toEqual([])
+  expect(store.balanceOf('ethereum', KEY.pk)).toBe(USDC.ethereum)
+})
+
+it('deposits again only on a deliberate retry, and keeps the earlier note if it lands later', async () => {
+  const m = await interruptedDeposit('ethereum', USDC.ethereum)
+  const earlier = m.note!.commitment
+
+  await expect(runMovement(m)).rejects.toThrow('not on chain yet')
+  await runMovement(m)
+  expect(h.calls.filter((c) => c.fn === 'transact')).toHaveLength(1)
+  expect(store.balanceOf('ethereum', KEY.pk)).toBe(USDC.ethereum)
+
+  h.hidden.delete(earlier)
+  await settleWatched('ethereum')
+  expect(store.balanceOf('ethereum', KEY.pk)).toBe(2n * USDC.ethereum)
+})
+
+it('never repeats a deposit that was sent but is not indexed yet', async () => {
+  const m = createMovement({ kind: 'deposit', network: 'stellar', amount: USDC.stellar, account: WALLET.stellar, identity: IDENTITY })
+  // The deposit note is the next commitment the fake prover makes.
+  h.hidden.add(`0x${(h.counter + 1).toString(16).padStart(4, '0')}`)
+  await expect(runMovement(m)).rejects.toThrow('not indexed yet')
+  expect(m.txs.transact).toBeDefined()
+  h.calls = []
+
+  await expect(runMovement(m)).rejects.toThrow('not indexed yet')
+  await expect(runMovement(m)).rejects.toThrow('not indexed yet')
+  expect(h.calls).toEqual([])
+
+  h.hidden.clear()
+  await runMovement(m)
+  expect(m.status).toBe('done')
+  expect(store.balanceOf('stellar', KEY.pk)).toBe(USDC.stellar)
+})
+
+it('resumes an interrupted bridge deposit without depositing twice', async () => {
+  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: USDC.ethereum, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
+  h.closeOnSend = true
+  await expect(runTransfer(t, () => {})).rejects.toThrow('page closed')
+  h.closeOnSend = false
+  h.hidden.add(t.depositNote!.commitment)
+  h.calls = []
+
+  await expect(runTransfer(t, () => {})).rejects.toThrow('not on chain yet')
+  expect(h.calls).toEqual([])
+
+  h.hidden.clear()
+  await runTransfer(t, () => {})
+  expect(t.status).toBe('withdrawn')
+  expect(h.calls.filter((c) => c.fn === 'transact' && c.amount! > 0n)).toEqual([])
 })
