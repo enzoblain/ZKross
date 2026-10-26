@@ -312,6 +312,82 @@ export async function decryptLedger(txs: LedgerTx[], dPriv: string, zk: AdminZk)
   return out
 }
 
+/** Transactions of one journey of funds, which the admin view can link. */
+export type Flow = {
+  id: string
+  /** Root posts and liquidity: the operator's, not a user's funds. */
+  operator: boolean
+  /** Oldest first. */
+  rows: AdminTx[]
+  /** Distinct note owners (public keys) of the flow's notes. */
+  owners: Hex[]
+}
+
+const OPERATOR_KINDS: TxKind[] = ['root', 'liquidity']
+
+/**
+ * Groups the decrypted ledger into flows: a note created by one transaction
+ * (deposit, claim, change, refund) and spent by another links them, as do a
+ * bridge out and its claim, and a bridge out and the refund or finalize that
+ * settles it. Each connected set is one flow, oldest first; operator
+ * transactions (root posts, liquidity) form a last group of their own.
+ */
+export function groupFlows(rows: AdminTx[]): Flow[] {
+  const parent = rows.map((_, i) => i)
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])))
+  const union = (a: number, b: number) => {
+    parent[find(a)] = find(b)
+  }
+  const user = rows.map((r) => !OPERATOR_KINDS.includes(r.tx.kind))
+  const producer = new Map<string, number>()
+  rows.forEach((r, i) => {
+    if (!user[i]) return
+    for (const c of r.tx.commitments) producer.set(`${r.tx.network}:${c.commitment}`, i)
+  })
+  const byMessage = new Map<string, number>()
+  rows.forEach((r, i) => {
+    if (r.tx.bridgeOut) byMessage.set(`${r.tx.network}:${r.tx.bridgeOut.message}`, i)
+  })
+  const byLink = new Map<string, number>()
+  rows.forEach((r, i) => {
+    if (!user[i]) return
+    for (const n of r.inputs) {
+      if (!n || n.amount === 0n) continue
+      const from = producer.get(`${r.tx.network}:${BigInt(n.commitment)}`)
+      if (from !== undefined) union(from, i)
+    }
+    if (r.linkId) {
+      const other = byLink.get(r.linkId)
+      if (other === undefined) byLink.set(r.linkId, i)
+      else union(other, i)
+    }
+    if (r.tx.settles !== undefined) {
+      const out = byMessage.get(`${r.tx.network}:${r.tx.settles}`)
+      if (out !== undefined) union(out, i)
+    }
+  })
+
+  const groups = new Map<number, AdminTx[]>()
+  rows.forEach((r, i) => {
+    if (!user[i]) return
+    const root = find(i)
+    groups.set(root, [...(groups.get(root) ?? []), r])
+  })
+  const byTime = (a: AdminTx, b: AdminTx) => a.tx.time - b.tx.time
+  const flows: Flow[] = [...groups.values()]
+    .map((g) => g.sort(byTime))
+    .sort((a, b) => a[0].tx.time - b[0].tx.time)
+    .map((g, k) => ({
+      id: `F${k + 1}`,
+      operator: false,
+      rows: g,
+      owners: [...new Set(g.flatMap((r) => [...r.outputs, ...r.inputs]).filter((n) => n && n.amount > 0n).map((n) => n!.pk))],
+    }))
+  const ops = rows.filter((_, i) => !user[i]).sort(byTime)
+  if (ops.length) flows.push({ id: 'OPS', operator: true, rows: ops, owners: [] })
+  return flows
+}
+
 /** Pool balances: public USDC, and with the admin view the notes/reserve split. */
 export function balances(rows: AdminTx[], poolUsdc: Record<NetworkId, bigint | null>): PoolBalance[] {
   return (['stellar', 'ethereum'] as NetworkId[]).map((network) => {

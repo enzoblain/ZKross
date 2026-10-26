@@ -3,7 +3,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { describe, expect, it } from 'vitest'
 
-import { type AdminZk, type LedgerTx, adminCsv, balances, decryptLedger } from './admin-ledger'
+import { type AdminNote, type AdminTx, type AdminZk, type LedgerTx, adminCsv, balances, decryptLedger, groupFlows } from './admin-ledger'
 import { ciphertext } from './zk/proof-args'
 import type { BuiltTransact, Hex, ProverWasm, Proved } from './zk/types'
 
@@ -125,5 +125,47 @@ describe('admin ledger links and balances', () => {
     expect(csv[2]).toContain('bridgeOut')
     expect(csv[2]).toContain('B1')
     expect(csv.every((l) => !l.includes('MISMATCH'))).toBe(true)
+  })
+})
+
+describe('grouping the admin view into flows', () => {
+  const n = (commitment: bigint, amount: bigint, pk = '0xa1'): AdminNote => ({ pk: pk as Hex, amount, commitment: `0x${commitment.toString(16)}` as Hex, matches: true })
+  const row = (patch: Partial<LedgerTx>, rest: Partial<AdminTx> = {}): AdminTx => ({
+    tx: tx({ hash: `h${patch.time}`, ...patch, commitments: (patch.commitments ?? []).map((c) => ({ ...c, ct: null })) }),
+    outputs: [],
+    inputs: [],
+    ...rest,
+  })
+  const c = (commitment: bigint, index = 0) => ({ index, commitment, ct: null })
+
+  it('follows notes, bridge links and refunds into one flow per journey', () => {
+    const deposit = row({ time: 1, kind: 'deposit', network: 'stellar', publicAmount: 30_000_000n, commitments: [c(1n)] }, { outputs: [n(1n, 30_000_000n)] })
+    const out = row(
+      { time: 2, kind: 'bridgeOut', network: 'stellar', commitments: [c(2n)] },
+      { inputs: [n(1n, 30_000_000n), n(99n, 0n)], outputs: [n(2n, 0n)], linkId: 'B1' },
+    )
+    const root = row({ time: 3, kind: 'root', network: 'ethereum' })
+    const claim = row({ time: 4, kind: 'bridgeIn', network: 'ethereum', commitments: [c(3n)] }, { outputs: [n(3n, 3_000_000n, '0xb2')], linkId: 'B1' })
+    const withdraw = row({ time: 5, kind: 'withdraw', network: 'ethereum', publicAmount: -3_000_000n }, { inputs: [n(3n, 3_000_000n, '0xb2')] })
+    const other = row({ time: 6, kind: 'deposit', network: 'ethereum', publicAmount: 1_000_000n, commitments: [c(7n)] }, { outputs: [n(7n, 1_000_000n, '0xc3')] })
+    const lateOut = row({ time: 7, kind: 'bridgeOut', network: 'ethereum', bridgeOut: { message: 42n, deadline: 0n, refundCommitment: 8n, ct: null as never, refundCt: null as never } }, { inputs: [n(7n, 1_000_000n, '0xc3')] })
+    const refund = row({ time: 8, kind: 'refund', network: 'ethereum', settles: 42n, commitments: [c(8n)] })
+    const liquidity = row({ time: 0, kind: 'liquidity', network: 'stellar', publicAmount: 200_000_000n })
+
+    const flows = groupFlows([withdraw, liquidity, claim, root, deposit, other, out, refund, lateOut])
+
+    expect(flows.map((f) => [f.id, f.rows.map((r) => r.tx.time)])).toEqual([
+      ['F1', [1, 2, 4, 5]],
+      ['F2', [6, 7, 8]],
+      ['OPS', [0, 3]],
+    ])
+    expect(flows[0].owners).toEqual(['0xa1', '0xb2'])
+    expect(flows[2].operator).toBe(true)
+  })
+
+  it('keeps unrelated transactions apart', () => {
+    const a = row({ time: 1, kind: 'deposit', commitments: [c(1n)] }, { outputs: [n(1n, 5n)] })
+    const b = row({ time: 2, kind: 'deposit', commitments: [c(2n)] }, { outputs: [n(2n, 5n)] })
+    expect(groupFlows([a, b]).map((f) => f.rows.length)).toEqual([1, 1])
   })
 })

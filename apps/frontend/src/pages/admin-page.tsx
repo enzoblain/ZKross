@@ -22,8 +22,10 @@ import {
   type LedgerTx,
   type TxKind,
   adminCsv,
+  type Flow,
   balances,
   decryptLedger,
+  groupFlows,
   loadLedger,
 } from '../lib/admin-ledger'
 import { formatMessage, formatNote } from '../lib/amounts'
@@ -129,6 +131,50 @@ async function fetchPublicData() {
   return { txs, poolUsdc: { stellar: stellarUsdc, ethereum: ethereumUsdc } as Record<NetworkId, bigint | null> }
 }
 
+function LedgerRow({ row, showAdmin, hoveredLink, onHoverLink }: { row: AdminTx; showAdmin: boolean; hoveredLink: string | null; onHoverLink: (id: string | null) => void }) {
+  return (
+    <article
+        id={`tx-${row.tx.hash}`}
+      className={cn('grid gap-3 p-5 sm:grid-cols-[150px_1fr_auto] sm:px-7', showAdmin && row.linkId && 'border-l-2', showAdmin && row.linkId && (hoveredLink === row.linkId ? 'border-l-accent bg-accent/[0.04]' : 'border-l-accent/30'))}
+    >
+      <div className="flex items-start gap-3">
+        <NetworkMark network={row.tx.network} className="size-8 rounded-xl" />
+        <div><p className="text-xs font-semibold">{kindLabel[row.tx.kind]}</p><p className="mt-1 text-[10px] text-subtle">{new Date(row.tx.time).toLocaleString()}</p></div>
+      </div>
+      {showAdmin ? <AdminDetails row={row} hoveredLink={hoveredLink} onHoverLink={onHoverLink} /> : <PublicDetails tx={row.tx} />}
+      <a href={explorer.tx(row.tx.network, row.tx.hash)} target="_blank" rel="noreferrer" className="focus-ring inline-flex h-fit items-center gap-1.5 self-start rounded-lg border border-border bg-background/45 px-2.5 py-1.5 text-[10px] font-medium text-accent hover:border-accent/30">{truncateAddress(row.tx.hash)}<ExternalLink aria-hidden="true" className="size-3" /></a>
+    </article>
+  )
+}
+
+/** A flow's journey in one line, e.g. "Deposit · Sepolia → Bridge out · Sepolia → Bridge in · Stellar". */
+function FlowHeader({ flow }: { flow: Flow }) {
+  const steps = flow.rows.map((r) => `${kindLabel[r.tx.kind]} · ${networkMeta[r.tx.network].shortName}`)
+  const moved = (sign: 1n | -1n) =>
+    (['ethereum', 'stellar'] as NetworkId[])
+      .map((n) => [n, flow.rows.filter((r) => r.tx.network === n && r.tx.publicAmount * sign > 0n).reduce((sum, r) => sum + r.tx.publicAmount * sign, 0n)] as const)
+      .filter(([, v]) => v > 0n)
+      .map(([n, v]) => `${formatNote(n, v)} USDC on ${networkMeta[n].shortName}`)
+      .join(' + ')
+  const span = flow.rows.at(-1)!.tx.time - flow.rows[0].tx.time
+  const minutes = Math.round(span / 60_000)
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border bg-background/40 px-5 py-4 sm:px-7">
+      <div className="min-w-0">
+        <p className="text-xs font-semibold">{flow.operator ? 'Operator transactions' : `Flow ${flow.id}`}<span className="ml-2 font-normal text-subtle">{flow.rows.length} transaction{flow.rows.length === 1 ? '' : 's'}{!flow.operator && flow.rows.length > 1 ? ` · ${minutes < 1 ? 'under a minute' : minutes < 120 ? `${minutes} min` : `${Math.round(minutes / 60)} h`}` : ''}</span></p>
+        <p className="mt-1 text-[10px] leading-4 text-muted">{flow.operator ? 'Root posts and liquidity: no user funds.' : steps.join(' → ')}</p>
+      </div>
+      {!flow.operator && (
+        <dl className="text-right text-[10px] leading-4 text-subtle">
+          {moved(1n) && <div><dt className="inline">In </dt><dd className="inline font-mono text-foreground">{moved(1n)}</dd></div>}
+          {moved(-1n) && <div><dt className="inline">Out </dt><dd className="inline font-mono text-foreground">{moved(-1n)}</dd></div>}
+          {flow.owners.length > 0 && <div>{flow.owners.length} note owner{flow.owners.length === 1 ? '' : 's'}</div>}
+        </dl>
+      )}
+    </div>
+  )
+}
+
 function AdminPage() {
   const [ledger, setLedger] = useState<LedgerTx[] | null>(null)
   const [poolUsdc, setPoolUsdc] = useState<Record<NetworkId, bigint | null>>({ stellar: null, ethereum: null })
@@ -142,6 +188,7 @@ function AdminPage() {
   const [adminRows, setAdminRows] = useState<AdminTx[] | null>(null)
   const [adminView, setAdminView] = useState(false)
   const [hoveredLink, setHoveredLink] = useState<string | null>(null)
+  const [grouped, setGrouped] = useState(true)
 
   const apply = (data: Awaited<ReturnType<typeof fetchPublicData>> | Error) => {
     setLoading(false)
@@ -216,6 +263,7 @@ function AdminPage() {
     () => adminRows ?? (ledger ?? []).map((tx) => ({ tx, outputs: [], inputs: [] })),
     [adminRows, ledger],
   )
+  const flows = useMemo(() => groupFlows(adminRows ?? []), [adminRows])
   const poolBalances = useMemo(() => balances(adminRows ?? [], poolUsdc), [adminRows, poolUsdc])
   const mismatches = (adminRows ?? []).filter(
     (r) => [...r.outputs, ...r.inputs, r.bridge?.refund ?? null].some((x) => x && !x.matches) || r.bridge?.messageMatches === false,
@@ -309,27 +357,30 @@ function AdminPage() {
 
       <section className="mt-5 overflow-hidden rounded-[2rem] border border-border bg-surface" aria-labelledby="ledger-title">
         <div className="flex items-center justify-between gap-4 border-b border-border px-5 py-5 sm:px-7">
-          <div><h2 id="ledger-title" className="text-base font-semibold tracking-[-0.02em]">{showAdmin ? 'Admin view' : 'Public view'}</h2><p className="mt-1 text-xs text-subtle">{rows.length} transaction{rows.length === 1 ? '' : 's'} on both pools, oldest first</p></div>
+          <div><h2 id="ledger-title" className="text-base font-semibold tracking-[-0.02em]">{showAdmin ? 'Admin view' : 'Public view'}</h2><p className="mt-1 text-xs text-subtle">{rows.length} transaction{rows.length === 1 ? '' : 's'} on both pools{showAdmin && grouped ? `, in ${flows.filter((f) => !f.operator).length} flow${flows.filter((f) => !f.operator).length === 1 ? '' : 's'} linked by the view key` : ', oldest first'}</p></div>
+          {showAdmin && (
+            <div role="radiogroup" aria-label="Ledger layout" className="ml-auto flex gap-1 rounded-xl border border-border bg-background p-1">
+              {([[true, 'By flow'], [false, 'Chronological']] as [boolean, string][]).map(([value, label]) => (
+                <button key={label} type="button" role="radio" aria-checked={grouped === value} onClick={() => setGrouped(value)} className={cn('focus-ring rounded-lg px-3 py-1.5 text-[10px] font-semibold transition-colors', grouped === value ? 'bg-surface-raised text-foreground' : 'text-muted hover:text-foreground')}>{label}</button>
+              ))}
+            </div>
+          )}
           {loading && <span className="flex items-center gap-2 text-[10px] text-accent"><LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />Reading both chains…</span>}
         </div>
         {rows.length === 0 ? (
           <div className="grid min-h-60 place-items-center p-8 text-center"><div className="max-w-sm"><span className="mx-auto grid size-14 place-items-center rounded-full border border-border bg-background text-subtle"><FileClock aria-hidden="true" className="size-5" /></span><p className="mt-6 text-sm leading-6 text-muted">{loading ? 'Loading pool events…' : 'No pool transactions found.'}</p></div></div>
         ) : (
           <div className="divide-y divide-border">
-            {rows.map((row) => (
-              <article
-                key={`${row.tx.network}:${row.tx.hash}`}
-                id={`tx-${row.tx.hash}`}
-                className={cn('grid gap-3 p-5 sm:grid-cols-[150px_1fr_auto] sm:px-7', showAdmin && row.linkId && 'border-l-2', showAdmin && row.linkId && (hoveredLink === row.linkId ? 'border-l-accent bg-accent/[0.04]' : 'border-l-accent/30'))}
-              >
-                <div className="flex items-start gap-3">
-                  <NetworkMark network={row.tx.network} className="size-8 rounded-xl" />
-                  <div><p className="text-xs font-semibold">{kindLabel[row.tx.kind]}</p><p className="mt-1 text-[10px] text-subtle">{new Date(row.tx.time).toLocaleString()}</p></div>
-                </div>
-                {showAdmin ? <AdminDetails row={row} hoveredLink={hoveredLink} onHoverLink={setHoveredLink} /> : <PublicDetails tx={row.tx} />}
-                <a href={explorer.tx(row.tx.network, row.tx.hash)} target="_blank" rel="noreferrer" className="focus-ring inline-flex h-fit items-center gap-1.5 self-start rounded-lg border border-border bg-background/45 px-2.5 py-1.5 text-[10px] font-medium text-accent hover:border-accent/30">{truncateAddress(row.tx.hash)}<ExternalLink aria-hidden="true" className="size-3" /></a>
-              </article>
-            ))}
+            {showAdmin && grouped
+              ? flows.map((flow) => (
+                  <div key={flow.id}>
+                    <FlowHeader flow={flow} />
+                    <div className="divide-y divide-border">
+                      {flow.rows.map((row) => <LedgerRow key={`${row.tx.network}:${row.tx.hash}`} row={row} showAdmin={showAdmin} hoveredLink={hoveredLink} onHoverLink={setHoveredLink} />)}
+                    </div>
+                  </div>
+                ))
+              : rows.map((row) => <LedgerRow key={`${row.tx.network}:${row.tx.hash}`} row={row} showAdmin={showAdmin} hoveredLink={hoveredLink} onHoverLink={setHoveredLink} />)}
           </div>
         )}
       </section>
