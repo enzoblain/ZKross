@@ -1,8 +1,10 @@
-// Note keys. A user's note secret key on a chain is derived from their wallet's
-// signature of a fixed message: MetaMask (RFC 6979 ECDSA) and Freighter
-// (Ed25519) sign deterministically, so the same wallet always gets the same
-// key. The key is kept in memory for the session only, never stored, and no
-// key is bundled with the frontend.
+// Note keys. A user's private identity is one note key, derived from the
+// signature of a fixed message by a single wallet: the source wallet of the
+// transfer. The same key owns the user's notes on both chains, so the
+// destination wallet never signs anything. MetaMask (RFC 6979 ECDSA) and
+// Freighter (Ed25519) sign deterministically, so the same wallet always gets
+// the same key. The key is kept in memory for the session only, never stored,
+// and no key is bundled with the frontend.
 // TODO(keys): a wallet that changes its signing scheme would derive a new key;
 // back up notes (Activity page) until note recovery from chain data exists.
 import { signMessage } from '@stellar/freighter-api'
@@ -43,7 +45,7 @@ async function signature(network: NetworkId, address: string): Promise<Uint8Arra
     : new Uint8Array(value)
 }
 
-/** The note key for `address` on `network`; asks the wallet to sign once per session. */
+/** The note key of the wallet `address` on `network` (used on both chains); asks it to sign once per session. */
 export async function noteKey(network: NetworkId, address: string): Promise<NoteKey> {
   const id = `${network}:${address}`
   const known = cache.get(id)

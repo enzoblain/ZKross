@@ -70,7 +70,6 @@ function ActivityPage() {
     transfer.status !== 'withdrawn' &&
     transfer.status !== 'refunded' &&
     wallets[transfer.from]?.address === transfer.sender &&
-    wallets[transfer.to]?.address === transfer.claimer &&
     isDeployed(transfer.from) &&
     isDeployed(transfer.to)
 
@@ -141,7 +140,7 @@ function ActivityPage() {
                       <a key={`${key}:${hash}`} href={explorer.tx(txNetwork(transfer, key), hash)} target="_blank" rel="noreferrer" className="focus-ring inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/45 px-2.5 py-1.5 text-[10px] font-medium text-accent hover:border-accent/30">{txLabel[key]} · {truncateAddress(hash)}<ExternalLink aria-hidden="true" className="size-3" /></a>
                     ))}
                     {transfer.status !== 'withdrawn' && transfer.status !== 'refunded' && (
-                      <Button variant="secondary" size="sm" className="ml-auto" disabled={!resumable || Boolean(runningId)} onClick={() => void resume(transfer)}>{isRunning ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Play aria-hidden="true" />}{!isDeployed(transfer.from) || !isDeployed(transfer.to) ? 'Awaiting Sepolia pool' : !resumable ? 'Connect both wallets' : 'Resume'}</Button>
+                      <Button variant="secondary" size="sm" className="ml-auto" disabled={!resumable || Boolean(runningId)} onClick={() => void resume(transfer)}>{isRunning ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Play aria-hidden="true" />}{!isDeployed(transfer.from) || !isDeployed(transfer.to) ? 'Awaiting Sepolia pool' : !resumable ? 'Connect the source wallet' : 'Resume'}</Button>
                     )}
                   </div>
                 </article>

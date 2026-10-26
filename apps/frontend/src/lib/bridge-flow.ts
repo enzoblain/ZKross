@@ -3,10 +3,12 @@
 // withdraw to a public address. Formats are SPEC.md's; the circuit inputs and
 // proofs come from zkross-prover in the browser. Every step saves what it
 // creates before sending, so `runTransfer` resumes after a reload.
-// Bridge outs, claims and withdrawals go through the relayer by default
-// (t.via), so the user's wallets do not appear on-chain for them; deposits
-// always come from the source wallet. If the relayer does not answer, the
-// step fails with `relayerFailed` and the user can send it themselves.
+// One note key, derived from the source wallet, owns the notes on both chains
+// (keys.ts): the destination wallet is never connected. The user only types
+// the destination address, and the claim and withdrawal always go through the
+// relayer. Deposits come from the source wallet; the bridge out goes through
+// the relayer by default (t.via). If the relayer does not answer the bridge
+// out, the step fails with `relayerFailed` and the user can send it themselves.
 import { formatNote, toNoteAmount } from './amounts'
 import { chainId, protocol } from './config'
 import { type NoteKey, noteKey } from './keys'
@@ -40,12 +42,12 @@ export function createProgress(from: NetworkId, to: NetworkId, t?: Transfer): Tr
   const a = networkMeta[from].shortName
   const b = networkMeta[to].shortName
   const steps: Record<FlowStepId, [string, string]> = {
-    keys: ['Unlock note keys', `One signature in each wallet derives your private note keys. No transaction.`],
+    keys: ['Unlock your note key', `One signature in your ${networkMeta[from].wallet} wallet derives your private note key, used on both chains. No transaction.`],
     deposit: ['Deposit into the private pool', `Public USDC moves into the ${a} pool as a hidden note (skipped if your private balance covers it).`],
     bridgeOut: ['Prove and send bridge out', `A zero-knowledge proof spends your ${a} note and records a bridge message.`],
     root: ['Wait for the root poster', `The ${a} outbox root is copied to ${b}${from === 'ethereum' ? ' after Sepolia finality (about 15 minutes)' : ' (about a minute)'}.`],
-    claim: ['Prove and claim', `A second proof claims the message as a new note in the ${b} pool, from your ${b} wallet.`],
-    withdraw: ['Withdraw to the recipient', `A third proof pays the public ${b} address from your new note.`],
+    claim: ['Prove and claim', `A second proof claims the message as a new note in the ${b} pool; the relayer submits it.`],
+    withdraw: ['Withdraw to the recipient', `A third proof pays the public ${b} address you entered; the relayer submits it.`],
   }
   const done = t ? DONE[t.status] : -1
   return ORDER.map((id, i) => ({
@@ -62,8 +64,8 @@ type NewTransfer = {
   /** Bridge-message units (10^-6 USDC). */
   amount: bigint
   sender: string
-  claimer: string
   recipient: string
+  /** Who sends the bridge out; claims and withdrawals always use the relayer. */
   via?: Via
 }
 
@@ -77,7 +79,6 @@ export function createTransfer(input: NewTransfer): Transfer {
     amount: input.amount.toString(),
     recipient: input.recipient,
     sender: input.sender,
-    claimer: input.claimer,
     deadlineBucket: '0',
     claimSecret: randomField(),
     recipientPk: '0x',
@@ -127,13 +128,16 @@ function selectNotes(available: Note[], amount: bigint): Note[] | null {
 
 const nowHour = () => BigInt(Math.floor(Date.now() / 3_600_000))
 
-async function keysFor(t: Transfer): Promise<{ from: NoteKey; to: NoteKey }> {
-  const from = await noteKey(t.from, t.sender)
-  const to = await noteKey(t.to, t.claimer)
-  if (t.recipientPk !== '0x' && (t.recipientPk !== to.pk || t.refundPk !== from.pk)) {
-    throw new Error('Connect the same two wallets that started this transfer.')
+/** The user's note key, from the source wallet; it owns the notes on both chains. */
+async function identityFor(t: Transfer): Promise<NoteKey> {
+  if (t.recipientPk !== t.refundPk) {
+    throw new Error('This transfer was started with a destination-wallet note key, which this version no longer uses. Start a new transfer.')
   }
-  return { from, to }
+  const key = await noteKey(t.from, t.sender)
+  if (t.recipientPk !== '0x' && t.recipientPk !== key.pk) {
+    throw new Error('Connect the same source wallet that started this transfer.')
+  }
+  return key
 }
 
 function save(t: Transfer, patch: Partial<Transfer>) {
@@ -150,7 +154,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       await f()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      save(t, { error: message, relayerFailed: error instanceof RelayerUnavailable })
+      // Only the bridge out has a "send it myself" fallback.
+      save(t, { error: message, relayerFailed: id === 'bridgeOut' && error instanceof RelayerUnavailable })
       update(id, 'failed', message)
       throw error
     }
@@ -162,23 +167,23 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
   const dst = pools[t.to]
   const amount = BigInt(t.amount)
   const via: Via = t.via ?? 'relayer'
-  const by = (wallet: string) => (via === 'relayer' ? 'Sending through the relayer…' : `Confirm in ${wallet}…`)
+  const relaying = 'Sending through the relayer…'
   const amountFrom = toNoteAmount(t.from, amount)
   const amountTo = toNoteAmount(t.to, amount)
-  let derivedKeys: { from: NoteKey; to: NoteKey } | undefined
+  let derivedKey: NoteKey | undefined
   await step('keys', async () => {
-    derivedKeys = await keysFor(t)
+    derivedKey = await identityFor(t)
     if (t.recipientPk === '0x') {
-      save(t, { recipientPk: derivedKeys.to.pk, refundPk: derivedKeys.from.pk, error: undefined })
+      save(t, { recipientPk: derivedKey.pk, refundPk: derivedKey.pk, error: undefined })
     }
   })
-  // A resumed transfer still needs both in-memory spending keys even though
+  // A resumed transfer still needs the in-memory spending key even though
   // the key step is already shown as complete.
-  const keys = derivedKeys ?? (await keysFor(t))
+  const key = derivedKey ?? (await identityFor(t))
 
   await step('deposit', async () => {
     if (t.depositNote && (await settleNotes(t.from, [t.depositNote], 1))) return save(t, { status: 'deposited', error: undefined })
-    if (selectNotes(store.notes(t.from, keys.from.pk), amountFrom)) return save(t, { status: 'deposited', error: undefined })
+    if (selectNotes(store.notes(t.from, key.pk), amountFrom)) return save(t, { status: 'deposited', error: undefined })
     const balance = await src.usdcBalance(t.sender)
     if (balance === null || balance < amountFrom) {
       throw new Error(`Your ${networkMeta[t.from].shortName} wallet needs ${formatNote(t.from, amountFrom)} public USDC to deposit.`)
@@ -186,10 +191,10 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     const blinding = randomField()
     const note: PendingNote = {
       network: t.from,
-      pk: keys.from.pk,
+      pk: key.pk,
       amount: amountFrom.toString(),
       blinding,
-      commitment: await prover.commitment(amountFrom, keys.from.pk, blinding),
+      commitment: await prover.commitment(amountFrom, key.pk, blinding),
     }
     save(t, { depositNote: note })
     update('deposit', 'active', 'Building the deposit proof in your browser…')
@@ -201,8 +206,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       public_amount: amountFrom.toString(),
       inputs: [dummy(), dummy()],
       outputs: [
-        { pk: keys.from.pk, amount: amountFrom.toString(), blinding },
-        { pk: keys.from.pk, amount: '0', blinding: randomField() },
+        { pk: key.pk, amount: amountFrom.toString(), blinding },
+        { pk: key.pk, amount: '0', blinding: randomField() },
       ],
       in_salts: salts(),
       out_salts: salts(),
@@ -223,15 +228,15 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       }
       return save(t, { status: 'sent', error: undefined })
     }
-    const chosen = selectNotes(store.notes(t.from, keys.from.pk), amountFrom)
+    const chosen = selectNotes(store.notes(t.from, key.pk), amountFrom)
     if (!chosen) throw new Error('Your private balance no longer covers this amount.')
     const total = chosen.reduce((sum, n) => sum + BigInt(n.amount), 0n)
     const change: PendingNote[] = []
     for (const value of [total - amountFrom, 0n]) {
       const blinding = randomField()
-      change.push({ network: t.from, pk: keys.from.pk, amount: value.toString(), blinding, commitment: '0x' })
+      change.push({ network: t.from, pk: key.pk, amount: value.toString(), blinding, commitment: '0x' })
     }
-    const asInput = (n: Note): InNote => ({ leaf_index: n.leafIndex, sk: keys.from.sk, amount: n.amount, blinding: n.blinding })
+    const asInput = (n: Note): InNote => ({ leaf_index: n.leafIndex, sk: key.sk, amount: n.amount, blinding: n.blinding })
     const deadline = nowHour() + protocol.deadlineHours
     update('bridgeOut', 'active', 'Building the bridge-out proof in your browser…')
     const built = await prover.buildBridgeOut({
@@ -241,8 +246,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       ext_data_hash: await src.bridgeOutExtHash(),
       inputs: [asInput(chosen[0]), chosen[1] ? asInput(chosen[1]) : dummy()],
       outputs: [
-        { pk: keys.from.pk, amount: change[0].amount, blinding: change[0].blinding },
-        { pk: keys.from.pk, amount: '0', blinding: change[1].blinding },
+        { pk: key.pk, amount: change[0].amount, blinding: change[0].blinding },
+        { pk: key.pk, amount: '0', blinding: change[1].blinding },
       ],
       in_salts: salts(),
       out_salts: salts(),
@@ -252,9 +257,9 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       src_chain: chainId(t.from).toString(),
       dst_chain: chainId(t.to).toString(),
       deadline_bucket: deadline.toString(),
-      recipient_pk: keys.to.pk,
+      recipient_pk: key.pk,
       claim_secret: t.claimSecret,
-      refund_pk: keys.from.pk,
+      refund_pk: key.pk,
       refund_blinding: t.refundBlinding,
       refund_salt: randomField(),
       bridge_salt: randomField(),
@@ -268,7 +273,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       changeNotes: change,
     })
     const proof = await prover.prove(built)
-    update('bridgeOut', 'active', by(networkMeta[t.from].wallet))
+    update('bridgeOut', 'active', via === 'relayer' ? relaying : `Confirm in ${networkMeta[t.from].wallet}…`)
     const sent = await src.bridgeOut(t.sender, proof, via)
     save(t, { txs: { ...t.txs, bridgeOut: sent.hash } })
     store.markSpent(t.from, t.inputs ?? [])
@@ -311,7 +316,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     if (index < 0) throw new Error('The bridge message is not present under the posted remote root.')
     const claim: PendingNote[] = [amountTo, 0n].map((value) => ({
       network: t.to,
-      pk: keys.to.pk,
+      pk: key.pk,
       amount: value.toString(),
       blinding: randomField(),
       commitment: '0x',
@@ -329,7 +334,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       src_chain: chainId(t.from).toString(),
       dst_chain: chainId(t.to).toString(),
       deadline_bucket: t.deadlineBucket,
-      recipient_sk: keys.to.sk,
+      recipient_sk: key.sk,
       claim_secret: t.claimSecret,
       outputs: [
         { amount: claim[0].amount, blinding: claim[0].blinding },
@@ -340,8 +345,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     built.commitments.forEach((c, i) => (claim[i].commitment = c))
     save(t, { claimNotes: claim })
     const proof = await prover.prove(built)
-    update('claim', 'active', by(networkMeta[t.to].wallet))
-    const sent = await dst.bridgeIn(t.claimer, proof, via)
+    update('claim', 'active', relaying)
+    const sent = await dst.bridgeIn('', proof, 'relayer')
     save(t, { txs: { ...t.txs, bridgeIn: sent.hash } })
     if (!(await settleNotes(t.to, claim))) {
       throw new Error('The claim landed, but its destination note is not indexed yet. Retry shortly.')
@@ -359,13 +364,9 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       if (state === 'missing') {
         throw new Error('The Stellar recipient account does not exist yet: fund it (Friendbot on testnet) and add a USDC trustline, then retry.')
       }
-      if (t.recipient !== t.claimer) {
-        throw new Error('The Stellar recipient has no USDC trustline: add one from that account, then retry.')
-      }
-      update('withdraw', 'active', 'Add the USDC trustline in Freighter…')
-      save(t, { txs: { ...t.txs, trustline: await stellar.addUsdcTrustline(t.recipient) } })
+      throw new Error('The Stellar recipient has no USDC trustline: add one from that account, then retry.')
     }
-    const note = store.notes(t.to, keys.to.pk).find((n) => n.commitment === t.claimNotes![0].commitment)
+    const note = store.notes(t.to, key.pk).find((n) => n.commitment === t.claimNotes![0].commitment)
     if (!note) throw new Error('The claimed note is not in this browser.')
     update('withdraw', 'active', 'Building the withdrawal proof in your browser…')
     const built = await prover.buildTransact({
@@ -374,18 +375,18 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       d: await dst.adminViewKey(),
       ext_data_hash: await dst.transactExtHash(t.recipient, -amountTo),
       public_amount: fieldNeg(amountTo),
-      inputs: [{ leaf_index: note.leafIndex, sk: keys.to.sk, amount: note.amount, blinding: note.blinding }, dummy()],
+      inputs: [{ leaf_index: note.leafIndex, sk: key.sk, amount: note.amount, blinding: note.blinding }, dummy()],
       outputs: [
-        { pk: keys.to.pk, amount: '0', blinding: randomField() },
-        { pk: keys.to.pk, amount: '0', blinding: randomField() },
+        { pk: key.pk, amount: '0', blinding: randomField() },
+        { pk: key.pk, amount: '0', blinding: randomField() },
       ],
       in_salts: salts(),
       out_salts: salts(),
     })
     save(t, { withdrawNullifier: built.nullifiers[0] })
     const proof = await prover.prove(built)
-    update('withdraw', 'active', by(networkMeta[t.to].wallet))
-    const sent = await dst.transact(t.claimer, proof, t.recipient, -amountTo, undefined, via)
+    update('withdraw', 'active', relaying)
+    const sent = await dst.transact('', proof, t.recipient, -amountTo, undefined, 'relayer')
     store.markSpent(t.to, [note.commitment])
     save(t, { status: 'withdrawn', txs: { ...t.txs, withdraw: sent.hash }, error: undefined })
   })

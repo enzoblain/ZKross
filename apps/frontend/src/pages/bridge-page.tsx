@@ -103,8 +103,8 @@ function BridgePage() {
   )
 
   const sourceWallet = wallets[from]
-  const destinationWallet = wallets[to]
-  const recipientValue = recipient || destinationWallet?.address || ''
+  // The destination wallet is never connected: the user types the address.
+  const recipientValue = recipient
   const messageAmount = useMemo(() => parseUnits(amount, 6), [amount])
   const recipientIsValid = validRecipient(to, recipientValue)
   const deploymentReady = isDeployed(from) && isDeployed(to)
@@ -114,7 +114,6 @@ function BridgePage() {
   const readError = liveReads.key === readKey ? liveReads.error : ''
   const canReview = Boolean(
     sourceWallet &&
-      destinationWallet &&
       messageAmount &&
       messageAmount > 0n &&
       recipientIsValid &&
@@ -158,10 +157,10 @@ function BridgePage() {
   }, [])
 
   const relayerDown = relayerAccounts === null
+  const relayerName = (network: NetworkId) =>
+    `The relayer${relayerAccounts?.[network] ? ` (${truncateAddress(relayerAccounts[network]!)})` : ''}`
   const submitter = (network: NetworkId, wallet: string | undefined) =>
-    via === 'relayer'
-      ? `The relayer${relayerAccounts?.[network] ? ` (${truncateAddress(relayerAccounts[network]!)})` : ''}`
-      : `Your wallet${wallet ? ` (${truncateAddress(wallet)})` : ''}`
+    via === 'relayer' ? relayerName(network) : `Your wallet${wallet ? ` (${truncateAddress(wallet)})` : ''}`
 
   const updateProgress = (step: FlowStepId, status: TransferProgressStep['status'], description?: string) => {
     setProgress((current) =>
@@ -190,13 +189,12 @@ function BridgePage() {
   }
 
   const beginTransfer = () => {
-    if (!sourceWallet || !destinationWallet || !messageAmount || !canReview) return
+    if (!sourceWallet || !messageAmount || !canReview) return
     const next = createTransfer({
       from,
       to,
       amount: messageAmount,
       sender: sourceWallet.address,
-      claimer: destinationWallet.address,
       recipient: recipientValue.trim(),
       via,
     })
@@ -208,7 +206,7 @@ function BridgePage() {
     setProgress(createProgress(from, to))
     setRunStatus('idle')
     setAmount('')
-    setRecipient(destinationWallet?.address ?? '')
+    setRecipient('')
   }
 
   const reverseRoute = () => {
@@ -220,7 +218,7 @@ function BridgePage() {
     setProgress(createProgress(nextFrom, nextTo))
     setRunStatus('idle')
     setAmount('')
-    setRecipient(wallets[nextTo]?.address ?? '')
+    setRecipient('')
   }
 
   const useMaximum = () => {
@@ -235,7 +233,6 @@ function BridgePage() {
       transfer.status !== 'withdrawn' &&
       transfer.status !== 'refunded' &&
       sourceWallet?.address === transfer.sender &&
-      destinationWallet?.address === transfer.claimer &&
       deploymentReady &&
       runStatus !== 'running',
   )
@@ -267,11 +264,11 @@ function BridgePage() {
           <div className="relative space-y-6 p-5 sm:p-7">
             <div>
               <div className="mb-3 flex items-center justify-between gap-4">
-                <span className="text-xs font-medium text-muted">Wallets you control</span>
-                <span className="text-[10px] text-subtle">Both required for now</span>
+                <span className="text-xs font-medium text-muted">Wallet you control</span>
+                <span className="text-[10px] text-subtle">Only the source wallet: no {networkMeta[to].shortName} wallet needed</span>
               </div>
-              <div className="grid gap-2 sm:grid-cols-2">
-                {([from, to] as NetworkId[]).map((network) => {
+              <div className="grid gap-2">
+                {([from] as NetworkId[]).map((network) => {
                   const connection = wallets[network]
                   const isConnecting = connecting === network
                   const isSource = network === from
@@ -284,7 +281,7 @@ function BridgePage() {
                     >
                       <NetworkMark network={network} />
                       <span className="min-w-0 flex-1">
-                        <span className={cn('block text-[9px] font-semibold uppercase tracking-[0.1em]', isSource ? 'text-accent' : 'text-subtle')}>{isSource ? 'Source · deposit + bridge out' : 'Destination · claim + withdraw'}</span>
+                        <span className={cn('block text-[9px] font-semibold uppercase tracking-[0.1em]', isSource ? 'text-accent' : 'text-subtle')}>{isSource ? 'Source · deposit + note key' : 'Destination'}</span>
                         <span className="mt-1 block truncate text-xs font-medium text-foreground">{connection ? truncateAddress(connection.address) : isConnecting ? 'Waiting for wallet…' : `Connect ${networkMeta[network].wallet}`}</span>
                       </span>
                       {isConnecting ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin text-accent" /> : connection ? <CheckCircle2 aria-hidden="true" className="size-4 text-success" /> : <ArrowRight aria-hidden="true" className="size-4 text-subtle" />}
@@ -293,14 +290,14 @@ function BridgePage() {
                 })}
               </div>
               <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 p-3">
-                <div className="min-w-0"><p className="text-[10px] font-medium text-foreground">Bridge out, claim and withdrawal sent by</p><p className="mt-1 text-[10px] leading-4 text-subtle">{via === 'relayer' ? 'The relayer submits them from its own account, so your wallets do not appear on-chain for these steps. Your wallets only sign the note-key messages.' : 'Your wallets submit and pay for them, so they appear on-chain.'} The deposit is always sent by your source wallet.</p></div>
+                <div className="min-w-0"><p className="text-[10px] font-medium text-foreground">Bridge out sent by</p><p className="mt-1 text-[10px] leading-4 text-subtle">{via === 'relayer' ? 'The relayer submits it from its own account, so your wallet does not appear on-chain for it.' : 'Your source wallet submits and pays for it, so it appears on-chain.'} The deposit is always sent by your source wallet; the claim and withdrawal always by the relayer.</p></div>
                 <div role="radiogroup" aria-label="Who sends the transactions" className="flex gap-1 rounded-xl border border-border bg-background p-1">
                   {([['relayer', 'Relayer'], ['wallet', 'Send myself']] as [Via, string][]).map(([value, label]) => (
                     <button key={value} type="button" role="radio" aria-checked={via === value} disabled={runStatus === 'running'} onClick={() => setVia(value)} className={cn('focus-ring rounded-lg px-3 py-1.5 text-[10px] font-semibold transition-colors disabled:opacity-50', via === value ? 'bg-surface-raised text-foreground' : 'text-muted hover:text-foreground')}>{label}</button>
                   ))}
                 </div>
               </div>
-              {via === 'relayer' && relayerDown && <p role="status" className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-warning"><AlertTriangle aria-hidden="true" className="mt-0.5 size-3 shrink-0" />The relayer at {RELAYER_URL} is not answering. Start it (services/bridge, npm run service) or choose “Send myself”.</p>}
+              {relayerDown && <p role="status" className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-warning"><AlertTriangle aria-hidden="true" className="mt-0.5 size-3 shrink-0" />The relayer at {RELAYER_URL} is not answering. It sends the claim and withdrawal: start it (services/bridge, npm run service).</p>}
             </div>
 
             <div className="overflow-hidden rounded-[1.75rem] border border-border bg-background/55">
@@ -315,7 +312,7 @@ function BridgePage() {
                 </button>
                 <div className="flex min-w-0 flex-col items-center text-center">
                   <NetworkMark network={to} className="size-12 rounded-[18px]" />
-                  <p className="mt-3 text-[9px] font-semibold uppercase tracking-[0.15em] text-subtle">To your wallet</p>
+                  <p className="mt-3 text-[9px] font-semibold uppercase tracking-[0.15em] text-subtle">To your address</p>
                   <p className="mt-1 truncate text-xs font-medium">{networkMeta[to].shortName}</p>
                 </div>
               </div>
@@ -339,10 +336,8 @@ function BridgePage() {
                 <label htmlFor="recipient" className="block text-[10px] font-medium text-subtle">Your public {networkMeta[to].shortName} withdrawal address</label>
                 <div className="mt-3 flex items-center rounded-xl border border-border bg-surface/60 px-3 focus-within:border-accent/50">
                   <input id="recipient" value={recipientValue} disabled={runStatus === 'running'} onChange={(event) => setRecipient(event.target.value)} aria-invalid={recipientValue.length > 0 && !recipientIsValid} className="min-w-0 flex-1 bg-transparent py-3 font-mono text-xs outline-none placeholder:text-subtle disabled:opacity-60" placeholder={to === 'stellar' ? 'G…' : '0x…'} />
-                  {destinationWallet && <button type="button" className="focus-ring rounded-lg px-2 py-1 text-[10px] font-medium text-accent hover:text-accent-strong" onClick={() => setRecipient(destinationWallet.address)}>Use wallet</button>}
                 </div>
                 {recipientValue.length > 0 && !recipientIsValid && <p className="mt-2 text-[10px] text-danger">Enter a valid {networkMeta[to].shortName} public address.</p>}
-                {destinationWallet && recipientValue === destinationWallet.address && (via === 'relayer' ? <p className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-warning"><AlertTriangle aria-hidden="true" className="mt-0.5 size-3 shrink-0" />This is your connected wallet: the withdrawal will publicly pay it. A fresh address keeps the relayer from being the only thing between you and the payout.</p> : <p className="mt-2 flex items-center gap-1.5 text-[10px] text-success"><CheckCircle2 aria-hidden="true" className="size-3" />Matches the connected destination wallet</p>)}
                 {to === 'stellar' && <p className="mt-2 text-[10px] leading-4 text-subtle">A Stellar address must exist and hold a USDC trustline before it can receive the withdrawal.</p>}
               </div>
 
@@ -351,7 +346,7 @@ function BridgePage() {
                 <dl className="mt-3 space-y-2 text-[11px]">
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">Your wallet{sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}</dd></div>
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Bridge out · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{submitter(from, sourceWallet?.address)}</dd></div>
-                  <div className="flex justify-between gap-4"><dt className="text-subtle">Claim + withdrawal · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{submitter(to, destinationWallet?.address)}</dd></div>
+                  <div className="flex justify-between gap-4"><dt className="text-subtle">Claim + withdrawal · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{relayerName(to)}</dd></div>
                 </dl>
               </div>
             </div>
@@ -394,15 +389,14 @@ function BridgePage() {
                 variant="accent"
                 size="lg"
                 className="w-full"
-                disabled={Boolean(sourceWallet && destinationWallet) && !canReview}
+                disabled={Boolean(sourceWallet) && !canReview}
                 onClick={() => {
                   if (!sourceWallet) setWalletDialogNetwork(from)
-                  else if (!destinationWallet) setWalletDialogNetwork(to)
                   else if (canReview) setReviewOpen(true)
                 }}
               >
                 <ShieldCheck aria-hidden="true" />
-                {!sourceWallet ? `Connect ${networkMeta[from].wallet}` : !destinationWallet ? `Connect ${networkMeta[to].wallet}` : !deploymentReady ? 'Sepolia pool not deployed' : !messageAmount || messageAmount <= 0n ? 'Enter an amount' : !recipientIsValid ? 'Enter a valid withdrawal address' : 'Review transfer'}
+                {!sourceWallet ? `Connect ${networkMeta[from].wallet}` : !deploymentReady ? 'Sepolia pool not deployed' : !messageAmount || messageAmount <= 0n ? 'Enter an amount' : !recipientIsValid ? 'Enter a valid withdrawal address' : 'Review transfer'}
               </Button>
             )}
             <p className="text-center text-[10px] leading-4 text-subtle">Never enter a private key or seed phrase. Note keys are derived from wallet signatures and kept in memory.</p>

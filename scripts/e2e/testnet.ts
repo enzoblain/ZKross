@@ -9,10 +9,12 @@
 //   4. the admin's view: every note, refund note and bridge message on both
 //      chains decrypted with the Global View Key, and every bridge_out linked
 //      to its bridge_in
-// With --relayer: 1 USDC each way, bridge outs, claims and withdrawals (0.5
-// USDC to a fresh address) go through the relayer (services/bridge), and each
-// of them is checked on-chain to come from the relayer's account, never a
-// user's. Liquidity is not added again.
+// With --relayer: 1 USDC each way, as the site does it: one note key (the
+// sender's) owns the notes on both chains, so alice claims on Sepolia and dave
+// on Stellar with their own key and no destination account. Bridge outs,
+// claims and withdrawals (0.5 USDC to a fresh address) go through the relayer
+// (services/bridge), and each of them is checked on-chain to come from the
+// relayer's account, never a user's. Liquidity is not added again.
 // The root poster (and with --relayer the relayer) must run alongside
 // (npm run service in services/bridge); the script waits for it. Progress
 // (including note secrets) is saved in deploy-out/e2e-state.json (or
@@ -423,7 +425,7 @@ async function main() {
   let note = await deposit("depositStellar", "stellar", "alice", DEPOSIT);
   const toEth: Message[] = [];
   for (const [i, amount] of TRANSFERS.entries()) {
-    const r = await bridgeOut(`bridgeOutStellar${i}`, note, amount, "carol");
+    const r = await bridgeOut(`bridgeOutStellar${i}`, note, amount, RELAYER ? "alice" : "carol");
     toEth.push(r.msg);
     note = r.change;
   }
@@ -440,7 +442,7 @@ async function main() {
   note = await deposit("depositSepolia", "sepolia", "dave", DEPOSIT);
   const toStellar: Message[] = [];
   for (const [i, amount] of TRANSFERS.entries()) {
-    const r = await bridgeOut(`bridgeOutSepolia${i}`, note, amount, "bob");
+    const r = await bridgeOut(`bridgeOutSepolia${i}`, note, amount, RELAYER ? "dave" : "bob");
     toStellar.push(r.msg);
     note = r.change;
   }

@@ -40,7 +40,8 @@ export type Transfer = {
   /** Public address on `to` that receives the withdrawal. */
   recipient: string
   sender: string
-  claimer: string
+  /** Destination wallet of transfers made before the single note key; never set now. */
+  claimer?: string
   deadlineBucket: string
   claimSecret: Hex
   recipientPk: Hex
@@ -58,7 +59,7 @@ export type Transfer = {
   remoteLeafCount?: number
   claimNotes?: PendingNote[]
   withdrawNullifier?: Hex
-  /** Who submits bridge outs, claims and withdrawals (default: the relayer). */
+  /** Who submits the bridge out (default: the relayer); claims and withdrawals always use it. */
   via?: 'relayer' | 'wallet'
   /** The last step failed because the relayer did not answer. */
   relayerFailed?: boolean

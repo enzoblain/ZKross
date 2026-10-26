@@ -25,8 +25,8 @@ const steps = [
   {
     number: '01',
     label: 'Authorize',
-    title: 'Connect both wallets you control.',
-    description: 'The source wallet deposits and bridges out; the destination wallet derives the claim note and withdraws.',
+    title: 'Connect the wallet you send from.',
+    description: 'It deposits and derives your private note key, used on both chains. You only type the destination address: the relayer claims and withdraws to it.',
     icon: WalletMinimal,
   },
   {
