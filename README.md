@@ -110,8 +110,8 @@ sequenceDiagram
    bridge message `C` in the pool's outbox. The amount and the recipient are
    hidden inside `C`.
 3. **Root posting.** The root poster copies the outbox's Merkle root to the
-   other chain. About a minute from Stellar, about 15 minutes from Sepolia
-   (it waits for Sepolia finality).
+   other chain. About a minute from Stellar; from Sepolia it waits for the
+   block to be final, about 15 minutes by default (see `ZKROSS_ETH_ROOT_BLOCK`).
 4. **Claim.** A second proof shows that `C` is under the posted root and
    creates a new note of the same value on the destination. A claim
    nullifier prevents double claims without revealing which `C` was claimed.
@@ -301,7 +301,11 @@ npm start
   `ZKROSS_RELAYER_PORT`, `ZKROSS_RELAYER_HOST`, `ZKROSS_RELAYER_ORIGINS`,
   `ZKROSS_RELAYER_MAX_GAS`, `ZKROSS_RELAYER_MAX_FEE`, `ZKROSS_RELAYER_RATE`.
 - **Root poster.** Copies each outbox root to the other chain, reading Sepolia
-  at the finalized block. No claim can happen while it is stopped.
+  at the block `ZKROSS_ETH_ROOT_BLOCK` names: `finalized` (default, about 15
+  minutes, can't be reorged away), `safe` (about 7 to 12 minutes) or a number
+  of blocks below the head such as `3` (about a minute, testnet only: a reorg
+  past it would let a claim spend liquidity for a vanished bridge out). No
+  claim can happen while it is stopped.
 - **Refund attester.** Settles messages that were not claimed, one hour after
   their deadline.
 

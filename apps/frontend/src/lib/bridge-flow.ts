@@ -47,7 +47,7 @@ export function createProgress(from: NetworkId, to: NetworkId, t?: Transfer): Tr
     keys: ['Unlock your note key', `One signature in your identity wallet derives your private note key, the same on both chains. No transaction.`],
     deposit: ['Deposit into the private pool', `Public USDC moves from your ${a} wallet into the pool as a hidden note (skipped if your private balance covers it).`],
     bridgeOut: ['Prove and send bridge out', `A zero-knowledge proof spends your ${a} note and records a bridge message.`],
-    root: ['Wait for the root poster', `The ${a} outbox root is copied to ${b}${from === 'ethereum' ? ' after Sepolia finality (about 15 minutes)' : ' (about a minute)'}.`],
+    root: ['Wait for the root poster', `The ${a} outbox root is copied to ${b}${from === 'ethereum' ? ' once Sepolia has confirmed it (from about a minute to 15, depending on the root poster)' : ' (about a minute)'}.`],
     claim: ['Prove and claim', `A second proof claims the message as a new note in the ${b} pool; the relayer submits it.`],
     withdraw: ['Withdraw to the recipient', `A third proof pays the public ${b} address you entered; the relayer submits it.`],
   }
