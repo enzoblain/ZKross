@@ -103,12 +103,13 @@ export function putTransfer(next: CctpTransfer) {
 export const notes = () => load().notes.slice().sort((a, b) => b.createdAt - a.createdAt)
 
 export const spendableNotes = (network?: NetworkId) =>
-  notes().filter((note) => !note.spentAt && (!network || note.network === network))
+  notes().filter((note) => note.mode === 'simulation' && !note.spentAt && (!network || note.network === network))
 
 export const privateBalance = (network: NetworkId) =>
   spendableNotes(network).reduce((sum, note) => sum + BigInt(note.amount), 0n)
 
 export function putNote(next: PrivateNote) {
+  if (next.mode !== 'simulation') throw new Error('Real private notes require encrypted storage; demo storage refuses testnet notes.')
   const data = load()
   const index = data.notes.findIndex((note) => note.id === next.id)
   if (index >= 0) data.notes[index] = next
@@ -120,6 +121,7 @@ export function markNoteWithdrawn(id: string, address: string) {
   const data = load()
   const note = data.notes.find((item) => item.id === id)
   if (!note) throw new Error('Private note not found in this browser.')
+  if (note.mode !== 'simulation') throw new Error('A real note requires an on-chain withdrawal and confirmation.')
   if (note.spentAt) throw new Error('This private note has already been withdrawn.')
   note.spentAt = Date.now()
   note.withdrawalAddress = address

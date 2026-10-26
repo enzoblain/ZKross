@@ -254,6 +254,32 @@ pub fn build_transact(req: &str) -> Result<Value> {
     }))
 }
 
+/// Non-GVK SPP input builder. Reuses the reviewed note/Merkle encoding and
+/// explicitly drops every GVK-only witness input. No bridge liquidity circuit.
+pub fn build_private_transact(req: &str) -> Result<Value> {
+    let mut request: Value = parse(req)?;
+    let object = request.as_object_mut().context("request must be an object")?;
+    object.insert("d".into(), json!(["0", "0"]));
+    object.insert("in_salts".into(), json!(["0", "0"]));
+    object.insert("out_salts".into(), json!(["0", "0"]));
+    let mut built = build_transact(&request.to_string())?;
+    if let Some(root) = request.get("deposit_root") {
+        // A deposit has only dummy (zero-valued) inputs, so no membership path
+        // is consumed. Bind it to the current chain root without an indexer.
+        let inputs = request["inputs"].as_array().context("inputs must be an array")?;
+        for input in inputs {
+            ensure!(fe(input["amount"].as_str().context("input amount")?)? == Fr::from(0u64), "deposit_root cannot override a spending path");
+        }
+        let root = fe(root.as_str().context("deposit root")?)?;
+        built["inputs"]["root"] = json!(dec(&root));
+        built["root"] = json!(hex(&root));
+    }
+    built["circuit"] = json!("policy_tx_2_2");
+    let inputs = built["inputs"].as_object_mut().context("missing witness inputs")?;
+    for name in ["D", "nonce", "inSalt", "outSalt"] { inputs.remove(name); }
+    Ok(built)
+}
+
 pub fn build_bridge_out(req: &str) -> Result<Value> {
     let r: BridgeOutReq = parse(req)?;
     let mut s = build_spend(&r.common)?;
@@ -476,4 +502,36 @@ pub fn tree_root(req: &str) -> Result<Value> {
     }
     let r: R = parse(req)?;
     Ok(json!({ "root": hex(&PrefixTree::new(&fes(&r.leaves)?, r.levels).root()) }))
+}
+
+#[cfg(test)]
+mod private_pool_tests {
+    use super::*;
+    fn request() -> Value {
+        json!({"levels":20,"leaves":[],"ext_data_hash":"1","public_amount":"100",
+            "inputs":[{"leaf_index":null,"sk":"2","amount":"0","blinding":"3"},{"leaf_index":null,"sk":"4","amount":"0","blinding":"5"}],
+            "outputs":[{"pk":"6","amount":"60","blinding":"7"},{"pk":"8","amount":"40","blinding":"9"}]})
+    }
+    #[test]
+    fn private_builder_has_no_global_view_inputs() {
+        let built=build_private_transact(&request().to_string()).unwrap();
+        assert_eq!(built["circuit"],"policy_tx_2_2");
+        let inputs=built["inputs"].as_object().unwrap();
+        for name in ["D","nonce","inSalt","outSalt"] {assert!(!inputs.contains_key(name));}
+        assert_eq!(inputs["publicAmount"],"100");
+        assert_eq!(built["commitments"].as_array().unwrap().len(),2);
+    }
+    #[test]
+    fn deposit_root_override_requires_dummy_inputs() {
+        let mut req=request(); req["deposit_root"]=json!("123");
+        let built=build_private_transact(&req.to_string()).unwrap();
+        assert_eq!(built["inputs"]["root"],"123");
+        req["inputs"][0]["amount"]=json!("1");
+        assert!(build_private_transact(&req.to_string()).is_err());
+    }
+    #[test]
+    fn private_builder_refuses_noncanonical_external_hash() {
+        let mut req=request(); req["ext_data_hash"]=json!("21888242871839275222246405745257275088548364400416034343698204186575808495617");
+        assert!(build_private_transact(&req.to_string()).is_err());
+    }
 }

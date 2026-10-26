@@ -6,6 +6,7 @@ export type Hex = `0x${string}`
 export type ProverWasm = {
   default: (init: { module_or_path: string | URL | BufferSource }) => Promise<unknown>
   buildTransact: (req: string) => string
+  buildPrivateTransact: (req: string) => string
   buildBridgeOut: (req: string) => string
   buildBridgeIn: (req: string) => string
   prove: (req: string, pk: Uint8Array, graph: Uint8Array, r1cs: Uint8Array) => string
@@ -36,6 +37,7 @@ export type SpendRequest = {
 }
 
 export type TransactRequest = SpendRequest & { public_amount: string }
+export type PrivateTransactRequest = Omit<TransactRequest, 'd' | 'in_salts' | 'out_salts'> & { deposit_root?: Hex }
 
 export type BridgeOutRequest = SpendRequest & {
   amount: string

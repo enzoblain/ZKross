@@ -37,6 +37,7 @@ describe('Poseidon2 through the browser WASM prover', () => {
       await wasm.default({ module_or_path: readFileSync(wasmBinary) })
       const vectors = JSON.parse(readFileSync(vectorsPath, 'utf8')) as { bridge_messages: BridgeVector[] }
 
+      const outboxLeaves: string[] = []
       for (const vector of vectors.bridge_messages) {
         const commitment = JSON.parse(
           wasm.commitment(String(vector.refund_value), vector.refund_pk, vector.refund_blinding),
@@ -55,9 +56,11 @@ describe('Poseidon2 through the browser WASM prover', () => {
         expect(message.bridge_message).toBe(vector.C)
         expect(message.claim_nullifier).toBe(vector.claim_nullifier)
 
+        // Fixture roots describe consecutive inserts into one tree.
+        outboxLeaves.push(vector.C, `0x${'00'.repeat(32)}`)
         const root = JSON.parse(wasm.treeRoot(JSON.stringify({
           levels: 20,
-          leaves: [vector.C, `0x${'00'.repeat(32)}`],
+          leaves: outboxLeaves,
         }))) as { root: string }
         expect(root.root).toBe(vector.outbox_root_after_insert)
       }

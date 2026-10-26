@@ -8,7 +8,13 @@ BUILD="${ZKROSS_BUILD:-$HOME/zkross-build}"
 OUT="${1:-$BUILD/prover-wasm}"
 export CARGO_TARGET_DIR="$BUILD/prover-wasm-target"
 cd "$REPO/prover/wasm"
-cargo build --release --target wasm32-unknown-unknown
+# Apple's system ar can emit an empty archive for WebAssembly C objects.
+# Prefer a matching LLVM toolchain when it is installed.
+if [ "$(uname -s)" = Darwin ] && [ -x /opt/homebrew/opt/llvm/bin/llvm-ar ]; then
+  export AR_wasm32_unknown_unknown="${AR_wasm32_unknown_unknown:-/opt/homebrew/opt/llvm/bin/llvm-ar}"
+  export CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-/opt/homebrew/opt/llvm/bin/clang}"
+fi
+"${CARGO:-cargo}" build --locked --release --target wasm32-unknown-unknown
 mkdir -p "$OUT"
-wasm-bindgen --target web --out-dir "$OUT" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/zkross_prover_wasm.wasm"
+"${WASM_BINDGEN:-wasm-bindgen}" --target web --out-dir "$OUT" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/zkross_prover_wasm.wasm"
 echo "$OUT"

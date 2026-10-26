@@ -4,12 +4,13 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run test:frontend",
     "dev": "npm run dev --workspace=apps/frontend",
     "build:frontend": "npm run build --workspace=apps/frontend",
     "test:ethereum": "forge test --root contracts/ethereum",
-    "test:stellar": "cargo test --manifest-path spp/Cargo.toml -p pool-gvk",
-    "test:frontend": "npm run test --workspace=apps/frontend"
+    "test:stellar": "VERIFIER_VK_JSON=\"$PWD/spp/deployments/testnet/circuit_keys/policy_tx_2_2_gvk_T_vk.json\" cargo test --manifest-path spp/Cargo.toml -p pool-gvk --locked",
+    "test:frontend": "npm run test --workspace=apps/frontend",
+    "test:stellar:private": "VERIFIER_VK_JSON=\"$PWD/spp/deployments/testnet/circuit_keys/policy_tx_2_2_vk.json\" cargo test --manifest-path spp/Cargo.toml -p pool --locked"
   },
   "repository": {
     "type": "git",

@@ -12,6 +12,8 @@ type ProviderRequest = {
 }
 
 type EthereumProvider = {
+  on?: (event: 'accountsChanged' | 'chainChanged', listener: () => void) => void
+  removeListener?: (event: 'accountsChanged' | 'chainChanged', listener: () => void) => void
   request<T = unknown>(request: ProviderRequest): Promise<T>
 }
 

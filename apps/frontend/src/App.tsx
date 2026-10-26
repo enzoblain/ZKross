@@ -2,12 +2,12 @@ import { useEffect, useState, type JSX } from 'react'
 
 import { AppShell } from './components/app-shell'
 import { WalletProvider } from './components/wallet-provider'
-import { ActivityPage } from './pages/activity-page'
-import { BridgePage } from './pages/bridge-page'
-import { CompliancePage } from './pages/compliance-page'
+import { CctpActivityPage as ActivityPage } from './pages/cctp-activity-page'
+import { CctpBridgePage as BridgePage } from './pages/cctp-bridge-page'
+import { CctpCompliancePage as CompliancePage } from './pages/cctp-compliance-page'
 import { LandingPage } from './pages/landing-page'
 import { PrivateBalancePage } from './pages/private-balance-page'
-import { PrivacyPage } from './pages/privacy-page'
+import { CctpPrivacyPage as PrivacyPage } from './pages/cctp-privacy-page'
 
 export type PageId =
   | 'landing'

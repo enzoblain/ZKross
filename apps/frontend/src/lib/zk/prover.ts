@@ -11,6 +11,7 @@ import type {
   ProverOp,
   Proved,
   TransactRequest,
+  PrivateTransactRequest,
   WorkerResponse,
 } from './types'
 
@@ -21,10 +22,13 @@ export const hex32 = (value: bigint): Hex => `0x${value.toString(16).padStart(64
 
 /** A random field element (blindings, salts, claim secrets). */
 export function randomField(): Hex {
-  const bytes = crypto.getRandomValues(new Uint8Array(32))
-  let value = 0n
-  for (const byte of bytes) value = (value << 8n) | BigInt(byte)
-  return hex32(value % R)
+  // Rejection sampling avoids modulo bias and excludes the invalid zero key.
+  for (;;) {
+    const bytes = crypto.getRandomValues(new Uint8Array(32))
+    let value = 0n
+    for (const byte of bytes) value = (value << 8n) | BigInt(byte)
+    if (value > 0n && value < R) return hex32(value)
+  }
 }
 
 /** A negative public amount as a field element (withdrawals). */
@@ -57,6 +61,7 @@ const json = async <T>(op: ProverOp, ...args: string[]): Promise<T> =>
   JSON.parse(await call(op, ...args)) as T
 
 export const prover = {
+  buildPrivateTransact: (req: PrivateTransactRequest) => json<BuiltTransact>('buildPrivateTransact', JSON.stringify(req)),
   buildTransact: (req: TransactRequest) => json<BuiltTransact>('buildTransact', JSON.stringify(req)),
   buildBridgeOut: (req: BridgeOutRequest) => json<BuiltBridgeOut>('buildBridgeOut', JSON.stringify(req)),
   buildBridgeIn: (req: BridgeInRequest) => json<BuiltBridgeIn>('buildBridgeIn', JSON.stringify(req)),

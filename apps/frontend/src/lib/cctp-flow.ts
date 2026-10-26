@@ -1,4 +1,4 @@
-import { cctp, isCctpTestnetReady, missingTestnetComponents, type ProtocolMode } from './cctp-config'
+import { cctp, missingTestnetComponents, testnetExecutionBlocker, type ProtocolMode } from './cctp-config'
 import * as store from './cctp-store'
 import type { CctpTransfer, SettlementStatus } from './cctp-store'
 import { networkMeta, type NetworkId, type ProgressState, type TransferProgressStep } from './networks'
@@ -47,7 +47,7 @@ export function progressFor(from: NetworkId, to: NetworkId, transfer?: CctpTrans
     burn: ['Burn aggregate USDC', `CCTP burns the batch total on ${source}; the aggregate amount remains public.`],
     attest: ['Receive Circle attestation', 'Iris signs the finalized CCTP message for the destination chain.'],
     mint: ['Mint aggregate USDC', `CCTP recreates the batch total on ${destination}.`],
-    'private-note': ['Create the destination note', `The Zkross adapter credits a private ${destination} note to this browser.`],
+    'private-note': ['Create the destination note', `A simulated ${destination} note is saved in this browser; real pool deposits remain blocked.`],
   }
   const completeThrough = transfer ? STATUS_INDEX[transfer.status] : -1
   const failedStatus = transfer?.status === 'failed'
@@ -73,6 +73,8 @@ type NewTransfer = {
 }
 
 export function createCctpTransfer(input: NewTransfer): CctpTransfer {
+  if (input.from === input.to) throw new Error('Choose two different networks.')
+  if (input.mode !== 'simulation' && input.mode !== 'testnet') throw new Error('Invalid execution mode.')
   if (input.amount <= 0n) throw new Error('Enter an amount above zero.')
   const now = Date.now()
   const next: CctpTransfer = {
@@ -128,13 +130,19 @@ function saveStep(transfer: CctpTransfer, step: CctpStepId) {
   store.putTransfer({ ...transfer, events: [...transfer.events] })
 }
 
+const running = new Set<string>()
+
 export async function runCctpTransfer(transfer: CctpTransfer, update: FlowUpdate) {
-  if (transfer.mode === 'testnet') {
-    if (!isCctpTestnetReady()) {
-      throw new Error(`Testnet mode is unavailable. Missing: ${missingTestnetComponents().join(', ')}.`)
-    }
-    throw new Error('Testnet configuration is present, but live signing remains disabled until the CCTP-to-SPP adapter has passed integration tests.')
+  if (transfer.mode !== 'simulation') {
+    const missing = missingTestnetComponents()
+    throw new Error(`${testnetExecutionBlocker}${missing.length ? ` Missing configuration: ${missing.join(', ')}.` : ''}`)
   }
+  if (transfer.status === 'withdrawn') throw new Error('This transfer has already been withdrawn.')
+  if (transfer.from === transfer.to || BigInt(transfer.amount) <= 0n) throw new Error('Invalid transfer.')
+  // Concurrent retries must not create duplicate lifecycle events or notes.
+  if (running.has(transfer.id)) throw new Error('This transfer is already running.')
+  running.add(transfer.id)
+  try {
 
   transfer.batchId ||= `sim_batch_${Math.floor(Date.now() / 60_000).toString(36)}`
   transfer.cctpMessageId ||= `sim_cctp_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`
@@ -164,6 +172,7 @@ export async function runCctpTransfer(transfer: CctpTransfer, update: FlowUpdate
       createdAt: Date.now(),
     })
   }
+  } finally { running.delete(transfer.id) }
 }
 
 export const flowOrder = ORDER

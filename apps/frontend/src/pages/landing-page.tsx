@@ -26,21 +26,21 @@ const steps = [
     number: '01',
     label: 'Authorize',
     title: 'Connect both wallets you control.',
-    description: 'The source wallet deposits and bridges out; the destination wallet derives the claim note and withdraws.',
+    description: 'Connect Sepolia and Stellar Testnet wallets. Simulation does not request signatures or move funds.',
     icon: WalletMinimal,
   },
   {
     number: '02',
     label: 'Route',
     title: 'Compose the transfer.',
-    description: 'Choose the direction and exact USDC amount, then confirm the destination pool has enough backing.',
+    description: 'Choose the direction and exact USDC amount. The target design uses CCTP burn/mint rather than prefunded liquidity.',
     icon: MoveRight,
   },
   {
     number: '03',
     label: 'Settle',
     title: 'Verify before release.',
-    description: 'Circom and Groth16 prove note ownership, bridge inclusion, and the final withdrawal.',
+    description: 'Real release requires verified settlement, valid pool proofs, encrypted notes and confirmed deposits.',
     icon: BadgeCheck,
   },
 ]
@@ -51,21 +51,21 @@ const useCases = [
     eyebrow: 'Treasury',
     title: 'Institutional settlement',
     description:
-      'Route working capital between ecosystems while a traceable Global View Key preserves administrative oversight.',
+      'Explore future treasury settlement with explicit user-authorized disclosure. Administrator-wide decryption is excluded from the target design.',
   },
   {
     icon: ScanLine,
     eyebrow: 'Tokenized assets',
     title: 'Real-world asset movement',
     description:
-      'Keep pool-note ownership and the cross-chain link private while public deposits and withdrawals remain visible.',
+      'The target privacy layer must protect pool-note ownership while disclosing the public settlement boundary.',
   },
   {
     icon: BriefcaseBusiness,
     eyebrow: 'Operations',
     title: 'Cross-border business payments',
     description:
-      'Move treasury USDC across networks without publishing the direct bridge-out to bridge-in relationship.',
+      'Model treasury USDC transfers across networks, accounting for observable settlement and correlation risks.',
   },
 ]
 
@@ -80,13 +80,13 @@ const principles = [
     icon: Fingerprint,
     index: 'P-02',
     title: 'Private linkage',
-    description: 'SPP-derived proofs break the direct public bridge-out to bridge-in link.',
+    description: 'Private note protection requires compatible verified pools and proofs; the current simulation provides no cryptographic privacy.',
   },
   {
     icon: KeyRound,
     index: 'P-03',
-    title: 'Traceable oversight',
-    description: 'One configured Global View Key can decrypt every note and reconstruct the bridge path.',
+    title: 'Disclosure redesign required',
+    description: 'The preserved legacy pools have administrator-wide decryption; they are blocked from the active CCTP flow.',
   },
 ]
 
@@ -157,7 +157,7 @@ function LandingPage({ onNavigate }: LandingPageProps) {
               with a protocol that protects note ownership and the cross-chain transfer link.
             </p>
             <p className="mt-3 max-w-xl text-xs leading-5 text-subtle">
-              Browser proving and Stellar testnet contracts are connected. The Sepolia pool deployment is still required for an end-to-end transfer.
+              The active application demonstrates the CCTP lifecycle in simulation. Live settlement and private deposits remain blocked pending verified pools and adapter integration.
             </p>
             <div className="mt-9 flex flex-wrap gap-3">
               <Button variant="accent" size="lg" onClick={() => onNavigate('bridge')}>

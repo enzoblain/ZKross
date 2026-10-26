@@ -12,6 +12,11 @@ pub fn build_transact(req: &str) -> Result<String, JsError> {
     js(zkross_prover::build_transact(req))
 }
 
+#[wasm_bindgen(js_name = buildPrivateTransact)]
+pub fn build_private_transact(req: &str) -> Result<String, JsError> {
+    js(zkross_prover::build_private_transact(req))
+}
+
 #[wasm_bindgen(js_name = buildBridgeOut)]
 pub fn build_bridge_out(req: &str) -> Result<String, JsError> {
     js(zkross_prover::build_bridge_out(req))

@@ -31,6 +31,7 @@ fn main() -> Result<()> {
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
     let first = || args.get(2).cloned().context("missing argument");
     let out = match cmd {
+        "build-private-transact" => build_private_transact(&read(&first()?)?)?,
         "build-transact" => build_transact(&read(&first()?)?)?,
         "build-bridge-out" => build_bridge_out(&read(&first()?)?)?,
         "build-bridge-in" => build_bridge_in(&read(&first()?)?)?,

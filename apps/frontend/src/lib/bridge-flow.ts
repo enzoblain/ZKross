@@ -139,6 +139,8 @@ function save(t: Transfer, patch: Partial<Transfer>) {
 
 /** Runs (or resumes) a transfer to the end. */
 export async function runTransfer(t: Transfer, update: FlowUpdate) {
+  throw new Error('Legacy liquidity bridge disabled: CCTP migration, encrypted storage and disclosure redesign are required.')
+
   const step = async (id: FlowStepId, f: () => Promise<void>) => {
     if (DONE[t.status] >= ORDER.indexOf(id)) return update(id, 'complete')
     update(id, 'active')

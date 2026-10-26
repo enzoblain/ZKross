@@ -53,8 +53,23 @@ export const cctp = {
 export const missingTestnetComponents = () =>
   cctp.components.filter((component) => !component.value).map((component) => component.label)
 
-export const isCctpTestnetReady = () => missingTestnetComponents().length === 0
+export const testnetExecutionBlocker = 'Live settlement is blocked: the CCTP-to-pool adapter, user-authorized disclosure circuits, and destination accounting have not passed integration verification.'
+
+export const isCctpTestnetReady = () => false
 
 export const defaultProtocolMode: ProtocolMode =
-  env.VITE_PROTOCOL_MODE === 'testnet' && isCctpTestnetReady() ? 'testnet' : 'simulation'
+  env.VITE_PROTOCOL_MODE === 'testnet' ? 'testnet' : 'simulation'
 
+
+// Public UI preference only; never store note secrets in this key.
+const MODE_KEY = 'zkross:execution-mode:v1'
+export function selectedProtocolMode(): ProtocolMode {
+  try {
+    const selected = window.localStorage.getItem(MODE_KEY)
+    if (selected === 'testnet' || selected === 'simulation') return selected
+  } catch { /* No persisted preference: use the explicit environment default. */ }
+  return defaultProtocolMode
+}
+export function selectProtocolMode(mode: ProtocolMode) {
+  window.localStorage.setItem(MODE_KEY, mode)
+}
