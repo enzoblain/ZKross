@@ -56,7 +56,7 @@ if [ "$SERVICE" = 1 ]; then
 fi
 
 if [ "$SITE" = 1 ]; then
-  [ -d "$REPO/apps/frontend/public/zk" ] || warn "apps/frontend/public/zk is missing: the site runs, but proofs fail until the browser prover is staged (scripts/build/sync-frontend.sh)."
+  [ -d "$REPO/apps/frontend/public/zk" ] || warn "apps/frontend/public/zk is missing: the site runs, but proofs fail until the browser prover is staged: bash scripts/build/stage-zk.sh"
   [ -z "$(port_owner "$SITE_PORT")" ] || warn "Port $SITE_PORT is taken: Vite will pick the next free one (see the [site] line with its URL)."
 fi
 

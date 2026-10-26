@@ -264,8 +264,10 @@ The site opens on <http://127.0.0.1:5173> and the relayer listens on
 (`.env`, the Ethereum ABIs, the browser prover files, a busy port) and says
 how to fix it. Ctrl+C stops everything.
 
-The browser prover and circuit files are staged in `apps/frontend/public/zk`
-by `bash scripts/build/sync-frontend.sh`. The refund attester runs separately:
+The browser prover and circuit files must be staged once in
+`apps/frontend/public/zk`: `bash scripts/build/stage-zk.sh` (or
+`scripts/build/sync-frontend.sh` for the WSL build mirror). Without them the
+site loads but cannot generate proofs. The refund attester runs separately:
 `npm run refund-attester` in `services/bridge`.
 
 ### Services in detail

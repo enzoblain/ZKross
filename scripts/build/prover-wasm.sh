@@ -8,11 +8,19 @@ BUILD="${ZKROSS_BUILD:-$HOME/zkross-build}"
 OUT="${1:-$BUILD/prover-wasm}"
 export CARGO_TARGET_DIR="$BUILD/prover-wasm-target"
 cd "$REPO/prover/wasm"
-# Apple's system ar can emit an empty archive for WebAssembly C objects.
-# Prefer a matching LLVM toolchain when it is installed.
-if [ "$(uname -s)" = Darwin ] && [ -x /opt/homebrew/opt/llvm/bin/llvm-ar ]; then
-  export AR_wasm32_unknown_unknown="${AR_wasm32_unknown_unknown:-/opt/homebrew/opt/llvm/bin/llvm-ar}"
-  export CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-/opt/homebrew/opt/llvm/bin/clang}"
+# Apple's system ar can emit an empty archive for WebAssembly C objects
+# (SQLite then fails to link: "undefined symbol: sqlite3_vfs_register").
+# Prefer Homebrew's LLVM when it is installed, else the llvm-ar that rustup
+# ships with llvm-tools (rustup component add llvm-tools).
+if [ "$(uname -s)" = Darwin ]; then
+  if [ -x /opt/homebrew/opt/llvm/bin/llvm-ar ]; then
+    export AR_wasm32_unknown_unknown="${AR_wasm32_unknown_unknown:-/opt/homebrew/opt/llvm/bin/llvm-ar}"
+    export CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-/opt/homebrew/opt/llvm/bin/clang}"
+  else
+    RUSTUP_AR="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-ar"
+    [ -x "$RUSTUP_AR" ] || { echo "macOS needs llvm-ar: rustup component add llvm-tools (or brew install llvm)" >&2; exit 1; }
+    export AR_wasm32_unknown_unknown="${AR_wasm32_unknown_unknown:-$RUSTUP_AR}"
+  fi
 fi
 "${CARGO:-cargo}" build --locked --release --target wasm32-unknown-unknown
 mkdir -p "$OUT"
