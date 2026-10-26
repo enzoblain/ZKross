@@ -9,12 +9,18 @@
 //   4. the admin's view: every note, refund note and bridge message on both
 //      chains decrypted with the Global View Key, and every bridge_out linked
 //      to its bridge_in
-// The root poster must run alongside (npm run root-poster in services/bridge);
-// the script waits for it. Progress (including note secrets) is saved in
-// deploy-out/e2e-state.json, so a failed run resumes where it stopped instead
+// With --relayer: 1 USDC each way, bridge outs, claims and withdrawals (0.5
+// USDC to a fresh address) go through the relayer (services/bridge), and each
+// of them is checked on-chain to come from the relayer's account, never a
+// user's. Liquidity is not added again.
+// The root poster (and with --relayer the relayer) must run alongside
+// (npm run service in services/bridge); the script waits for it. Progress
+// (including note secrets) is saved in deploy-out/e2e-state.json (or
+// e2e-relayer-state.json), so a failed run resumes where it stopped instead
 // of spending faucet USDC again. Testnet only; keys from the git-ignored .env.
 import fs from "node:fs";
 import path from "node:path";
+import { Asset, BASE_FEE, Horizon, Keypair, Operation, TransactionBuilder } from "@stellar/stellar-sdk";
 import { type Address, createPublicClient, createWalletClient, http, parseEventLogs } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { sepolia } from "viem/chains";
@@ -26,7 +32,9 @@ import * as st from "../../services/bridge/src/lib/stellar.ts";
 const S = deployments.stellarTestnet.zkross;
 const E = deployments.sepolia.zkross;
 if (!E) throw new Error("deploy the Sepolia pool first (scripts/testnet/deploy-sepolia.sh)");
-const STATE = path.join(REPO, "deploy-out/e2e-state.json");
+const RELAYER = process.argv.includes("--relayer");
+const RELAYER_URL = process.env.ZKROSS_RELAYER_URL ?? "http://127.0.0.1:8788";
+const STATE = path.join(REPO, RELAYER ? "deploy-out/e2e-relayer-state.json" : "deploy-out/e2e-state.json");
 fs.mkdirSync(path.dirname(STATE), { recursive: true });
 const state: any = fs.existsSync(STATE) ? JSON.parse(fs.readFileSync(STATE, "utf8")) : { steps: {}, links: [] };
 const save = () => fs.writeFileSync(STATE, JSON.stringify(state, null, 2));
@@ -42,8 +50,8 @@ const ETH_USDC = deployments.sepolia.usdc.address as Address;
 
 const USDC6 = 1_000_000n; // one USDC in bridge-message units (10^-6)
 const LIQUIDITY = 20n * USDC6;
-const DEPOSIT = 4n * USDC6;
-const TRANSFERS = [2n * USDC6, 1n * USDC6];
+const DEPOSIT = RELAYER ? USDC6 : 4n * USDC6;
+const TRANSFERS = RELAYER ? [USDC6] : [2n * USDC6, 1n * USDC6];
 
 type Chain = "stellar" | "sepolia";
 const SCALE: Record<Chain, bigint> = { stellar: 10n, sepolia: 1n };
@@ -99,6 +107,68 @@ function stSend(identity: string, fn: string, args: Record<string, unknown>, lab
   link(label, links.stellarTx(txHash!));
 }
 
+const wire = (v: unknown) => JSON.parse(JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x)));
+
+/** Sends a call through the relayer, waits for it, and checks on-chain that
+ * the relayer's account (no user's) sent it. Returns the hash. */
+async function relayCall(chain: Chain, fn: string, args: Record<string, unknown> | null, label: string, name: string): Promise<string> {
+  state.relayed ??= {};
+  let hash: string | undefined = state.relayed[name];
+  if (!hash) {
+    if (!args) throw new Error(`${name}: nothing to relay`);
+    const r = await fetch(`${RELAYER_URL}/relay`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chain, pool: chain === "stellar" ? S.pool : E.pool, fn, args: wire(args) }),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(`the relayer refused ${fn}: ${body.error}`);
+    hash = body.hash as string;
+    // Saved before waiting: a resumed run never relays the same step twice.
+    state.relayed[name] = hash;
+    save();
+  }
+  for (;;) {
+    const s = await fetch(`${RELAYER_URL}/status/${hash}`).then((x) => x.json()).catch(() => ({}));
+    if (s.status === "success") break;
+    if (s.status === "failed") throw new Error(`relayed ${fn} failed: ${hash}`);
+    await sleep(3000);
+  }
+  let sender = "";
+  for (let i = 0; !sender && i < 10; i++) {
+    if (chain === "sepolia") sender = (await pub.getTransaction({ hash: hash as `0x${string}` })).from;
+    else sender = (await fetch(`https://horizon-testnet.stellar.org/transactions/${hash}`).then((x) => (x.ok ? x.json() : {}))).source_account ?? "";
+    if (!sender) await sleep(3000);
+  }
+  const relayer = chain === "sepolia" ? need("SEPOLIA_RELAYER_ADDRESS") : need("STELLAR_RELAYER_ADDRESS");
+  const users = [user.address, need("STELLAR_ALICE_ADDRESS"), need("STELLAR_BOB_ADDRESS")].map((a) => a.toLowerCase());
+  check(sender.toLowerCase() === relayer.toLowerCase() && !users.includes(sender.toLowerCase()), `${fn} was sent by the relayer ${sender}`);
+  link(`${label} [via relayer]`, chain === "sepolia" ? links.sepoliaTx(hash) : links.stellarTx(hash));
+  return hash;
+}
+
+/** A fresh Stellar account with a USDC trustline (testnet throwaway, kept in the state file). */
+async function freshStellarAccount(): Promise<string> {
+  state.freshStellarSecret ??= Keypair.random().secret();
+  save();
+  const kp = Keypair.fromSecret(state.freshStellarSecret);
+  const horizon = new Horizon.Server("https://horizon-testnet.stellar.org");
+  let account = await horizon.loadAccount(kp.publicKey()).catch(() => null);
+  if (!account) {
+    await fetch(`https://friendbot.stellar.org?addr=${kp.publicKey()}`);
+    account = await horizon.loadAccount(kp.publicKey());
+  }
+  if (!account.balances.some((b: any) => b.asset_code === "USDC")) {
+    const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: deployments.stellarTestnet.networkPassphrase })
+      .addOperation(Operation.changeTrust({ asset: new Asset("USDC", deployments.stellarTestnet.usdc.issuer) }))
+      .setTimeout(120)
+      .build();
+    tx.sign(kp);
+    await horizon.submitTransaction(tx);
+  }
+  return kp.publicKey();
+}
+
 const ethView = (functionName: string, args: unknown[] = []) => pub.readContract({ address: E.pool, abi: eth.poolAbi, functionName, args } as any) as Promise<any>;
 const stView = (fn: string, args: Record<string, unknown> = {}) => st.view(S.pool, fn, args);
 const sHex = (s: string): zk.Hex => (s.startsWith("0x") ? (s as zk.Hex) : `0x${s}`);
@@ -128,6 +198,15 @@ async function stellarUsdc(addr: string): Promise<bigint> {
   const r = await fetch(`https://horizon-testnet.stellar.org/accounts/${addr}`).then((x) => x.json());
   const b = r.balances?.find((x: any) => x.asset_code === "USDC");
   return b ? BigInt(b.balance.replace(".", "")) : 0n;
+}
+
+/** Retries a read for a few seconds: public RPC nodes can lag a block behind. */
+async function eventually(f: () => Promise<boolean>, tries = 8): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    if (await f()) return true;
+    await sleep(3000);
+  }
+  return false;
 }
 
 const ethUsdc = (a: Address) => pub.readContract({ address: ETH_USDC, abi: eth.erc20Abi, functionName: "balanceOf", args: [a] }) as Promise<bigint>;
@@ -177,14 +256,44 @@ async function bridgeOut(name: string, note: Note, amount: bigint, recipient: st
     const label = `${c === "stellar" ? "Stellar bridge_out" : "Sepolia bridgeOut"} ${Number(amount) / 1e6} USDC (${note.owner} -> ${recipient})`;
     let block: string | undefined;
     let built: zk.Built;
+    const relayedHash: string | undefined = state.relayed?.[name];
+    if (RELAYER && relayedHash) {
+      // Resume: the relayer already sent it; read C and the deadline from its event.
+      await relayCall(c, c === "stellar" ? "bridge_out" : "bridgeOut", null, label, name);
+      let c0: zk.Hex, deadline0: string;
+      if (c === "stellar") {
+        const e = (await st.events(S.pool, S.deployLedger)).find((x) => x.txHash === relayedHash && x.name === "bridge_out_event")!;
+        c0 = st.hex32(e.topics[1]);
+        deadline0 = String(e.data.deadline_bucket);
+      } else {
+        const r = await pub.getTransactionReceipt({ hash: relayedHash as `0x${string}` });
+        const ev = (parseEventLogs({ abi: eth.poolAbi, logs: r.logs, eventName: "BridgeOut" }) as any[])[0];
+        c0 = st.hex32(ev.args.bridgeMessage);
+        deadline0 = String(ev.args.deadlineBucket);
+        block = r.blockNumber.toString();
+      }
+      const changeCommitment0 = zk.commitment(changeUnits.toString(), pk(note.owner), changeBlinding);
+      return {
+        msg: { src: c, c: c0, amount: amount.toString(), deadline: deadline0, recipient, secret, block },
+        change: { chain: c, owner: note.owner, amount: changeUnits.toString(), blinding: changeBlinding, leaf: changeUnits > 0n ? await leafOf(c, changeCommitment0) : -1 },
+      };
+    }
     if (c === "stellar") {
       const ext = { encrypted_output0: "03", encrypted_output1: "04", encrypted_refund: "05", encrypted_bridge_message: "06" };
       built = zk.buildBridgeOut({ ...req, ext_data_hash: sHex(stView("hash_bridge_out_ext_data", { ext_data: ext })) });
-      stSend("zkross-alice", "bridge_out", { proof: st.bridgeOutProof(zk.prove(built)), ext_data: ext, sender: need("STELLAR_ALICE_ADDRESS") }, label);
+      const proof = st.bridgeOutProof(zk.prove(built));
+      if (RELAYER) await relayCall("stellar", "bridge_out", { proof, ext_data: ext }, label, name);
+      else stSend("zkross-alice", "bridge_out", { proof, ext_data: ext, sender: need("STELLAR_ALICE_ADDRESS") }, label);
     } else {
       const ext = { encryptedOutput0: "0x03", encryptedOutput1: "0x04", encryptedRefund: "0x05", encryptedBridgeMessage: "0x06" };
       built = zk.buildBridgeOut({ ...req, ext_data_hash: await ethView("hashBridgeOutExtData", [ext]) });
-      block = (await ethSend(user, E.pool, eth.poolAbi, "bridgeOut", [eth.bridgeOutProof(zk.prove(built)), ext], label)).blockNumber.toString();
+      const proof = eth.bridgeOutProof(zk.prove(built));
+      if (RELAYER) {
+        const hash = await relayCall("sepolia", "bridgeOut", { proof, extData: ext }, label, name);
+        block = (await pub.getTransactionReceipt({ hash: hash as `0x${string}` })).blockNumber.toString();
+      } else {
+        block = (await ethSend(user, E.pool, eth.poolAbi, "bridgeOut", [proof, ext], label)).blockNumber.toString();
+      }
     }
     const changeCommitment = zk.commitment(changeUnits.toString(), pk(note.owner), changeBlinding);
     return {
@@ -232,16 +341,24 @@ async function bridgeIn(name: string, msg: Message, outboxCount: number): Promis
       out_salts: [zk.randomField(), zk.randomField()],
     };
     const label = `${dst === "sepolia" ? "Sepolia bridgeIn" : "Stellar bridge_in"} ${Number(msg.amount) / 1e6} USDC (${msg.recipient})`;
+    if (RELAYER && state.relayed?.[name]) {
+      await relayCall(dst, dst === "sepolia" ? "bridgeIn" : "bridge_in", null, label, name);
+      return { chain: dst, owner: msg.recipient, amount: units.toString(), blinding, leaf: await leafOf(dst, zk.commitment(units.toString(), pk(msg.recipient), blinding)) };
+    }
     let built: zk.Built;
     if (dst === "sepolia") {
       const ext = { encryptedOutput0: "0x07", encryptedOutput1: "0x08" };
       built = zk.buildBridgeIn({ ...req, ext_data_hash: await ethView("hashBridgeInExtData", [ext]) });
-      await ethSend(user, E.pool, eth.poolAbi, "bridgeIn", [eth.bridgeInProof(zk.prove(built)), ext], label);
+      const proof = eth.bridgeInProof(zk.prove(built));
+      if (RELAYER) await relayCall("sepolia", "bridgeIn", { proof, extData: ext }, label, name);
+      else await ethSend(user, E.pool, eth.poolAbi, "bridgeIn", [proof, ext], label);
       check(await ethView("isClaimed", [BigInt(built.claim_nullifier)]), "the claim nullifier is spent on Sepolia");
     } else {
       const ext = { encrypted_output0: "07", encrypted_output1: "08" };
       built = zk.buildBridgeIn({ ...req, ext_data_hash: sHex(stView("hash_bridge_in_ext_data", { ext_data: ext })) });
-      stSend("zkross-bob", "bridge_in", { proof: st.bridgeInProof(zk.prove(built)), ext_data: ext, sender: need("STELLAR_BOB_ADDRESS") }, label);
+      const proof = st.bridgeInProof(zk.prove(built));
+      if (RELAYER) await relayCall("stellar", "bridge_in", { proof, ext_data: ext }, label, name);
+      else stSend("zkross-bob", "bridge_in", { proof, ext_data: ext, sender: need("STELLAR_BOB_ADDRESS") }, label);
       check(stView("is_claimed", { claim_nullifier: BigInt(built.claim_nullifier).toString() }) === true, "the claim nullifier is spent on Stellar");
     }
     return { chain: dst, owner: msg.recipient, amount: units.toString(), blinding, leaf: await leafOf(dst, built.commitments[0]) };
@@ -249,24 +366,34 @@ async function bridgeIn(name: string, msg: Message, outboxCount: number): Promis
 }
 
 /** Withdraws all of `note` to `to`, a fresh public address. */
-async function withdraw(name: string, note: Note, to: string) {
+/** Withdraws `units` (default: all) of `note` to `to`, a fresh public address;
+ * any rest stays a note of the owner. */
+async function withdraw(name: string, note: Note, to: string, amount?: bigint) {
   return step(name, async () => {
     const c = note.chain;
-    const units = BigInt(note.amount);
-    const outputs = [{ pk: pk(note.owner), amount: "0", blinding: zk.randomField() }, { pk: pk(note.owner), amount: "0", blinding: zk.randomField() }];
+    const units = amount ?? BigInt(note.amount);
+    const rest = BigInt(note.amount) - units;
+    const outputs = [{ pk: pk(note.owner), amount: rest.toString(), blinding: key(`${name}_rest`) }, { pk: pk(note.owner), amount: "0", blinding: zk.randomField() }];
     const label = `${c === "sepolia" ? "Sepolia" : "Stellar"} withdraw ${Number(units / SCALE[c]) / 1e6} USDC to fresh ${to}`;
+    state.withdrawals ??= [];
+    if (!state.withdrawals.some((w: any) => w.to === to && w.units === units.toString())) state.withdrawals.push({ chain: c, to, units: units.toString() });
+    if (RELAYER && state.relayed?.[name]) return void (await relayCall(c, "transact", null, label, name));
     if (c === "sepolia") {
       const before = await ethUsdc(to as Address);
       const ext = { recipient: to, extAmount: -units, encryptedOutput0: "0x09", encryptedOutput1: "0x0a" };
       const built = zk.buildTransact({ levels: 20, leaves: await leaves(c), d: [D.x, D.y], ext_data_hash: await ethView("hashExtData", [ext]), public_amount: zk.hex32(zk.R - units), inputs: [input(note), dummy()], outputs, ...salts() });
-      await ethSend(user, E.pool, eth.poolAbi, "transact", [eth.transactProof(zk.prove(built)), ext], label);
-      check((await ethUsdc(to as Address)) - before === units, `${to} received exactly ${units} units`);
+      const proof = eth.transactProof(zk.prove(built));
+      if (RELAYER) await relayCall("sepolia", "transact", { proof, extData: ext }, label, name);
+      else await ethSend(user, E.pool, eth.poolAbi, "transact", [proof, ext], label);
+      check(await eventually(async () => (await ethUsdc(to as Address)) - before === units), `${to} received exactly ${units} units`);
     } else {
       const before = await stellarUsdc(to);
       const ext = { recipient: to, ext_amount: (-units).toString(), encrypted_output0: "09", encrypted_output1: "0a" };
       const built = zk.buildTransact({ levels: 20, leaves: await leaves(c), d: [D.x, D.y], ext_data_hash: sHex(stView("hash_ext_data", { ext_data: ext })), public_amount: zk.hex32(zk.R - units), inputs: [input(note), dummy()], outputs, ...salts() });
-      stSend("zkross-bob", "transact", { proof: st.transactProof(zk.prove(built)), ext_data: ext, sender: need("STELLAR_BOB_ADDRESS") }, label);
-      check((await stellarUsdc(to)) - before === units, `${to} received exactly ${units} stroops`);
+      const proof = st.transactProof(zk.prove(built));
+      if (RELAYER) await relayCall("stellar", "transact", { proof, ext_data: ext }, label, name);
+      else stSend("zkross-bob", "transact", { proof, ext_data: ext, sender: need("STELLAR_BOB_ADDRESS") }, label);
+      check(await eventually(async () => (await stellarUsdc(to)) - before === units), `${to} received exactly ${units} stroops`);
     }
   });
 }
@@ -274,14 +401,19 @@ async function withdraw(name: string, note: Note, to: string) {
 async function main() {
   // ---------- 0. Preflight ----------
   console.log("0. preflight");
-  check((await ethUsdc(deployer.address)) >= LIQUIDITY || !!state.steps.liquidity, "Sepolia deployer has 20 USDC for liquidity");
-  check((await stellarUsdc(need("STELLAR_DEPLOYER_ADDRESS"))) >= LIQUIDITY * 10n || !!state.steps.liquidity, "Stellar deployer has 20 USDC for liquidity");
-  check((await stellarUsdc(need("STELLAR_ALICE_ADDRESS"))) >= DEPOSIT * 10n || !!state.steps.depositStellar, "alice has 4 USDC on Stellar");
-  check((await ethUsdc(user.address)) >= DEPOSIT || !!state.steps.depositSepolia, "dave (Sepolia user) has 4 USDC");
+  if (RELAYER) {
+    const h = await fetch(`${RELAYER_URL}/health`).then((r) => r.json()).catch(() => null);
+    check(Boolean(h?.ok), `the relayer answers at ${RELAYER_URL}`);
+  } else {
+    check((await ethUsdc(deployer.address)) >= LIQUIDITY || !!state.steps.liquidity, "Sepolia deployer has 20 USDC for liquidity");
+    check((await stellarUsdc(need("STELLAR_DEPLOYER_ADDRESS"))) >= LIQUIDITY * 10n || !!state.steps.liquidity, "Stellar deployer has 20 USDC for liquidity");
+  }
+  check((await stellarUsdc(need("STELLAR_ALICE_ADDRESS"))) >= DEPOSIT * 10n || !!state.steps.depositStellar, `alice has ${DEPOSIT / USDC6} USDC on Stellar`);
+  check((await ethUsdc(user.address)) >= DEPOSIT || !!state.steps.depositSepolia, `dave (Sepolia user) has ${DEPOSIT / USDC6} USDC`);
   for (const a of [deployer, user, acct("SEPOLIA_POSTER_KEY")]) check((await pub.getBalance({ address: a.address })) > 0n, `${a.address} has Sepolia ETH`);
 
   // ---------- 1. Liquidity ----------
-  await step("liquidity", async () => {
+  if (!RELAYER) await step("liquidity", async () => {
     await ethSend(deployer, ETH_USDC, eth.erc20Abi, "approve", [E.pool, LIQUIDITY], "Sepolia approve (deployer)");
     await ethSend(deployer, E.pool, eth.poolAbi, "addLiquidity", [LIQUIDITY], "Sepolia addLiquidity 20 USDC");
     stSend("zkross-deployer", "add_liquidity", { amount: (LIQUIDITY * 10n).toString() }, "Stellar add_liquidity 20 USDC");
@@ -301,7 +433,7 @@ async function main() {
     state.freshEth ??= [];
     state.freshEth[i] ??= privateKeyToAccount(zk.randomField()).address;
     save();
-    await withdraw(`withdrawSepolia${i}`, claimed, state.freshEth[i]);
+    await withdraw(`withdrawSepolia${i}`, claimed, state.freshEth[i], RELAYER ? BigInt(claimed.amount) / 2n : undefined);
   }
 
   // ---------- 3. Ethereum -> Stellar ----------
@@ -315,7 +447,8 @@ async function main() {
   const rootE = await waitForRoot("rootSepoliaToStellar", "sepolia", toStellar);
   for (const [i, m] of toStellar.entries()) {
     const claimed = await bridgeIn(`bridgeInStellar${i}`, m, rootE.count);
-    await withdraw(`withdrawStellar${i}`, claimed, need("STELLAR_FRESH_ADDRESS"));
+    const to = RELAYER ? await freshStellarAccount() : need("STELLAR_FRESH_ADDRESS");
+    await withdraw(`withdrawStellar${i}`, claimed, to, RELAYER ? BigInt(claimed.amount) / 2n : undefined);
   }
 
   // ---------- 4. Admin view ----------
