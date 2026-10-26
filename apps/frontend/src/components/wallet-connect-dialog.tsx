@@ -41,7 +41,7 @@ function WalletConnectDialog({
     required: 'This source wallet authorizes the private intake and the CCTP transfer in live testnet mode.',
     destination: 'Optional: connect this wallet only when you want to withdraw a private destination note publicly.',
     optional: 'Optional: use this public address for a later withdrawal. A second wallet is not required to bridge.',
-    liquidity: 'Legacy option. Public liquidity provisioning is not part of the CCTP architecture.',
+    liquidity: 'Connect the pool admin wallet for this chain. Only the admin can add liquidity to the pool.',
   }[purpose]
 
   return (

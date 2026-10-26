@@ -2,6 +2,8 @@ import {
   Activity,
   ArrowLeftRight,
   CircleDollarSign,
+  Droplets,
+  FlaskConical,
   Moon,
   ScanEye,
   ShieldCheck,
@@ -22,20 +24,56 @@ type AppShellProps = {
   onNavigate: (page: PageId) => void
   theme: Theme
   onThemeChange: (theme: Theme) => void
+  experimental: boolean
+  onExperimentalChange: (enabled: boolean) => void
   children: ReactNode
+}
+
+type NavItem = {
+  id: Exclude<PageId, 'landing'>
+  label: string
+  icon: typeof Activity
 }
 
 const appNavigation = [
   { id: 'bridge', label: 'Bridge', icon: ArrowLeftRight },
-  { id: 'private-balance', label: 'Private balance', icon: CircleDollarSign },
+  { id: 'liquidity', label: 'Liquidity', icon: Droplets },
   { id: 'activity', label: 'Activity', icon: Activity },
   { id: 'privacy', label: 'Privacy', icon: ScanEye },
   { id: 'compliance', label: 'Compliance', icon: ShieldCheck },
-] satisfies Array<{
-  id: Exclude<PageId, 'landing'>
-  label: string
-  icon: typeof Activity
-}>
+] satisfies NavItem[]
+
+// Enzo's CCTP pages, shown only with the experimental setting on.
+const experimentalNavigation = [
+  { id: 'cctp-bridge', label: 'CCTP bridge', icon: FlaskConical },
+  { id: 'private-balance', label: 'Private balance', icon: CircleDollarSign },
+  { id: 'cctp-activity', label: 'CCTP activity', icon: Activity },
+  { id: 'cctp-privacy', label: 'CCTP privacy', icon: ScanEye },
+  { id: 'cctp-compliance', label: 'CCTP compliance', icon: ShieldCheck },
+] satisfies NavItem[]
+
+function ExperimentalButton({
+  experimental,
+  onExperimentalChange,
+}: Pick<AppShellProps, 'experimental' | 'onExperimentalChange'>) {
+  const label = experimental ? 'Hide experimental CCTP pages' : 'Show experimental CCTP pages'
+
+  return (
+    <button
+      type="button"
+      className={cn(
+        'focus-ring grid size-9 place-items-center rounded-xl border bg-surface transition-colors hover:border-border-strong hover:text-foreground',
+        experimental ? 'border-accent/40 text-accent' : 'border-border text-muted',
+      )}
+      onClick={() => onExperimentalChange(!experimental)}
+      aria-pressed={experimental}
+      aria-label={label}
+      title={label}
+    >
+      <FlaskConical aria-hidden="true" className="size-4" />
+    </button>
+  )
+}
 
 function ThemeButton({
   theme,
@@ -61,9 +99,12 @@ function AppShell({
   onNavigate,
   theme,
   onThemeChange,
+  experimental,
+  onExperimentalChange,
   children,
 }: AppShellProps) {
   const isLanding = activePage === 'landing'
+  const navigation: NavItem[] = experimental ? [...appNavigation, ...experimentalNavigation] : appNavigation
   const { wallets } = useWallets()
   const walletCount = Object.keys(wallets).length
 
@@ -103,7 +144,7 @@ function AppShell({
             </nav>
           ) : (
             <nav aria-label="Application" className="hidden items-center gap-1 md:flex">
-              {appNavigation.map((item) => {
+              {navigation.map((item) => {
                 const Icon = item.icon
                 const isActive = activePage === item.id
                 return (
@@ -129,6 +170,7 @@ function AppShell({
 
           <div className="flex items-center gap-2">
             <NetworkRouteMark className="mr-1 hidden sm:inline-flex" />
+            {!isLanding && <ExperimentalButton experimental={experimental} onExperimentalChange={onExperimentalChange} />}
             <ThemeButton theme={theme} onThemeChange={onThemeChange} />
             {isLanding ? (
               <Button variant="accent" size="sm" onClick={() => onNavigate('bridge')}>
@@ -150,7 +192,7 @@ function AppShell({
 
         {!isLanding && (
           <nav aria-label="Mobile application" className="mx-auto flex max-w-[1240px] gap-1 overflow-x-auto pb-2 md:hidden">
-            {appNavigation.map((item) => {
+            {navigation.map((item) => {
               const Icon = item.icon
               const isActive = activePage === item.id
               return (
