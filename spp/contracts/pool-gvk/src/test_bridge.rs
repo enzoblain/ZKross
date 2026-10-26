@@ -452,6 +452,39 @@ fn bridge_functions_refuse_before_init_bridge() {
     assert_eq!(err(pool.try_refund(&one, &sig)), Error::NotPending);
 }
 
+// ========== Relayer ==========
+
+/// Any account can submit bridge_out and bridge_in for someone else's notes:
+/// the only authorization asked for is the submitter's own, and it neither
+/// pays nor receives tokens.
+#[test]
+fn a_relayer_can_submit_bridge_out_and_bridge_in() {
+    let c = ctx();
+    let relayer = Address::generate(&c.env);
+    let t = TokenClient::new(&c.env, &c.token);
+    let pool_balance = t.balance(&c.pool.address);
+    let msg = u(&c.env, 0xC1);
+    let (p, ext) = mk_out(&c, 0xB1, 0xB2, &msg);
+    accept_out(&c, &p);
+    c.pool.bridge_out(&p, &ext, &relayer);
+    let auths = c.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, relayer);
+    assert!(c.pool.get_pending_message(&msg).is_some());
+
+    let root = remote_root(&c.env);
+    post(&c, &root);
+    let (q, qext) = mk_in(&c, 0xCB, &root);
+    accept_in(&c, &q);
+    c.pool.bridge_in(&q, &qext, &relayer);
+    let auths = c.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, relayer);
+    assert!(c.pool.is_claimed(&u(&c.env, 0xCB)));
+    assert_eq!(t.balance(&relayer), 0);
+    assert_eq!(t.balance(&c.pool.address), pool_balance);
+}
+
 // ========== post_remote_root and add_liquidity ==========
 
 #[test]

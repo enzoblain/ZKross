@@ -450,6 +450,27 @@ contract ShieldedPoolBridgeTest is PoolTestBase {
         assertEq(pool.nextIndex(), 2);
     }
 
+    /// Relayer: bridgeOut and bridgeIn work from any caller; msg.sender is not
+    /// part of the proof, the ext hash or any transfer.
+    function test_aRelayerCanSubmitBridgeOutAndBridgeIn() public {
+        address relayer = makeAddr("relayer");
+        uint256 poolBalance = token.balanceOf(address(pool));
+        (ShieldedPool.BridgeOutProof memory o, ShieldedPool.BridgeOutExtData memory oext) = _mkOut(pool, 0xB1, 0xB2, 0xC1);
+        _acceptOut(o);
+        vm.prank(relayer);
+        pool.bridgeOut(o, oext);
+        assertEq(uint8(pool.getPendingMessage(0xC1).status), uint8(ShieldedPool.BridgeStatus.Pending));
+
+        _postRemote(pool, REMOTE_ROOT);
+        (ShieldedPool.BridgeInProof memory p, ShieldedPool.BridgeInExtData memory ext) = _mkIn(pool, 0xCB);
+        _acceptIn(p);
+        vm.prank(relayer);
+        pool.bridgeIn(p, ext);
+        assertTrue(pool.isClaimed(0xCB));
+        assertEq(token.balanceOf(relayer), 0);
+        assertEq(token.balanceOf(address(pool)), poolBalance);
+    }
+
     /// Claiming a bridge message twice (Phase 7).
     function test_bridgeInRejectsASecondClaim() public {
         _postRemote(pool, REMOTE_ROOT);

@@ -689,6 +689,30 @@ contract ShieldedPoolTest is PoolTestBase {
         assertTrue(pool.isSpent(0xE4));
     }
 
+    /// Relayer: any account can submit a withdrawal or a private transfer. The
+    /// caller is never tied to the note owner, pays nothing and receives
+    /// nothing; the USDC goes only to the ext-data recipient.
+    function test_aRelayerCanSubmitWithdrawalsAndTransfers() public {
+        ShieldedPool pool = _openPool();
+        address relayer = makeAddr("relayer");
+        token.mint(address(pool), 1000);
+        (ShieldedPool.Proof memory p, ShieldedPool.ExtData memory e) = _mkMovingProof(pool, -50, 0xE7);
+        _accept(p, _pt(1, 2));
+        vm.prank(relayer);
+        pool.transact(p, e);
+        assertEq(token.balanceOf(e.recipient), 50);
+        assertEq(token.balanceOf(relayer), 0);
+        assertEq(token.balanceOf(address(pool)), 950);
+
+        (p, e) = _mkMovingProof(pool, 0, 0xE8);
+        _accept(p, _pt(1, 2));
+        vm.prank(relayer);
+        pool.transact(p, e);
+        assertTrue(pool.isSpent(0xE8));
+        assertEq(token.balanceOf(relayer), 0);
+        assertEq(token.balanceOf(address(pool)), 950);
+    }
+
     /// A withdrawal larger than the pool's balance fails and changes nothing
     /// (ours: the solvency must-fail case from PLAN.md).
     function test_transactRefusesAWithdrawalLargerThanThePoolBalance() public {
