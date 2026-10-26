@@ -339,7 +339,7 @@ while it sleeps, no root is posted and transfers wait.
 **1. The bridge service, on an Ubuntu VM** (22.04 or 24.04, x86_64 or arm64)
 
 ```sh
-git clone https://github.com/enzoblain/ZKross.git && cd ZKross && git checkout dev
+git clone https://github.com/enzoblain/ZKross.git && cd ZKross   # main
 # from your machine: scp .env <vm>:ZKross/.env
 bash scripts/deploy/server-setup.sh https://zkross.pages.dev
 ```
@@ -364,6 +364,32 @@ and uploads it with Cloudflare's `wrangler` (it asks you to log in the first
 time and creates the `zkross` project). If the site's final address differs
 from the one given to `server-setup.sh`, update `ZKROSS_RELAYER_ORIGINS` in the
 server's `.env` and run `sudo systemctl restart zkross-bridge`.
+
+### CI/CD (GitHub Actions, `main` only)
+
+`dev` is the working branch; merging it into `main` releases.
+
+| Workflow | Runs on | Does |
+| --- | --- | --- |
+| `ci.yml` | pull requests to `main`, pushes to `main` | Site lint, types, tests and build; relayer tests (with throwaway keys); `forge test`; `cargo test -p pool-gvk` |
+| `deploy-site.yml` | pushes to `main` | Builds the prover, circuits and site, publishes to Cloudflare Pages |
+| `deploy-service.yml` | pushes to `main` touching the service | SSHes to the VM: pulls `main`, `npm ci`, restarts the service |
+
+Set them up in **Settings → Secrets and variables → Actions**:
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `CLOUDFLARE_API_TOKEN` | secret | A Cloudflare API token with *Cloudflare Pages: Edit* |
+| `CLOUDFLARE_ACCOUNT_ID` | secret | Your Cloudflare account ID |
+| `VITE_RELAYER_URL` | variable | The relayer's `https://` address |
+| `CLOUDFLARE_PAGES_PROJECT` | variable | Optional, default `zkross` |
+| `VM_SSH_KEY` | secret | A private key used only for deploys (its public key in the VM's `~/.ssh/authorized_keys`) |
+| `VM_KNOWN_HOSTS` | secret | The output of `ssh-keyscan <vm>` |
+| `VM_HOST`, `VM_USER` | variables | The VM's address and user (e.g. `ubuntu`) |
+| `VM_REPO_DIR` | variable | Optional, default `ZKross` (in the user's home) |
+
+The testnet keys never go to GitHub: they stay in the VM's `.env`. Pull
+requests from forks run the CI but never deploy.
 
 ## Testing
 

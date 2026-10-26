@@ -1,0 +1,73 @@
+# Updates the bridge service on the VM (set up once with
+# scripts/deploy/server-setup.sh) on every push to main that touches it.
+# The testnet keys stay in the VM's .env; GitHub only holds an SSH key.
+# Repository settings → Secrets and variables → Actions:
+#   secrets:   VM_SSH_KEY (a key dedicated to deploys), VM_KNOWN_HOSTS (output of
+#              `ssh-keyscan <vm>`, so the VM's identity is checked)
+#   variables: VM_HOST, VM_USER (e.g. ubuntu), VM_REPO_DIR (default: ZKross,
+#              relative to the user's home)
+name: Deploy service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - services/bridge/**
+      - apps/frontend/src/lib/abi/**
+      - deployments.json
+      - package.json
+      - package-lock.json
+      - .github/workflows/deploy-service.yml
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-service
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      VM_HOST: ${{ vars.VM_HOST }}
+      VM_USER: ${{ vars.VM_USER }}
+      VM_REPO_DIR: ${{ vars.VM_REPO_DIR || 'ZKross' }}
+    steps:
+      - name: Check the configuration
+        env:
+          HAS_KEY: ${{ secrets.VM_SSH_KEY != '' && secrets.VM_KNOWN_HOSTS != '' }}
+        run: |
+          if [ "$HAS_KEY" != true ] || [ -z "$VM_HOST" ] || [ -z "$VM_USER" ]; then
+            echo "::error::Set the VM_SSH_KEY and VM_KNOWN_HOSTS secrets and the VM_HOST and VM_USER variables."; exit 1
+          fi
+      - name: SSH key
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$VM_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Pull, install and restart
+        run: |
+          ssh -i ~/.ssh/deploy -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" bash -s -- "$VM_REPO_DIR" "$GITHUB_SHA" <<'EOF'
+          set -euo pipefail
+          cd "$1"
+          git fetch -q origin main
+          git checkout -q main
+          git merge -q --ff-only origin/main
+          [ "$(git rev-parse HEAD)" = "$2" ] || echo "note: the VM is at $(git rev-parse --short HEAD), main moved on since this run started"
+          npm ci --silent
+          sudo systemctl restart zkross-bridge
+          if systemctl cat zkross-refund-attester >/dev/null 2>&1; then
+            sudo systemctl restart zkross-refund-attester
+          fi
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8788/health >/dev/null 2>&1 && { echo "relayer is up"; exit 0; }
+            sleep 2
+          done
+          echo "the relayer did not come back: journalctl -u zkross-bridge -n 50" >&2
+          exit 1
+          EOF

@@ -1,0 +1,73 @@
+# Checks every pull request to main and every push to main.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Site (lint, types, tests, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint --workspace=apps/frontend
+      - run: npx tsc -b
+        working-directory: apps/frontend
+      - run: npm test --workspace=apps/frontend
+      - run: npm run build --workspace=apps/frontend
+
+  relayer:
+    name: Bridge service (relayer tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # Throwaway keys made here: the tests never touch a network or real keys.
+      - name: Test with throwaway keys
+        working-directory: services/bridge
+        run: |
+          export STELLAR_RELAYER_SECRET="$(node -e "console.log(require('@stellar/stellar-sdk').Keypair.random().secret())")"
+          export SEPOLIA_RELAYER_KEY="0x$(openssl rand -hex 32)"
+          npm test
+
+  ethereum:
+    name: Ethereum contracts (forge test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.6
+      - run: forge test
+        working-directory: contracts/ethereum
+
+  stellar:
+    name: Stellar contracts (cargo test -p pool-gvk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # spp/rust-toolchain.toml pins the toolchain; rustup installs it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spp
+      - run: npm run test:stellar

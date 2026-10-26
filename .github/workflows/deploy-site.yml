@@ -1,0 +1,62 @@
+# Builds the site (with the browser prover and circuit files) and publishes
+# it to Cloudflare Pages on every push to main.
+# Repository settings → Secrets and variables → Actions:
+#   secrets:   CLOUDFLARE_API_TOKEN (Pages edit permission), CLOUDFLARE_ACCOUNT_ID
+#   variables: VITE_RELAYER_URL (https://…), CLOUDFLARE_PAGES_PROJECT (default: zkross)
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-site
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      VITE_RELAYER_URL: ${{ vars.VITE_RELAYER_URL }}
+      HAS_CLOUDFLARE: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+    steps:
+      - name: Check the configuration
+        run: |
+          if [ "$HAS_CLOUDFLARE" != true ]; then
+            echo "::error::Set the CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets."; exit 1
+          fi
+          case "$VITE_RELAYER_URL" in
+            https://*) ;;
+            *) echo "::error::Set the VITE_RELAYER_URL variable to the relayer's https:// address."; exit 1 ;;
+          esac
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      # Browser prover: prover/wasm's rust-toolchain.toml pins Rust; wasm-bindgen
+      # must match the crate's version (0.2.128).
+      - run: rustup target add wasm32-unknown-unknown
+        working-directory: prover/wasm
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.128
+      # The circuits' .r1cs only change with the circuits: compiled once, then cached.
+      - uses: actions/cache@v4
+        with:
+          path: ~/zkross-build/spp/target/circuits-artifacts/out
+          key: circuits-${{ hashFiles('spp/circuits/**', 'spp/tools/circuit-compiler/**', 'spp/Cargo.lock') }}
+      - run: bash scripts/build/stage-zk.sh
+
+      - run: npm run build --workspace=apps/frontend
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy apps/frontend/dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT || 'zkross' }} --branch=main --commit-dirty=true
