@@ -336,3 +336,42 @@ it('picks up a merge that landed after its page closed', async () => {
   expect(h.calls).toEqual([expect.objectContaining({ amount: -(3n * USDC.ethereum) })])
   expect(store.pendingMerges('ethereum')).toEqual([])
 })
+
+// A bridge the private balance only partly covers: the wallet deposits the rest.
+
+const deposits = () => h.calls.filter((c) => c.fn === 'transact' && c.amount! > 0n)
+
+it('tops the private balance up from the wallet with only what it lacks', async () => {
+  await deposit('ethereum', 1n * USDC.ethereum)
+  h.calls = []
+
+  const t = createTransfer({ from: 'ethereum', to: 'stellar', amount: 3n * USDC.ethereum, identity: IDENTITY, sender: WALLET.ethereum, recipient: TYPED.stellar })
+  await runTransfer(t, () => {})
+
+  expect(t.status).toBe('withdrawn')
+  expect(deposits()).toEqual([expect.objectContaining({ account: WALLET.ethereum, amount: 2n * USDC.ethereum })])
+  expect(h.calls.find((c) => c.fn === 'bridgeOut')).toBeDefined()
+  expect(store.balanceOf('ethereum', KEY.pk)).toBe(0n)
+})
+
+it('tops up across several balance notes, merging them before the bridge out', async () => {
+  for (let i = 0; i < 2; i++) await deposit('stellar', USDC.stellar)
+  h.calls = []
+
+  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 5n * USDC.ethereum, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
+  await runTransfer(t, () => {})
+
+  expect(t.status).toBe('withdrawn')
+  expect(deposits()).toEqual([expect.objectContaining({ amount: 3n * USDC.stellar })])
+  expect(h.calls.filter((c) => c.network === 'stellar' && c.amount === 0n)).toHaveLength(1)
+  expect(store.balanceOf('stellar', KEY.pk)).toBe(0n)
+})
+
+it('still asks for the wallet when the balance falls short and none is connected', async () => {
+  await deposit('ethereum', 1n * USDC.ethereum)
+  h.calls = []
+
+  const t = createTransfer({ from: 'ethereum', to: 'stellar', amount: 3n * USDC.ethereum, identity: IDENTITY, recipient: TYPED.stellar })
+  await expect(runTransfer(t, () => {})).rejects.toThrow('lacks 2')
+  expect(h.calls).toEqual([])
+})

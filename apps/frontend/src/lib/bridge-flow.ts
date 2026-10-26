@@ -45,7 +45,7 @@ export function createProgress(from: NetworkId, to: NetworkId, t?: Transfer): Tr
   const b = networkMeta[to].shortName
   const steps: Record<FlowStepId, [string, string]> = {
     keys: ['Unlock your note key', `One signature in your identity wallet derives your private note key, the same on both chains. No transaction.`],
-    deposit: ['Deposit into the private pool', `Public USDC moves from your ${a} wallet into the pool as a hidden note (skipped if your private balance covers it).`],
+    deposit: ['Deposit into the private pool', `Only what your private balance lacks moves from your ${a} wallet into the pool as a hidden note (skipped if the balance covers it all).`],
     bridgeOut: ['Prove and send bridge out', `A zero-knowledge proof spends your ${a} note and records a bridge message.`],
     root: ['Wait for the root poster', `The ${a} outbox root is copied to ${b}${from === 'ethereum' ? ' once Sepolia has confirmed it (from about a minute to 15, depending on the root poster)' : ' (about a minute)'}.`],
     claim: ['Prove and claim', `A second proof claims the message as a new note in the ${b} pool; the relayer submits it.`],
@@ -310,22 +310,24 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     if (await resumeDeposit(t.from, t.depositNote, t.txs.deposit, t.depositUnseen, () => save(t, { depositUnseen: true }))) {
       return save(t, { status: 'deposited', error: undefined })
     }
-    // The private balance covers it (its notes are merged at the bridge out if needed).
-    if (store.balanceOf(t.from, key.pk) >= amountFrom) return save(t, { status: 'deposited', error: undefined })
+    // The private balance pays first; the wallet deposits only what it lacks.
+    // Its notes and the deposit's are merged at the bridge out if needed.
+    const topUp = amountFrom - store.balanceOf(t.from, key.pk)
+    if (topUp <= 0n) return save(t, { status: 'deposited', error: undefined })
     if (!t.sender) {
-      throw new Error(`Your private balance does not cover this amount: connect your ${networkMeta[t.from].wallet} wallet to deposit.`)
+      throw new Error(`Your private balance lacks ${formatNote(t.from, topUp)} USDC: connect your ${networkMeta[t.from].wallet} wallet to deposit it.`)
     }
     const balance = await src.usdcBalance(t.sender)
-    if (balance === null || balance < amountFrom) {
-      throw new Error(`Your ${networkMeta[t.from].shortName} wallet needs ${formatNote(t.from, amountFrom)} public USDC to deposit.`)
+    if (balance === null || balance < topUp) {
+      throw new Error(`Your ${networkMeta[t.from].shortName} wallet needs ${formatNote(t.from, topUp)} public USDC to deposit.`)
     }
     const blinding = randomField()
     const note: PendingNote = {
       network: t.from,
       pk: key.pk,
-      amount: amountFrom.toString(),
+      amount: topUp.toString(),
       blinding,
-      commitment: await prover.commitment(amountFrom, key.pk, blinding),
+      commitment: await prover.commitment(topUp, key.pk, blinding),
     }
     store.watchNote(note)
     save(t, { depositNote: note, depositUnseen: undefined })
@@ -334,11 +336,11 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       levels: protocol.levels,
       leaves: await src.noteLeaves(),
       d: await src.adminViewKey(),
-      ext_data_hash: await src.transactExtHash(t.sender, amountFrom),
-      public_amount: amountFrom.toString(),
+      ext_data_hash: await src.transactExtHash(t.sender, topUp),
+      public_amount: topUp.toString(),
       inputs: [dummy(), dummy()],
       outputs: [
-        { pk: key.pk, amount: amountFrom.toString(), blinding },
+        { pk: key.pk, amount: topUp.toString(), blinding },
         { pk: key.pk, amount: '0', blinding: randomField() },
       ],
       in_salts: salts(),
@@ -346,7 +348,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     })
     const proof = await prover.prove(built)
     update('deposit', 'active', `Confirm the deposit in ${networkMeta[t.from].wallet}…`)
-    const sent = await src.transact(t.sender, proof, t.sender, amountFrom, (hash) => save(t, { txs: { ...t.txs, approve: hash } }))
+    const sent = await src.transact(t.sender, proof, t.sender, topUp, (hash) => save(t, { txs: { ...t.txs, approve: hash } }))
     save(t, { txs: { ...t.txs, deposit: sent.hash } })
     if (!(await settleNotes(t.from, [note]))) throw new Error('The deposit landed but its note is not indexed yet; retry shortly.')
     save(t, { status: 'deposited', error: undefined })

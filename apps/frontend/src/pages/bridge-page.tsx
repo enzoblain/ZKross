@@ -119,6 +119,8 @@ function BridgePage() {
   const readError = liveReads.key === readKey ? liveReads.error : ''
   // The source wallet is needed only to deposit what the private balance lacks.
   const needsDeposit = Boolean(messageAmount && toNoteAmount(from, messageAmount) > privateBalance)
+  // The private balance pays first; the wallet deposits only the rest.
+  const topUp = needsDeposit && messageAmount ? toNoteAmount(from, messageAmount) - privateBalance : 0n
   // Paid from the private balance: notes merged first when two do not cover it.
   const merges = id && messageAmount && messageAmount > 0n && !needsDeposit ? mergeSteps(store.notes(from, id.pk), toNoteAmount(from, messageAmount)) : null
   const needsSource = needsDeposit
@@ -394,7 +396,7 @@ function BridgePage() {
               <div className="border-t border-border px-5 py-5 sm:px-7">
                 <p className="text-[10px] font-medium text-subtle">Account visible on-chain as the sender</p>
                 <dl className="mt-3 space-y-2 text-[11px]">
-                  <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{needsDeposit ? `Your wallet${sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}` : 'None: private balance'}</dd></div>
+                  <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{needsDeposit ? `${formatNote(from, topUp)} USDC · your wallet${sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}${privateBalance > 0n ? ` + ${formatNote(from, privateBalance)} private` : ''}` : 'None: private balance'}</dd></div>
                   {Boolean(merges) && <div className="flex justify-between gap-4"><dt className="text-subtle">Note merges first · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{merges} · {relayerName(from)}</dd></div>}
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Bridge out · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{relayerName(from)}</dd></div>
                   <div className="flex justify-between gap-4"><dt className="text-subtle">{keepPrivate ? 'Claim' : 'Claim + withdrawal'} · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{relayerName(to)}</dd></div>
