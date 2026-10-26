@@ -9,15 +9,13 @@
 // balance. The destination wallet is never connected: the user only types the
 // destination address, and the claim and withdrawal always go through the
 // relayer. The source wallet is needed only to deposit what the private
-// balance does not cover; the bridge out goes through the relayer by default
-// (t.via). If the relayer does not answer the bridge out, the step fails with
-// `relayerFailed` and the user can send it themselves.
+// balance does not cover; the bridge out also goes through the relayer, so
+// the user's wallets appear on-chain only for deposits.
 import { formatNote, toNoteAmount } from './amounts'
 import { chainId, poolAddress, protocol } from './config'
 import { type IdentityWallet, type NoteKey, noteKey } from './keys'
 import { type NetworkId, type ProgressState, type TransferProgressStep, networkMeta } from './networks'
-import { type Via, pools } from './pools'
-import { RelayerUnavailable } from './relayer'
+import { pools } from './pools'
 import * as stellar from './stellar'
 import * as store from './store'
 import type { Note, PendingNote, Transfer } from './store'
@@ -75,8 +73,6 @@ type NewTransfer = {
   /** Public address on `to`; ignored when `keepPrivate`. */
   recipient: string
   keepPrivate?: boolean
-  /** Who sends the bridge out; claims and withdrawals always use the relayer. */
-  via?: Via
 }
 
 export function createTransfer(input: NewTransfer): Transfer {
@@ -98,7 +94,6 @@ export function createTransfer(input: NewTransfer): Transfer {
     refundBlinding: randomField(),
     status: 'created',
     txs: {},
-    via: input.via ?? 'relayer',
   }
   store.putTransfer(t)
   return t
@@ -286,7 +281,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       // Only the bridge out has a "send it myself" fallback.
-      save(t, { error: message, relayerFailed: id === 'bridgeOut' && error instanceof RelayerUnavailable })
+      save(t, { error: message })
       update(id, 'failed', message)
       throw error
     }
@@ -297,7 +292,6 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
   const src = pools[t.from]
   const dst = pools[t.to]
   const amount = BigInt(t.amount)
-  const via: Via = t.via ?? 'relayer'
   const relaying = 'Sending through the relayer…'
   const amountFrom = toNoteAmount(t.from, amount)
   const amountTo = toNoteAmount(t.to, amount)
@@ -369,7 +363,6 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     await mergeNotes(t.from, key, amountFrom, (message) => update('bridgeOut', 'active', message))
     const chosen = selectNotes(store.notes(t.from, key.pk), amountFrom)
     if (!chosen) throw new Error('Your private balance no longer covers this amount.')
-    if (via === 'wallet' && !t.sender) throw new Error(`Connect your ${networkMeta[t.from].wallet} wallet to send the bridge out yourself.`)
     const total = chosen.reduce((sum, n) => sum + BigInt(n.amount), 0n)
     const change: PendingNote[] = []
     for (const value of [total - amountFrom, 0n]) {
@@ -413,8 +406,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       changeNotes: change,
     })
     const proof = await prover.prove(built)
-    update('bridgeOut', 'active', via === 'relayer' ? relaying : `Confirm in ${networkMeta[t.from].wallet}…`)
-    const sent = await src.bridgeOut(t.sender, proof, via)
+    update('bridgeOut', 'active', relaying)
+    const sent = await src.bridgeOut('', proof, 'relayer')
     save(t, { txs: { ...t.txs, bridgeOut: sent.hash } })
     store.markSpent(t.from, t.inputs ?? [])
     if (!(await settleNotes(t.from, change))) {

@@ -34,7 +34,7 @@ import { createProgress, createTransfer, identityOf, mergeSteps, runTransfer, se
 import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { chainId, explorer, isDeployed, poolAddress, protocol } from '../lib/config'
 import { networkMeta, otherNetwork, validAddress, type NetworkId, type TransferProgressStep } from '../lib/networks'
-import { type Via, pools } from '../lib/pools'
+import { pools } from '../lib/pools'
 import { RELAYER_URL, relayerHealth } from '../lib/relayer'
 import * as store from '../lib/store'
 import type { Transfer } from '../lib/store'
@@ -89,7 +89,6 @@ function BridgePage() {
     destinationCapacity: bigint | null
     error: string
   }>({ key: '', publicBalance: null, destinationCapacity: null, error: '' })
-  const [via, setVia] = useState<Via>(initial?.via ?? 'relayer')
   const [relayerAccounts, setRelayerAccounts] = useState<Record<NetworkId, string | null> | null | undefined>(undefined)
   const [id, setId] = useState<Identity | null>(() => identity())
   const [identityError, setIdentityError] = useState('')
@@ -122,7 +121,7 @@ function BridgePage() {
   const needsDeposit = Boolean(messageAmount && toNoteAmount(from, messageAmount) > privateBalance)
   // Paid from the private balance: notes merged first when two do not cover it.
   const merges = id && messageAmount && messageAmount > 0n && !needsDeposit ? mergeSteps(store.notes(from, id.pk), toNoteAmount(from, messageAmount)) : null
-  const needsSource = needsDeposit || via === 'wallet'
+  const needsSource = needsDeposit
   const canReview = Boolean(
     identityReady &&
       (sourceWallet || !needsSource) &&
@@ -173,8 +172,6 @@ function BridgePage() {
   const relayerDown = relayerAccounts === null
   const relayerName = (network: NetworkId) =>
     `The relayer${relayerAccounts?.[network] ? ` (${truncateAddress(relayerAccounts[network]!)})` : ''}`
-  const submitter = (network: NetworkId, wallet: string | undefined) =>
-    via === 'relayer' ? relayerName(network) : `Your wallet${wallet ? ` (${truncateAddress(wallet)})` : ''}`
 
   const updateProgress = (step: FlowStepId, status: TransferProgressStep['status'], description?: string) => {
     setProgress((current) =>
@@ -230,7 +227,6 @@ function BridgePage() {
       sender: needsSource ? sourceWallet?.address : undefined,
       recipient: recipientValue.trim(),
       keepPrivate,
-      via,
     })
     void execute(next)
   }
@@ -342,14 +338,7 @@ function BridgePage() {
                     </button>
                   ))}
               </div>
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 p-3">
-                <div className="min-w-0"><p className="text-[10px] font-medium text-foreground">Bridge out sent by</p><p className="mt-1 text-[10px] leading-4 text-subtle">{via === 'relayer' ? 'The relayer submits it from its own account, so your wallet does not appear on-chain for it.' : 'Your source wallet submits and pays for it, so it appears on-chain.'} A deposit, when your private balance lacks the amount, is sent by your source wallet; the claim and withdrawal always by the relayer.</p></div>
-                <div role="radiogroup" aria-label="Who sends the transactions" className="flex gap-1 rounded-xl border border-border bg-background p-1">
-                  {([['relayer', 'Relayer'], ['wallet', 'Send myself']] as [Via, string][]).map(([value, label]) => (
-                    <button key={value} type="button" role="radio" aria-checked={via === value} disabled={runStatus === 'running'} onClick={() => setVia(value)} className={cn('focus-ring rounded-lg px-3 py-1.5 text-[10px] font-semibold transition-colors disabled:opacity-50', via === value ? 'bg-surface-raised text-foreground' : 'text-muted hover:text-foreground')}>{label}</button>
-                  ))}
-                </div>
-              </div>
+              <p className="mt-4 rounded-2xl border border-border bg-background/40 p-3 text-[10px] leading-4 text-subtle"><span className="font-medium text-foreground">Sent by the relayer.</span> The bridge out, claim and withdrawal come from the relayer’s own account, so your wallets do not appear on-chain for them. Your wallet only sends a deposit, when your private balance lacks the amount.</p>
               {relayerDown && <p role="status" className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-warning"><AlertTriangle aria-hidden="true" className="mt-0.5 size-3 shrink-0" />The relayer at {RELAYER_URL} is not answering. It sends the claim and withdrawal: start it (services/bridge, npm run service).</p>}
             </div>
 
@@ -407,7 +396,7 @@ function BridgePage() {
                 <dl className="mt-3 space-y-2 text-[11px]">
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{needsDeposit ? `Your wallet${sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}` : 'None: private balance'}</dd></div>
                   {Boolean(merges) && <div className="flex justify-between gap-4"><dt className="text-subtle">Note merges first · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{merges} · {relayerName(from)}</dd></div>}
-                  <div className="flex justify-between gap-4"><dt className="text-subtle">Bridge out · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{submitter(from, sourceWallet?.address)}</dd></div>
+                  <div className="flex justify-between gap-4"><dt className="text-subtle">Bridge out · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{relayerName(from)}</dd></div>
                   <div className="flex justify-between gap-4"><dt className="text-subtle">{keepPrivate ? 'Claim' : 'Claim + withdrawal'} · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{relayerName(to)}</dd></div>
                 </dl>
               </div>
@@ -437,9 +426,6 @@ function BridgePage() {
             </details>
 
             {currentError && <div role="alert" className="rounded-2xl border border-danger/25 bg-danger/[0.055] p-4 text-[11px] leading-5 text-danger">{currentError}</div>}
-            {transfer?.relayerFailed && latestCanResume && (
-              <Button variant="secondary" size="lg" className="w-full" onClick={() => { const next = { ...transfer, via: 'wallet' as Via, relayerFailed: false }; store.putTransfer(next); setVia('wallet'); void execute(next) }}>Send it myself instead</Button>
-            )}
 
             {latestCanResume && transfer ? (
               <div className="grid gap-2 sm:grid-cols-2">
@@ -517,9 +503,9 @@ function BridgePage() {
             <div className="my-5 h-px bg-border" />
             <dl className="space-y-3 text-xs">
               <div className="flex justify-between gap-4"><dt className="text-subtle">Route</dt><dd>{networkMeta[from].name} → {networkMeta[to].name}</dd></div>
-              <div className="flex justify-between gap-4"><dt className="text-subtle">Withdrawal address</dt><dd className="max-w-[230px] truncate font-mono">{recipientValue}</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">{keepPrivate ? 'Destination' : 'Withdrawal address'}</dt><dd className="max-w-[230px] truncate font-mono">{keepPrivate ? 'Your private balance' : recipientValue}</dd></div>
               <div className="flex justify-between gap-4"><dt className="text-subtle">Protocol fee</dt><dd>0 USDC</dd></div>
-              <div className="flex justify-between gap-4"><dt className="text-subtle">Wallet transactions</dt><dd>{via === 'relayer' ? 'Deposit only (the relayer sends the rest)' : 'Deposit · bridge out · claim · withdraw'}</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">Wallet transactions</dt><dd>{needsDeposit ? 'Deposit only (the relayer sends the rest)' : 'None (the relayer sends everything)'}</dd></div>
               <div className="flex justify-between gap-4"><dt className="text-subtle">ZK link protection</dt><dd className="text-success">Active</dd></div>
             </dl>
           </div>

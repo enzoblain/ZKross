@@ -44,8 +44,7 @@ export type Transfer = {
   recipient: string
   /** Keep the claimed note in the private balance on `to` instead of withdrawing. */
   keepPrivate?: boolean
-  /** Source-chain wallet that deposits (and sends the bridge out when `via` is
-   * 'wallet'); empty when the private balance covers the amount. */
+  /** Source-chain wallet that deposits; empty when the private balance covers the amount. */
   sender: string
   /** The wallet that derives the note key; absent on older transfers, whose
    * key came from the source wallet (`from`, `sender`). */
@@ -72,10 +71,8 @@ export type Transfer = {
   /** The resumed deposit's note was not seen on chain and the user was told;
    * the next retry deposits again (the earlier note stays watched). */
   depositUnseen?: boolean
-  /** Who submits the bridge out (default: the relayer); claims and withdrawals always use it. */
+  /** Ignored: older transfers could send the bridge out from the wallet; now the relayer always does. */
   via?: 'relayer' | 'wallet'
-  /** The last step failed because the relayer did not answer. */
-  relayerFailed?: boolean
   status: TransferStatus
   txs: Partial<Record<'approve' | 'deposit' | 'bridgeOut' | 'bridgeIn' | 'trustline' | 'withdraw', string>>
   error?: string

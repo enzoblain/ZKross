@@ -116,8 +116,8 @@ describe.each([
   ['stellar', 'ethereum'],
   ['ethereum', 'stellar'],
 ] as [NetworkId, NetworkId][])('%s → %s', (from, to) => {
-  const start = (via: 'relayer' | 'wallet' = 'relayer') =>
-    createTransfer({ from, to, amount: 1_000_000n, identity: IDENTITY, sender: WALLET[from], recipient: TYPED[to], via })
+  const start = () =>
+    createTransfer({ from, to, amount: 1_000_000n, identity: IDENTITY, sender: WALLET[from], recipient: TYPED[to] })
 
   it('derives the note key from the identity wallet, whichever chain the transfer starts from', async () => {
     const t = start()
@@ -147,21 +147,24 @@ describe.each([
     expect(wallet[0].amount! > 0n).toBe(true)
   })
 
-  it('still claims and withdraws through the relayer when the user sends the bridge out', async () => {
-    const t = start('wallet')
+  it('sends the bridge out through the relayer too, never from the wallet', async () => {
+    const t = start()
     await runTransfer(t, () => {})
 
-    expect(h.calls.find((c) => c.fn === 'bridgeOut')).toMatchObject({ account: WALLET[from], via: 'wallet' })
-    expect(h.calls.filter((c) => c.network === to).map((c) => c.via)).toEqual(['relayer', 'relayer'])
+    expect(h.calls.find((c) => c.fn === 'bridgeOut')).toMatchObject({ network: from, account: '', via: 'relayer' })
   })
 
-  it('offers no "send it myself" fallback when the relayer fails the claim', async () => {
+  it('stops where the relayer failed the claim, and resumes from there', async () => {
     h.failRelay = 'bridgeIn'
     const t = start()
     await expect(runTransfer(t, () => {})).rejects.toThrow('not answering')
-
     expect(t.status).toBe('rootPosted')
-    expect(t.relayerFailed).toBe(false)
+
+    h.failRelay = ''
+    h.calls = []
+    await runTransfer(t, () => {})
+    expect(t.status).toBe('withdrawn')
+    expect(h.calls.map((c) => c.fn)).toEqual(['bridgeIn', 'transact'])
   })
 })
 
@@ -207,11 +210,17 @@ it('resumes an older transfer with the key of its source wallet', async () => {
   expect(t.recipientPk).toBe(KEYS[WALLET.stellar].pk)
 })
 
-it('offers the fallback when the relayer fails the bridge out', async () => {
+it('resumes after the relayer failed the bridge out, without depositing again', async () => {
   h.failRelay = 'bridgeOut'
   const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 1_000_000n, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
   await expect(runTransfer(t, () => {})).rejects.toThrow('not answering')
-  expect(t.relayerFailed).toBe(true)
+  expect(t.status).toBe('deposited')
+
+  h.failRelay = ''
+  h.calls = []
+  await runTransfer(t, () => {})
+  expect(t.status).toBe('withdrawn')
+  expect(h.calls.filter((c) => c.via !== 'relayer')).toEqual([])
 })
 
 it('refuses to resume a transfer started with a destination-wallet key', async () => {
