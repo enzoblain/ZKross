@@ -28,6 +28,8 @@ export type TransferStatus =
   | 'rootPosted'
   | 'claimed'
   | 'withdrawn'
+  /** Claimed and kept in the destination's private balance (no withdrawal). */
+  | 'kept'
   | 'refunded'
 
 export type Transfer = {
@@ -37,9 +39,16 @@ export type Transfer = {
   createdAt: number
   /** In bridge-message units (10^-6 USDC). */
   amount: string
-  /** Public address on `to` that receives the withdrawal. */
+  /** Public address on `to` that receives the withdrawal; empty when kept private. */
   recipient: string
+  /** Keep the claimed note in the private balance on `to` instead of withdrawing. */
+  keepPrivate?: boolean
+  /** Source-chain wallet that deposits (and sends the bridge out when `via` is
+   * 'wallet'); empty when the private balance covers the amount. */
   sender: string
+  /** The wallet that derives the note key; absent on older transfers, whose
+   * key came from the source wallet (`from`, `sender`). */
+  identity?: { network: NetworkId; address: string }
   /** Destination wallet of transfers made before the single note key; never set now. */
   claimer?: string
   deadlineBucket: string
@@ -103,6 +112,10 @@ export function subscribe(listener: () => void) {
 export const notes = (network: NetworkId, pk: Hex) =>
   load().notes.filter((n) => n.network === network && n.pk === pk && !n.spent)
 
+/** Unspent private balance on `network` owned by the note key `pk`. */
+export const balanceOf = (network: NetworkId, pk: Hex) =>
+  notes(network, pk).reduce((sum, n) => sum + BigInt(n.amount), 0n)
+
 /** Unspent private balance on `network` across all of this browser's keys. */
 export const privateBalance = (network: NetworkId) =>
   load()
@@ -122,6 +135,9 @@ export function markSpent(network: NetworkId, commitments: Hex[]) {
   for (const n of data.notes) if (n.network === network && commitments.includes(n.commitment)) n.spent = true
   save(data)
 }
+
+/** Nothing is left to do for `t`. */
+export const isFinished = (t: Transfer) => t.status === 'withdrawn' || t.status === 'kept' || t.status === 'refunded'
 
 export const transfers = () => load().transfers.slice().sort((a, b) => b.createdAt - a.createdAt)
 

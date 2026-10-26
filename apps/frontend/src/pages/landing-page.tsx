@@ -25,8 +25,8 @@ const steps = [
   {
     number: '01',
     label: 'Authorize',
-    title: 'Connect the wallet you send from.',
-    description: 'It deposits and derives your private note key, used on both chains. You only type the destination address: the relayer claims and withdraws to it.',
+    title: 'Choose one wallet as your identity.',
+    description: 'It signs your private note key once, the same on both chains and in both directions. The wallet you send from only deposits; you type the destination address and the relayer claims and withdraws to it.',
     icon: WalletMinimal,
   },
   {

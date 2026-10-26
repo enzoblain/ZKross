@@ -1,14 +1,23 @@
-// The transfer flow in both directions with fake pools, prover and wallet:
-// one note key from the source wallet owns the notes on both chains, the
-// destination wallet is never asked for anything, and the claim and
-// withdrawal always go through the relayer to the typed address.
+// The transfer flow in both directions with fake pools, prover and wallets:
+// one note key from the identity wallet (chosen once, on either chain) owns
+// the notes on both chains, the destination wallet is never asked for
+// anything, the claim and withdrawal always go through the relayer, and a
+// note kept private on arrival can be bridged back from the private balance.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { NetworkId } from './networks'
 import type { Pool } from './pools'
 import type { Hex } from './zk/types'
 
-const KEY = { sk: '0x5e' as Hex, pk: '0x9b' as Hex }
+const WALLET: Record<NetworkId, string> = { ethereum: '0xA11CE', stellar: 'GALICE' }
+const TYPED: Record<NetworkId, string> = { ethereum: '0xF4E5', stellar: 'GFRESH' }
+const KEYS: Record<string, { sk: Hex; pk: Hex }> = {
+  [WALLET.ethereum]: { sk: '0x5e', pk: '0x9b' },
+  [WALLET.stellar]: { sk: '0x5f', pk: '0x9c' },
+}
+/** The identity: the MetaMask wallet, used whichever chain the transfer starts from. */
+const IDENTITY = { network: 'ethereum' as NetworkId, address: WALLET.ethereum }
+const KEY = KEYS[WALLET.ethereum]
 
 const h = vi.hoisted(() => ({
   leaves: [] as string[],
@@ -18,7 +27,7 @@ const h = vi.hoisted(() => ({
   counter: 0,
 }))
 
-vi.mock('./keys', () => ({ noteKey: vi.fn(async () => KEY) }))
+vi.mock('./keys', () => ({ noteKey: vi.fn(async (_network: string, address: string) => KEYS[address]) }))
 
 vi.mock('./stellar', () => ({ accountState: vi.fn(async () => 'exists') }))
 
@@ -88,9 +97,7 @@ vi.mock('./pools', async () => {
 
 const { noteKey } = await import('./keys')
 const { createTransfer, runTransfer } = await import('./bridge-flow')
-
-const WALLET: Record<NetworkId, string> = { ethereum: '0xA11CE', stellar: 'GALICE' }
-const TYPED: Record<NetworkId, string> = { ethereum: '0xF4E5', stellar: 'GFRESH' }
+const store = await import('./store')
 
 beforeEach(() => {
   const storage = new Map<string, string>()
@@ -110,14 +117,15 @@ describe.each([
   ['ethereum', 'stellar'],
 ] as [NetworkId, NetworkId][])('%s → %s', (from, to) => {
   const start = (via: 'relayer' | 'wallet' = 'relayer') =>
-    createTransfer({ from, to, amount: 1_000_000n, sender: WALLET[from], recipient: TYPED[to], via })
+    createTransfer({ from, to, amount: 1_000_000n, identity: IDENTITY, sender: WALLET[from], recipient: TYPED[to], via })
 
-  it('derives one note key from the source wallet and uses it on both chains', async () => {
+  it('derives the note key from the identity wallet, whichever chain the transfer starts from', async () => {
     const t = start()
     await runTransfer(t, () => {})
 
     expect(t.status).toBe('withdrawn')
-    expect(vi.mocked(noteKey).mock.calls.every(([network, address]) => network === from && address === WALLET[from])).toBe(true)
+    expect(vi.mocked(noteKey).mock.calls.length).toBeGreaterThan(0)
+    expect(vi.mocked(noteKey).mock.calls.every(([network, address]) => network === 'ethereum' && address === WALLET.ethereum)).toBe(true)
     expect(t.recipientPk).toBe(KEY.pk)
     expect(t.refundPk).toBe(KEY.pk)
     expect(h.requests.bridgeOut).toMatchObject({ recipient_pk: KEY.pk, refund_pk: KEY.pk })
@@ -157,15 +165,57 @@ describe.each([
   })
 })
 
+describe.each([
+  ['stellar', 'ethereum'],
+  ['ethereum', 'stellar'],
+] as [NetworkId, NetworkId][])('round trip %s → %s → back, from the private balance', (from, to) => {
+  it('keeps the claimed note private, then bridges it back with no wallet but the identity', async () => {
+    const out = createTransfer({ from, to, amount: 1_000_000n, identity: IDENTITY, sender: WALLET[from], recipient: '', keepPrivate: true })
+    await runTransfer(out, () => {})
+
+    expect(out.status).toBe('kept')
+    expect(h.calls.filter((c) => c.network === to).map((c) => c.fn)).toEqual(['bridgeIn'])
+    const claimed = out.claimNotes![0].commitment
+    expect(store.notes(to, KEY.pk).map((n) => n.commitment)).toContain(claimed)
+
+    h.calls = []
+    const back = createTransfer({ from: to, to: from, amount: 1_000_000n, identity: IDENTITY, recipient: TYPED[from] })
+    await runTransfer(back, () => {})
+
+    expect(back.status).toBe('withdrawn')
+    expect(back.txs.deposit).toBeUndefined()
+    // No wallet sends anything: the private note pays for the bridge out.
+    expect(h.calls.every((c) => c.via === 'relayer')).toBe(true)
+    expect(h.requests.bridgeOut).toMatchObject({ inputs: [expect.objectContaining({ sk: KEY.sk }), expect.anything()] })
+    expect(back.inputs).toEqual([claimed])
+    expect(store.notes(to, KEY.pk).map((n) => n.commitment)).not.toContain(claimed)
+  })
+})
+
+it('asks for the source wallet when the private balance does not cover the amount', async () => {
+  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 1_000_000n, identity: IDENTITY, recipient: TYPED.ethereum })
+  await expect(runTransfer(t, () => {})).rejects.toThrow('connect your Freighter wallet to deposit')
+  expect(h.calls).toEqual([])
+})
+
+it('resumes an older transfer with the key of its source wallet', async () => {
+  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 1_000_000n, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
+  delete t.identity
+  await runTransfer(t, () => {})
+
+  expect(vi.mocked(noteKey).mock.calls.every(([network, address]) => network === 'stellar' && address === WALLET.stellar)).toBe(true)
+  expect(t.recipientPk).toBe(KEYS[WALLET.stellar].pk)
+})
+
 it('offers the fallback when the relayer fails the bridge out', async () => {
   h.failRelay = 'bridgeOut'
-  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 1_000_000n, sender: WALLET.stellar, recipient: TYPED.ethereum })
+  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 1_000_000n, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
   await expect(runTransfer(t, () => {})).rejects.toThrow('not answering')
   expect(t.relayerFailed).toBe(true)
 })
 
 it('refuses to resume a transfer started with a destination-wallet key', async () => {
-  const t = createTransfer({ from: 'ethereum', to: 'stellar', amount: 1_000_000n, sender: WALLET.ethereum, recipient: TYPED.stellar })
+  const t = createTransfer({ from: 'ethereum', to: 'stellar', amount: 1_000_000n, identity: IDENTITY, sender: WALLET.ethereum, recipient: TYPED.stellar })
   Object.assign(t, { recipientPk: '0x1111', refundPk: '0x2222', claimer: 'GBOB' })
   await expect(runTransfer(t, () => {})).rejects.toThrow('destination-wallet note key')
   expect(noteKey).not.toHaveBeenCalled()

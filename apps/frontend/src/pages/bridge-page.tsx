@@ -31,8 +31,9 @@ import {
 } from '../components/ui/dialog'
 import { WalletConnectDialog } from '../components/wallet-connect-dialog'
 import { useWallets } from '../components/wallet-context'
-import { formatMessage, formatNote, parseUnits } from '../lib/amounts'
-import { createProgress, createTransfer, runTransfer, type FlowStepId } from '../lib/bridge-flow'
+import { formatMessage, formatNote, parseUnits, toNoteAmount } from '../lib/amounts'
+import { createProgress, createTransfer, identityOf, runTransfer, type FlowStepId } from '../lib/bridge-flow'
+import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { chainId, explorer, isDeployed, poolAddress, protocol } from '../lib/config'
 import { networkMeta, otherNetwork, type NetworkId, type TransferProgressStep } from '../lib/networks'
 import { type Via, pools } from '../lib/pools'
@@ -45,7 +46,7 @@ import { truncateAddress } from '../lib/wallet-adapters'
 type RunStatus = 'idle' | 'running' | 'complete' | 'failed'
 
 const unfinishedTransfer = () =>
-  store.transfers().find((item) => item.status !== 'withdrawn' && item.status !== 'refunded')
+  store.transfers().find((item) => !store.isFinished(item))
 
 function validRecipient(network: NetworkId, address: string) {
   const value = address.trim()
@@ -82,6 +83,7 @@ function BridgePage() {
   const [walletDialogNetwork, setWalletDialogNetwork] = useState<NetworkId | null>(null)
   const [amount, setAmount] = useState(initial ? formatMessage(BigInt(initial.amount)) : '')
   const [recipient, setRecipient] = useState(initial?.recipient ?? '')
+  const [keepPrivate, setKeepPrivate] = useState(Boolean(initial?.keepPrivate))
   const [reviewOpen, setReviewOpen] = useState(false)
   const [transfer, setTransfer] = useState<Transfer | null>(initial ?? null)
   const [runStatus, setRunStatus] = useState<RunStatus>(initial?.error ? 'failed' : 'idle')
@@ -96,24 +98,39 @@ function BridgePage() {
   }>({ key: '', publicBalance: null, destinationCapacity: null, error: '' })
   const [via, setVia] = useState<Via>(initial?.via ?? 'relayer')
   const [relayerAccounts, setRelayerAccounts] = useState<Record<NetworkId, string | null> | null | undefined>(undefined)
+  const [id, setId] = useState<Identity | null>(() => identity())
+  const [identityError, setIdentityError] = useState('')
+  // Spendable: the identity's notes. Notes of other keys stay where they are.
   const privateBalance = useSyncExternalStore(
+    store.subscribe,
+    () => (id ? store.balanceOf(from, id.pk) : 0n),
+    () => 0n,
+  )
+  const otherKeysBalance = useSyncExternalStore(
     store.subscribe,
     () => store.privateBalance(from),
     () => 0n,
-  )
+  ) - privateBalance
 
   const sourceWallet = wallets[from]
+  // Without a chosen identity, the source wallet becomes it at the first transfer.
+  const identityWallet = id ? wallets[id.network] : sourceWallet
+  const identityReady = Boolean(identityWallet && (!id || identityWallet.address === id.address))
   // The destination wallet is never connected: the user types the address.
   const recipientValue = recipient
   const messageAmount = useMemo(() => parseUnits(amount, 6), [amount])
-  const recipientIsValid = validRecipient(to, recipientValue)
+  const recipientIsValid = keepPrivate || validRecipient(to, recipientValue)
   const deploymentReady = isDeployed(from) && isDeployed(to)
   const readKey = `${from}:${sourceWallet?.address ?? ''}:${to}`
   const publicBalance = liveReads.key === readKey ? liveReads.publicBalance : null
   const destinationCapacity = liveReads.key === readKey ? liveReads.destinationCapacity : null
   const readError = liveReads.key === readKey ? liveReads.error : ''
+  // The source wallet is needed only to deposit what the private balance lacks.
+  const needsDeposit = Boolean(messageAmount && toNoteAmount(from, messageAmount) > privateBalance)
+  const needsSource = needsDeposit || via === 'wallet'
   const canReview = Boolean(
-    sourceWallet &&
+    identityReady &&
+      (sourceWallet || !needsSource) &&
       messageAmount &&
       messageAmount > 0n &&
       recipientIsValid &&
@@ -171,6 +188,8 @@ function BridgePage() {
   }
 
   const execute = async (next: Transfer) => {
+    // A transfer started from the private balance may need a deposit after all.
+    if (!next.sender && sourceWallet) next.sender = sourceWallet.address
     setTransfer({ ...next })
     setProgress(createProgress(next.from, next.to, next))
     setRunStatus('running')
@@ -188,14 +207,32 @@ function BridgePage() {
     }
   }
 
-  const beginTransfer = () => {
-    if (!sourceWallet || !messageAmount || !canReview) return
+  const makeIdentity = async (network: NetworkId) => {
+    const wallet = wallets[network]
+    if (!wallet) return null
+    setIdentityError('')
+    try {
+      const chosen = await chooseIdentity({ network, address: wallet.address })
+      setId(chosen)
+      return chosen
+    } catch (error) {
+      setIdentityError(error instanceof Error ? error.message : String(error))
+      return null
+    }
+  }
+
+  const beginTransfer = async () => {
+    if (!messageAmount || !canReview) return
+    const chosen = id ?? (await makeIdentity(from))
+    if (!chosen) return
     const next = createTransfer({
       from,
       to,
       amount: messageAmount,
-      sender: sourceWallet.address,
+      identity: chosen,
+      sender: needsSource ? sourceWallet?.address : undefined,
       recipient: recipientValue.trim(),
+      keepPrivate,
       via,
     })
     void execute(next)
@@ -226,13 +263,13 @@ function BridgePage() {
     setAmount(formatMessage(publicBalance / protocol.scale[from]))
   }
 
-  const currentError = transfer?.error ?? readError
+  const currentError = identityError || (transfer?.error ?? readError)
   const amountLabel = messageAmount && messageAmount > 0n ? formatMessage(messageAmount) : '0.00'
   const latestCanResume = Boolean(
     transfer &&
-      transfer.status !== 'withdrawn' &&
-      transfer.status !== 'refunded' &&
-      sourceWallet?.address === transfer.sender &&
+      !store.isFinished(transfer) &&
+      wallets[identityOf(transfer).network]?.address === identityOf(transfer).address &&
+      (!transfer.sender || sourceWallet?.address === transfer.sender) &&
       deploymentReady &&
       runStatus !== 'running',
   )
@@ -264,14 +301,17 @@ function BridgePage() {
           <div className="relative space-y-6 p-5 sm:p-7">
             <div>
               <div className="mb-3 flex items-center justify-between gap-4">
-                <span className="text-xs font-medium text-muted">Wallet you control</span>
-                <span className="text-[10px] text-subtle">Only the source wallet: no {networkMeta[to].shortName} wallet needed</span>
+                <span className="text-xs font-medium text-muted">Wallets you control</span>
+                <span className="text-[10px] text-subtle">No {networkMeta[to].shortName} wallet needed</span>
               </div>
-              <div className="grid gap-2">
-                {([from] as NetworkId[]).map((network) => {
+              <div className={cn('grid gap-2', id && id.network !== from && 'sm:grid-cols-2')}>
+                {(id && id.network !== from ? [id.network, from] : [from]).map((network) => {
                   const connection = wallets[network]
                   const isConnecting = connecting === network
+                  const isIdentity = id ? network === id.network : true
                   const isSource = network === from
+                  const role = isIdentity && isSource ? 'Identity · note key + deposit' : isIdentity ? 'Identity · note key' : needsSource ? 'Source · deposit' : 'Source · deposit (not needed: private balance)'
+                  const wrongAccount = id && isIdentity && connection && connection.address !== id.address
                   return (
                     <button
                       key={network}
@@ -281,16 +321,32 @@ function BridgePage() {
                     >
                       <NetworkMark network={network} />
                       <span className="min-w-0 flex-1">
-                        <span className={cn('block text-[9px] font-semibold uppercase tracking-[0.1em]', isSource ? 'text-accent' : 'text-subtle')}>{isSource ? 'Source · deposit + note key' : 'Destination'}</span>
-                        <span className="mt-1 block truncate text-xs font-medium text-foreground">{connection ? truncateAddress(connection.address) : isConnecting ? 'Waiting for wallet…' : `Connect ${networkMeta[network].wallet}`}</span>
+                        <span className={cn('block text-[9px] font-semibold uppercase tracking-[0.1em]', isIdentity || needsSource ? 'text-accent' : 'text-subtle')}>{role}</span>
+                        <span className={cn('mt-1 block truncate text-xs font-medium', wrongAccount ? 'text-warning' : 'text-foreground')}>{wrongAccount ? `Switch to ${truncateAddress(id.address)}` : connection ? truncateAddress(connection.address) : isConnecting ? 'Waiting for wallet…' : `Connect ${networkMeta[network].wallet}${id && isIdentity ? ` (${truncateAddress(id.address)})` : ''}`}</span>
                       </span>
                       {isConnecting ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin text-accent" /> : connection ? <CheckCircle2 aria-hidden="true" className="size-4 text-success" /> : <ArrowRight aria-hidden="true" className="size-4 text-subtle" />}
                     </button>
                   )
                 })}
               </div>
+              <div className="mt-4 rounded-2xl border border-border bg-background/40 p-3">
+                <p className="text-[10px] font-medium text-foreground">Private identity</p>
+                <p className="mt-1 text-[10px] leading-4 text-subtle">
+                  {id
+                    ? <>Your note key comes from your {networkMeta[id.network].wallet} wallet {truncateAddress(id.address)}, for every transfer in both directions: notes you receive on either chain stay spendable, including to bridge back from your private balance.</>
+                    : <>Chosen once: your {networkMeta[from].wallet} wallet will sign your note key at your first transfer, and the same key will be used on both chains.</>}
+                  {otherKeysBalance > 0n && <> {formatNote(from, otherKeysBalance)} USDC on {networkMeta[from].shortName} belongs to another wallet’s key: make that wallet your identity to spend it.</>}
+                </p>
+                {(['ethereum', 'stellar'] as NetworkId[])
+                  .filter((network) => wallets[network] && !(id && id.network === network && id.address === wallets[network]!.address))
+                  .map((network) => (
+                    <button key={network} type="button" disabled={runStatus === 'running'} onClick={() => void makeIdentity(network)} className="focus-ring mt-2 mr-2 rounded-lg border border-border px-2.5 py-1 text-[10px] font-medium text-accent hover:border-accent/40 disabled:opacity-50">
+                      {id ? 'Switch identity to' : 'Use'} {networkMeta[network].wallet} {truncateAddress(wallets[network]!.address)}
+                    </button>
+                  ))}
+              </div>
               <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 p-3">
-                <div className="min-w-0"><p className="text-[10px] font-medium text-foreground">Bridge out sent by</p><p className="mt-1 text-[10px] leading-4 text-subtle">{via === 'relayer' ? 'The relayer submits it from its own account, so your wallet does not appear on-chain for it.' : 'Your source wallet submits and pays for it, so it appears on-chain.'} The deposit is always sent by your source wallet; the claim and withdrawal always by the relayer.</p></div>
+                <div className="min-w-0"><p className="text-[10px] font-medium text-foreground">Bridge out sent by</p><p className="mt-1 text-[10px] leading-4 text-subtle">{via === 'relayer' ? 'The relayer submits it from its own account, so your wallet does not appear on-chain for it.' : 'Your source wallet submits and pays for it, so it appears on-chain.'} A deposit, when your private balance lacks the amount, is sent by your source wallet; the claim and withdrawal always by the relayer.</p></div>
                 <div role="radiogroup" aria-label="Who sends the transactions" className="flex gap-1 rounded-xl border border-border bg-background p-1">
                   {([['relayer', 'Relayer'], ['wallet', 'Send myself']] as [Via, string][]).map(([value, label]) => (
                     <button key={value} type="button" role="radio" aria-checked={via === value} disabled={runStatus === 'running'} onClick={() => setVia(value)} className={cn('focus-ring rounded-lg px-3 py-1.5 text-[10px] font-semibold transition-colors disabled:opacity-50', via === value ? 'bg-surface-raised text-foreground' : 'text-muted hover:text-foreground')}>{label}</button>
@@ -333,18 +389,23 @@ function BridgePage() {
               </div>
 
               <div className="border-t border-border px-5 py-5 sm:px-7">
-                <label htmlFor="recipient" className="block text-[10px] font-medium text-subtle">Your public {networkMeta[to].shortName} withdrawal address</label>
+                <div className="flex items-center justify-between gap-3">
+                  <label htmlFor="recipient" className="block text-[10px] font-medium text-subtle">Your public {networkMeta[to].shortName} withdrawal address</label>
+                  <label className="flex items-center gap-1.5 text-[10px] text-muted"><input type="checkbox" checked={keepPrivate} disabled={runStatus === 'running'} onChange={(event) => setKeepPrivate(event.target.checked)} />Keep it private on {networkMeta[to].shortName}</label>
+                </div>
+                {keepPrivate ? <p className="mt-3 text-[10px] leading-4 text-subtle">No withdrawal: the claimed note stays in your {networkMeta[to].shortName} private balance, owned by your note key, ready to bridge back or withdraw later.</p> : <>
                 <div className="mt-3 flex items-center rounded-xl border border-border bg-surface/60 px-3 focus-within:border-accent/50">
                   <input id="recipient" value={recipientValue} disabled={runStatus === 'running'} onChange={(event) => setRecipient(event.target.value)} aria-invalid={recipientValue.length > 0 && !recipientIsValid} className="min-w-0 flex-1 bg-transparent py-3 font-mono text-xs outline-none placeholder:text-subtle disabled:opacity-60" placeholder={to === 'stellar' ? 'G…' : '0x…'} />
                 </div>
                 {recipientValue.length > 0 && !recipientIsValid && <p className="mt-2 text-[10px] text-danger">Enter a valid {networkMeta[to].shortName} public address.</p>}
                 {to === 'stellar' && <p className="mt-2 text-[10px] leading-4 text-subtle">A Stellar address must exist and hold a USDC trustline before it can receive the withdrawal.</p>}
+                </>}
               </div>
 
               <div className="border-t border-border px-5 py-5 sm:px-7">
                 <p className="text-[10px] font-medium text-subtle">Account visible on-chain as the sender</p>
                 <dl className="mt-3 space-y-2 text-[11px]">
-                  <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">Your wallet{sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}</dd></div>
+                  <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{needsDeposit ? `Your wallet${sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}` : 'None: private balance'}</dd></div>
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Bridge out · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{submitter(from, sourceWallet?.address)}</dd></div>
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Claim + withdrawal · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{relayerName(to)}</dd></div>
                 </dl>
@@ -389,14 +450,15 @@ function BridgePage() {
                 variant="accent"
                 size="lg"
                 className="w-full"
-                disabled={Boolean(sourceWallet) && !canReview}
+                disabled={Boolean(identityReady && (sourceWallet || !needsSource)) && !canReview}
                 onClick={() => {
-                  if (!sourceWallet) setWalletDialogNetwork(from)
+                  if (!identityReady) setWalletDialogNetwork(id?.network ?? from)
+                  else if (needsSource && !sourceWallet) setWalletDialogNetwork(from)
                   else if (canReview) setReviewOpen(true)
                 }}
               >
                 <ShieldCheck aria-hidden="true" />
-                {!sourceWallet ? `Connect ${networkMeta[from].wallet}` : !deploymentReady ? 'Sepolia pool not deployed' : !messageAmount || messageAmount <= 0n ? 'Enter an amount' : !recipientIsValid ? 'Enter a valid withdrawal address' : 'Review transfer'}
+                {!identityReady ? `Connect your identity wallet (${networkMeta[id?.network ?? from].wallet})` : needsSource && !sourceWallet ? `Connect ${networkMeta[from].wallet} to deposit` : !deploymentReady ? 'Sepolia pool not deployed' : !messageAmount || messageAmount <= 0n ? 'Enter an amount' : !recipientIsValid ? 'Enter a valid withdrawal address' : 'Review transfer'}
               </Button>
             )}
             <p className="text-center text-[10px] leading-4 text-subtle">Never enter a private key or seed phrase. Note keys are derived from wallet signatures and kept in memory.</p>
@@ -406,7 +468,7 @@ function BridgePage() {
         <aside className="space-y-4 lg:sticky lg:top-24">
           <section className="rounded-3xl border border-border bg-surface p-5 sm:p-6" aria-labelledby="progress-title">
             <div className="flex items-start justify-between gap-3">
-              <div><p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-subtle">Transfer trace</p><h2 id="progress-title" className="mt-2 text-base font-semibold tracking-[-0.02em]">{runStatus === 'complete' ? 'Transfer withdrawn' : runStatus === 'running' ? 'Transfer in progress' : runStatus === 'failed' ? 'Action required' : transfer ? 'Transfer ready to resume' : 'Ready for review'}</h2></div>
+              <div><p className="text-[10px] font-semibold uppercase tracking-[0.15em] text-subtle">Transfer trace</p><h2 id="progress-title" className="mt-2 text-base font-semibold tracking-[-0.02em]">{runStatus === 'complete' ? (transfer?.keepPrivate ? 'Transfer kept private' : 'Transfer withdrawn') : runStatus === 'running' ? 'Transfer in progress' : runStatus === 'failed' ? 'Action required' : transfer ? 'Transfer ready to resume' : 'Ready for review'}</h2></div>
               <span aria-hidden="true" className={cn('mt-1 size-2 rounded-full', runStatus === 'complete' ? 'bg-success' : runStatus === 'running' ? 'dot-pulse bg-accent' : runStatus === 'failed' ? 'bg-danger' : 'bg-subtle')} />
             </div>
 
@@ -427,7 +489,7 @@ function BridgePage() {
               })}
             </ol>
 
-            {runStatus === 'complete' && <div className="mt-6 rounded-2xl border border-success/20 bg-success/[0.055] p-4 text-[11px] leading-5 text-muted">The destination note was claimed and withdrawn. Use the explorer links above to inspect each public boundary.</div>}
+            {runStatus === 'complete' && <div className="mt-6 rounded-2xl border border-success/20 bg-success/[0.055] p-4 text-[11px] leading-5 text-muted">{transfer?.keepPrivate ? 'The destination note was claimed and stays in your private balance, spendable by your note key.' : 'The destination note was claimed and withdrawn.'} Use the explorer links above to inspect each public boundary.</div>}
           </section>
 
           <section className="rounded-3xl border border-warning/20 bg-warning/[0.045] p-5">
@@ -463,7 +525,7 @@ function BridgePage() {
           <div className="flex items-start gap-3 rounded-2xl border border-warning/20 bg-warning/[0.055] p-4 text-[11px] leading-5 text-muted"><Info aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />This is unaudited testnet software. Do not use mainnet funds. Keep this browser’s note backup until encrypted note delivery is implemented.</div>
           <div className="grid gap-2 sm:grid-cols-2">
             <DialogClose asChild><Button variant="secondary">Back to edit</Button></DialogClose>
-            <Button variant="accent" onClick={beginTransfer}><FileKey2 aria-hidden="true" />Start testnet transfer</Button>
+            <Button variant="accent" onClick={() => void beginTransfer()}><FileKey2 aria-hidden="true" />Start testnet transfer</Button>
           </div>
         </DialogContent>
       </Dialog>

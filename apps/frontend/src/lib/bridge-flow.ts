@@ -3,15 +3,18 @@
 // withdraw to a public address. Formats are SPEC.md's; the circuit inputs and
 // proofs come from zkross-prover in the browser. Every step saves what it
 // creates before sending, so `runTransfer` resumes after a reload.
-// One note key, derived from the source wallet, owns the notes on both chains
-// (keys.ts): the destination wallet is never connected. The user only types
-// the destination address, and the claim and withdrawal always go through the
-// relayer. Deposits come from the source wallet; the bridge out goes through
-// the relayer by default (t.via). If the relayer does not answer the bridge
-// out, the step fails with `relayerFailed` and the user can send it themselves.
+// One note key, derived from the identity wallet chosen once (keys.ts), owns
+// the notes on both chains and signs for every transfer, in both directions:
+// notes claimed on the destination can later be bridged back from the private
+// balance. The destination wallet is never connected: the user only types the
+// destination address, and the claim and withdrawal always go through the
+// relayer. The source wallet is needed only to deposit what the private
+// balance does not cover; the bridge out goes through the relayer by default
+// (t.via). If the relayer does not answer the bridge out, the step fails with
+// `relayerFailed` and the user can send it themselves.
 import { formatNote, toNoteAmount } from './amounts'
 import { chainId, protocol } from './config'
-import { type NoteKey, noteKey } from './keys'
+import { type IdentityWallet, type NoteKey, noteKey } from './keys'
 import { type NetworkId, type ProgressState, type TransferProgressStep, networkMeta } from './networks'
 import { type Via, pools } from './pools'
 import { RelayerUnavailable } from './relayer'
@@ -35,6 +38,7 @@ const DONE: Record<Transfer['status'], number> = {
   rootPosted: 3,
   claimed: 4,
   withdrawn: 5,
+  kept: 5,
   refunded: 2,
 }
 
@@ -42,13 +46,14 @@ export function createProgress(from: NetworkId, to: NetworkId, t?: Transfer): Tr
   const a = networkMeta[from].shortName
   const b = networkMeta[to].shortName
   const steps: Record<FlowStepId, [string, string]> = {
-    keys: ['Unlock your note key', `One signature in your ${networkMeta[from].wallet} wallet derives your private note key, used on both chains. No transaction.`],
-    deposit: ['Deposit into the private pool', `Public USDC moves into the ${a} pool as a hidden note (skipped if your private balance covers it).`],
+    keys: ['Unlock your note key', `One signature in your identity wallet derives your private note key, the same on both chains. No transaction.`],
+    deposit: ['Deposit into the private pool', `Public USDC moves from your ${a} wallet into the pool as a hidden note (skipped if your private balance covers it).`],
     bridgeOut: ['Prove and send bridge out', `A zero-knowledge proof spends your ${a} note and records a bridge message.`],
     root: ['Wait for the root poster', `The ${a} outbox root is copied to ${b}${from === 'ethereum' ? ' after Sepolia finality (about 15 minutes)' : ' (about a minute)'}.`],
     claim: ['Prove and claim', `A second proof claims the message as a new note in the ${b} pool; the relayer submits it.`],
     withdraw: ['Withdraw to the recipient', `A third proof pays the public ${b} address you entered; the relayer submits it.`],
   }
+  if (t?.keepPrivate) steps.withdraw = ['Keep in your private balance', `No withdrawal: the claimed note stays in the ${b} pool, spendable by your note key (for example to bridge back).`]
   const done = t ? DONE[t.status] : -1
   return ORDER.map((id, i) => ({
     id,
@@ -63,8 +68,13 @@ type NewTransfer = {
   to: NetworkId
   /** Bridge-message units (10^-6 USDC). */
   amount: bigint
-  sender: string
+  /** The identity wallet that derives the note key. */
+  identity: IdentityWallet
+  /** The source wallet, needed only to deposit or to send the bridge out yourself. */
+  sender?: string
+  /** Public address on `to`; ignored when `keepPrivate`. */
   recipient: string
+  keepPrivate?: boolean
   /** Who sends the bridge out; claims and withdrawals always use the relayer. */
   via?: Via
 }
@@ -77,8 +87,10 @@ export function createTransfer(input: NewTransfer): Transfer {
     to: input.to,
     createdAt: Date.now(),
     amount: input.amount.toString(),
-    recipient: input.recipient,
-    sender: input.sender,
+    recipient: input.keepPrivate ? '' : input.recipient,
+    keepPrivate: input.keepPrivate || undefined,
+    sender: input.sender ?? '',
+    identity: { network: input.identity.network, address: input.identity.address },
     deadlineBucket: '0',
     claimSecret: randomField(),
     recipientPk: '0x',
@@ -128,14 +140,18 @@ function selectNotes(available: Note[], amount: bigint): Note[] | null {
 
 const nowHour = () => BigInt(Math.floor(Date.now() / 3_600_000))
 
-/** The user's note key, from the source wallet; it owns the notes on both chains. */
+/** The identity wallet of `t`; older transfers derived their key from the source wallet. */
+export const identityOf = (t: Transfer): IdentityWallet => t.identity ?? { network: t.from, address: t.sender }
+
+/** The user's note key, from the identity wallet; it owns the notes on both chains. */
 async function identityFor(t: Transfer): Promise<NoteKey> {
   if (t.recipientPk !== t.refundPk) {
     throw new Error('This transfer was started with a destination-wallet note key, which this version no longer uses. Start a new transfer.')
   }
-  const key = await noteKey(t.from, t.sender)
+  const wallet = identityOf(t)
+  const key = await noteKey(wallet.network, wallet.address)
   if (t.recipientPk !== '0x' && t.recipientPk !== key.pk) {
-    throw new Error('Connect the same source wallet that started this transfer.')
+    throw new Error('Connect the same identity wallet that started this transfer.')
   }
   return key
 }
@@ -184,6 +200,9 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
   await step('deposit', async () => {
     if (t.depositNote && (await settleNotes(t.from, [t.depositNote], 1))) return save(t, { status: 'deposited', error: undefined })
     if (selectNotes(store.notes(t.from, key.pk), amountFrom)) return save(t, { status: 'deposited', error: undefined })
+    if (!t.sender) {
+      throw new Error(`Your private balance does not cover this amount: connect your ${networkMeta[t.from].wallet} wallet to deposit.`)
+    }
     const balance = await src.usdcBalance(t.sender)
     if (balance === null || balance < amountFrom) {
       throw new Error(`Your ${networkMeta[t.from].shortName} wallet needs ${formatNote(t.from, amountFrom)} public USDC to deposit.`)
@@ -230,6 +249,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     }
     const chosen = selectNotes(store.notes(t.from, key.pk), amountFrom)
     if (!chosen) throw new Error('Your private balance no longer covers this amount.')
+    if (via === 'wallet' && !t.sender) throw new Error(`Connect your ${networkMeta[t.from].wallet} wallet to send the bridge out yourself.`)
     const total = chosen.reduce((sum, n) => sum + BigInt(n.amount), 0n)
     const change: PendingNote[] = []
     for (const value of [total - amountFrom, 0n]) {
@@ -355,6 +375,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
   })
 
   await step('withdraw', async () => {
+    if (t.keepPrivate) return save(t, { status: 'kept', error: undefined })
     if (t.withdrawNullifier && (await dst.isSpent(t.withdrawNullifier))) {
       store.markSpent(t.to, [t.claimNotes![0].commitment])
       return save(t, { status: 'withdrawn', error: undefined })

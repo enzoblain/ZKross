@@ -15,7 +15,7 @@ import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
 import { Button } from '../components/ui/button'
 import { useWallets } from '../components/wallet-context'
 import { formatMessage } from '../lib/amounts'
-import { runTransfer } from '../lib/bridge-flow'
+import { identityOf, runTransfer } from '../lib/bridge-flow'
 import { explorer, isDeployed } from '../lib/config'
 import { networkMeta } from '../lib/networks'
 import * as store from '../lib/store'
@@ -30,6 +30,7 @@ const statusCopy: Record<TransferStatus, { label: string; tone: string }> = {
   rootPosted: { label: 'Remote root posted', tone: 'text-accent' },
   claimed: { label: 'Claimed', tone: 'text-success' },
   withdrawn: { label: 'Withdrawn', tone: 'text-success' },
+  kept: { label: 'Kept private', tone: 'text-success' },
   refunded: { label: 'Refunded', tone: 'text-warning' },
 }
 
@@ -67,9 +68,9 @@ function ActivityPage() {
   }
 
   const canResume = (transfer: Transfer) =>
-    transfer.status !== 'withdrawn' &&
-    transfer.status !== 'refunded' &&
-    wallets[transfer.from]?.address === transfer.sender &&
+    !store.isFinished(transfer) &&
+    wallets[identityOf(transfer).network]?.address === identityOf(transfer).address &&
+    (!transfer.sender || wallets[transfer.from]?.address === transfer.sender) &&
     isDeployed(transfer.from) &&
     isDeployed(transfer.to)
 
@@ -139,8 +140,8 @@ function ActivityPage() {
                     {(Object.entries(transfer.txs) as [keyof Transfer['txs'], string][]).map(([key, hash]) => (
                       <a key={`${key}:${hash}`} href={explorer.tx(txNetwork(transfer, key), hash)} target="_blank" rel="noreferrer" className="focus-ring inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/45 px-2.5 py-1.5 text-[10px] font-medium text-accent hover:border-accent/30">{txLabel[key]} · {truncateAddress(hash)}<ExternalLink aria-hidden="true" className="size-3" /></a>
                     ))}
-                    {transfer.status !== 'withdrawn' && transfer.status !== 'refunded' && (
-                      <Button variant="secondary" size="sm" className="ml-auto" disabled={!resumable || Boolean(runningId)} onClick={() => void resume(transfer)}>{isRunning ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Play aria-hidden="true" />}{!isDeployed(transfer.from) || !isDeployed(transfer.to) ? 'Awaiting Sepolia pool' : !resumable ? 'Connect the source wallet' : 'Resume'}</Button>
+                    {!store.isFinished(transfer) && (
+                      <Button variant="secondary" size="sm" className="ml-auto" disabled={!resumable || Boolean(runningId)} onClick={() => void resume(transfer)}>{isRunning ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Play aria-hidden="true" />}{!isDeployed(transfer.from) || !isDeployed(transfer.to) ? 'Awaiting Sepolia pool' : !resumable ? 'Connect your identity wallet' : 'Resume'}</Button>
                     )}
                   </div>
                 </article>
