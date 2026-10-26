@@ -14,6 +14,8 @@ export type ProverWasm = {
   commitment: (amount: string, pk: string, blinding: string) => string
   bridgeMessage: (req: string) => string
   treeRoot: (req: string) => string
+  adminKey: (dPriv: string) => string
+  decrypt: (req: string) => string
 }
 
 export type ProverOp = Exclude<keyof ProverWasm, 'default'>
@@ -92,3 +94,16 @@ export type BuiltBridgeIn = Built & {
 
 /** A 256-byte proof (the EVM calldata words) and the public signals. */
 export type Proved = { proof: Hex; words: Hex[]; public_signals: Hex[] }
+
+/** A GVK ciphertext in zkross-prover's `decrypt` request form. */
+export type GvkCiphertextHex = { rx: Hex; ry: Hex; c1: Hex; c2: Hex; c3: Hex }
+export type DecryptedNote = { pk: Hex; amount: string; blinding: Hex; commitment: Hex }
+export type BridgeMessageRequest = {
+  amount: string
+  asset_id: string
+  src_chain: string
+  dst_chain: string
+  recipient_pk: Hex
+  claim_secret: Hex
+  deadline_bucket: string
+}

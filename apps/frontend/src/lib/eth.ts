@@ -125,3 +125,45 @@ export async function liquidityAdded(): Promise<bigint> {
 }
 
 export const poolUsdcBalance = () => usdcBalance(pool())
+
+export type PoolLog = {
+  eventName: string
+  args: Record<string, unknown>
+  transactionHash: Hash
+  blockNumber: bigint
+  logIndex: number
+}
+
+/** Every pool event from the deploy block on, in chain order. */
+export async function allPoolLogs(): Promise<PoolLog[]> {
+  const latest = await publicClient.getBlockNumber()
+  const logs = []
+  for (let from = sepoliaConfig.deployBlock; from <= latest; from += LOG_CHUNK) {
+    const to = from + LOG_CHUNK - 1n < latest ? from + LOG_CHUNK - 1n : latest
+    logs.push(...(await publicClient.getLogs({ address: pool(), fromBlock: from, toBlock: to })))
+  }
+  return parseEventLogs({ abi: shieldedPoolAbi, logs }) as unknown as PoolLog[]
+}
+
+export type TxDetails = { sender: string; time: number; usdc: { from: string; to: string; amount: bigint }[] }
+
+const blockTimes = new Map<bigint, Promise<number>>()
+
+/** A transaction's sender, block time (ms) and USDC transfers, from its receipt. */
+export async function txDetails(hash: Hash): Promise<TxDetails> {
+  const [tx, receipt] = await Promise.all([
+    publicClient.getTransaction({ hash }),
+    publicClient.getTransactionReceipt({ hash }),
+  ])
+  let time = blockTimes.get(receipt.blockNumber)
+  if (!time) {
+    time = publicClient.getBlock({ blockNumber: receipt.blockNumber }).then((b) => Number(b.timestamp) * 1000)
+    blockTimes.set(receipt.blockNumber, time)
+  }
+  const usdc = parseEventLogs({
+    abi: erc20Abi,
+    logs: receipt.logs.filter((l) => l.address.toLowerCase() === sepoliaConfig.usdc.address.toLowerCase()),
+    eventName: 'Transfer',
+  }).map((l) => ({ from: l.args.from, to: l.args.to, amount: l.args.value }))
+  return { sender: tx.from, time: await time, usdc }
+}

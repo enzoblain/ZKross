@@ -1,6 +1,7 @@
 //! zkross-prover's library for the browser: the same input builders, hashes
 //! and SPP witness calculator and Groth16 prover as the CLI. Requests and
-//! results are the CLI's JSON, as strings.
+//! results are the CLI's JSON, as strings. adminKey and decrypt serve the
+//! Admin page, which holds the pasted view key in memory only.
 use wasm_bindgen::prelude::*;
 
 fn js(r: anyhow::Result<serde_json::Value>) -> Result<String, JsError> {
@@ -51,4 +52,17 @@ pub fn bridge_message(req: &str) -> Result<String, JsError> {
 #[wasm_bindgen(js_name = treeRoot)]
 pub fn tree_root(req: &str) -> Result<String, JsError> {
     js(zkross_prover::tree_root(req))
+}
+
+/// The admin's Global View Key `D` for a pasted private scalar (Admin page
+/// only; the page keeps the scalar in memory and never sends or stores it).
+#[wasm_bindgen(js_name = adminKey)]
+pub fn admin_key(d_priv: &str) -> Result<String, JsError> {
+    js(zkross_prover::admin_key_of(d_priv))
+}
+
+/// Admin decryption of GVK ciphertexts, as the CLI's `decrypt`.
+#[wasm_bindgen]
+pub fn decrypt(req: &str) -> Result<String, JsError> {
+    js(zkross_prover::decrypt(req))
 }

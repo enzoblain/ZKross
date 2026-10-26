@@ -4,6 +4,7 @@ import { AppShell } from './components/app-shell'
 import { WalletProvider } from './components/wallet-provider'
 import { experimentalPages, readExperimental, writeExperimental } from './lib/experimental'
 import { ActivityPage } from './pages/activity-page'
+import { AdminPage } from './pages/admin-page'
 import { BridgePage } from './pages/bridge-page'
 import { CctpActivityPage } from './pages/cctp-activity-page'
 import { CctpBridgePage } from './pages/cctp-bridge-page'
@@ -22,6 +23,7 @@ export type PageId =
   | 'activity'
   | 'privacy'
   | 'compliance'
+  | 'admin'
   | 'cctp-bridge'
   | 'private-balance'
   | 'cctp-activity'
@@ -37,6 +39,7 @@ const pages: Record<Exclude<PageId, 'landing'>, () => JSX.Element> = {
   activity: ActivityPage,
   privacy: PrivacyPage,
   compliance: CompliancePage,
+  admin: AdminPage,
   'cctp-bridge': CctpBridgePage,
   'private-balance': PrivateBalancePage,
   'cctp-activity': CctpActivityPage,

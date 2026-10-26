@@ -87,7 +87,15 @@ export const bytesHex = (bytes: Uint8Array): Hex =>
 export const hex32 = (value: bigint | number | string): Hex =>
   `0x${BigInt(value).toString(16).padStart(64, '0')}`
 
-type PoolEvent = { name: string; topics: unknown[]; data: Record<string, unknown>; ledger: number }
+export type PoolEvent = {
+  name: string
+  topics: unknown[]
+  data: Record<string, unknown>
+  ledger: number
+  txHash: string
+  /** Ledger close time (ms since 1970). */
+  time: number
+}
 
 /** Pool events from the deploy ledger on (Stellar RPC keeps about 7 days). */
 export async function poolEvents(): Promise<PoolEvent[]> {
@@ -100,7 +108,14 @@ export async function poolEvents(): Promise<PoolEvent[]> {
     )
     for (const event of response.events) {
       const topics = event.topic.map((t: xdr.ScVal) => scValToNative(t))
-      all.push({ name: String(topics[0]), topics, data: scValToNative(event.value), ledger: event.ledger })
+      all.push({
+        name: String(topics[0]),
+        topics,
+        data: scValToNative(event.value),
+        ledger: event.ledger,
+        txHash: event.txHash,
+        time: Date.parse(event.ledgerClosedAt),
+      })
     }
     if (response.events.length < 200) break
     cursor = response.cursor
@@ -187,3 +202,21 @@ export async function addUsdcTrustline(account: string) {
 }
 
 export const poolId = () => stellarConfig.pool
+
+export type TxDetails = { sender: string; usdc: { from: string; to: string; amount: bigint }[] }
+
+/** A transaction's source account and its USDC movements (stroops), from Horizon. */
+export async function txDetails(hash: string): Promise<TxDetails> {
+  const response = await fetch(`${stellarConfig.horizonUrl}/transactions/${hash}/operations`)
+  if (!response.ok) throw new Error(`Horizon has no transaction ${hash}`)
+  const records = ((await response.json())._embedded?.records ?? []) as {
+    source_account: string
+    asset_balance_changes?: { asset_code?: string; asset_issuer?: string; from: string; to: string; amount: string }[]
+  }[]
+  const usdc = records.flatMap((op) =>
+    (op.asset_balance_changes ?? [])
+      .filter((c) => c.asset_code === stellarConfig.usdc.code && c.asset_issuer === stellarConfig.usdc.issuer)
+      .map((c) => ({ from: c.from, to: c.to, amount: stellarUnits(c.amount) })),
+  )
+  return { sender: records[0]?.source_account ?? '', usdc }
+}

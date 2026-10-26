@@ -4,6 +4,7 @@ import {
   CircleDollarSign,
   Droplets,
   FlaskConical,
+  KeyRound,
   Moon,
   ScanEye,
   ShieldCheck,
@@ -170,6 +171,21 @@ function AppShell({
 
           <div className="flex items-center gap-2">
             <NetworkRouteMark className="mr-1 hidden sm:inline-flex" />
+            {!isLanding && (
+              <button
+                type="button"
+                className={cn(
+                  'focus-ring grid size-9 place-items-center rounded-xl border bg-surface transition-colors hover:border-border-strong hover:text-foreground',
+                  activePage === 'admin' ? 'border-accent/40 text-accent' : 'border-border text-muted',
+                )}
+                onClick={() => onNavigate('admin')}
+                aria-current={activePage === 'admin' ? 'page' : undefined}
+                aria-label="Admin"
+                title="Admin"
+              >
+                <KeyRound aria-hidden="true" className="size-4" />
+              </button>
+            )}
             {!isLanding && <ExperimentalButton experimental={experimental} onExperimentalChange={onExperimentalChange} />}
             <ThemeButton theme={theme} onThemeChange={onThemeChange} />
             {isLanding ? (

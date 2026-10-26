@@ -2,11 +2,14 @@
 // a Web Worker, with the same JSON requests as the CLI the scripts use.
 import type {
   BridgeInRequest,
+  BridgeMessageRequest,
   BridgeOutRequest,
   Built,
   BuiltBridgeIn,
   BuiltBridgeOut,
   BuiltTransact,
+  DecryptedNote,
+  GvkCiphertextHex,
   Hex,
   ProverOp,
   Proved,
@@ -72,4 +75,11 @@ export const prover = {
     (await json<{ commitment: Hex }>('commitment', amount.toString(), pk, blinding)).commitment,
   treeRoot: async (leaves: Hex[]) =>
     (await json<{ root: Hex }>('treeRoot', JSON.stringify({ levels: 20, leaves }))).root,
+  /** Admin page only: D for a pasted view key (kept in memory by the page). */
+  adminKey: (dPriv: string) => json<{ x: Hex; y: Hex }>('adminKey', dPriv),
+  /** Admin page only: GVK decryption; `commitment` is recomputed from the plaintext. */
+  decrypt: (dPriv: string, ciphertexts: GvkCiphertextHex[]) =>
+    json<{ notes: DecryptedNote[] }>('decrypt', JSON.stringify({ d_priv: dPriv, ciphertexts })),
+  bridgeMessage: (req: BridgeMessageRequest) =>
+    json<{ bridge_message: Hex; claim_nullifier: Hex }>('bridgeMessage', JSON.stringify(req)),
 }
