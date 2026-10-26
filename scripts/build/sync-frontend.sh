@@ -12,7 +12,7 @@ BUILD="${ZKROSS_BUILD:-$HOME/zkross-build}"
 M="$BUILD/front"
 mkdir -p "$M/services"
 rsync -a "$REPO/package.json" "$REPO/package-lock.json" "$REPO/deployments.json" "$M/"
-for d in apps packages services/prover services/relayer; do
+for d in apps packages services/prover services/relayer contracts/ethereum/test/fixtures; do
   mkdir -p "$M/$d"
   rsync -a --delete --exclude node_modules --exclude dist --exclude public/zk "$REPO/$d/" "$M/$d/"
 done
