@@ -6,8 +6,8 @@
 #   bash scripts/dev.sh                 both
 #   bash scripts/dev.sh --site-only     the site only (the relayer runs elsewhere)
 #   bash scripts/dev.sh --service-only  the service only
-# Before starting, it checks what each needs (.env keys, the Ethereum ABIs,
-# the browser prover files, free ports) and says what is missing. A relayer
+# Before starting, it checks what each needs (.env keys, the browser prover
+# files, free ports) and says what is missing. A relayer
 # already answering on its port is reused instead of failing with EADDRINUSE.
 set -euo pipefail
 set -m # each background job gets its own process group, so stopping it stops its children
@@ -46,12 +46,6 @@ if [ "$SERVICE" = 1 ]; then
 fi
 if [ "$SERVICE" = 1 ]; then
   [ -f "$REPO/.env" ] || fail "No .env at the repo root: the relayer and root poster need its testnet keys (scripts/testnet/create-accounts.sh, or ask Emin)."
-  ABI="$REPO/contracts/ethereum/out/ShieldedPool.sol/ShieldedPool.json"
-  if [ ! -f "$ABI" ]; then
-    command -v forge >/dev/null || fail "The Ethereum ABIs are missing ($ABI) and Foundry is not installed: install it (https://getfoundry.sh), then rerun."
-    echo "→ Building the Ethereum contracts for their ABIs (forge build)…"
-    (cd "$REPO/contracts/ethereum" && forge build >/dev/null) || fail "forge build failed."
-  fi
   [ -x "$REPO/node_modules/.bin/tsx" ] || fail "tsx is missing: run npm install at the repo root."
 fi
 

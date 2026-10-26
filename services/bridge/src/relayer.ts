@@ -32,6 +32,8 @@ const MAX_GAS = BigInt(env.ZKROSS_RELAYER_MAX_GAS ?? 6_000_000);
 /** Total Soroban fee cap, in stroops (default 5 XLM). */
 const MAX_STELLAR_FEE = BigInt(env.ZKROSS_RELAYER_MAX_FEE ?? 50_000_000);
 const RATE_PER_MINUTE = Number(env.ZKROSS_RELAYER_RATE ?? 12);
+/** Behind a reverse proxy (HTTPS on a server), rate-limit by the client IP it forwards. */
+const TRUST_PROXY = env.ZKROSS_RELAYER_TRUST_PROXY === "1";
 const MAX_BODY = 256 * 1024;
 /** The relayer's commission: 0 on testnet. */
 export const FEE = 0n;
@@ -238,7 +240,8 @@ export function startRelayer(port = PORT) {
       });
       return res.end();
     }
-    if (limited(req.socket.remoteAddress ?? "?")) return send(res, 429, { error: "too many requests" }, origin);
+    const forwarded = TRUST_PROXY ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "";
+    if (limited(forwarded || req.socket.remoteAddress || "?")) return send(res, 429, { error: "too many requests" }, origin);
     try {
       if (req.method === "POST" && req.url === "/relay") {
         const r = validate(await readBody(req));

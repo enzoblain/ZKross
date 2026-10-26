@@ -30,6 +30,7 @@ Built during **HackMeridian** on top of
 - [Architecture](#architecture)
 - [Deployed contracts](#deployed-contracts)
 - [Getting started](#getting-started)
+- [Deploying for free](#deploying-for-free)
 - [Testing](#testing)
 - [Repository layout](#repository-layout)
 - [Team and acknowledgements](#team-and-acknowledgements)
@@ -261,7 +262,7 @@ npm start -- --service-only  # only the service
 
 The site opens on <http://127.0.0.1:5173> and the relayer listens on
 <http://127.0.0.1:8788>. `scripts/dev.sh` first checks what is missing
-(`.env`, the Ethereum ABIs, the browser prover files, a busy port) and says
+(`.env`, the browser prover files, a busy port) and says
 how to fix it. Ctrl+C stops everything.
 
 The browser prover and circuit files must be staged once in
@@ -318,6 +319,52 @@ sub-path, build with `npm run build -- --base=/path/`.
 `scripts/testnet/deploy-stellar.sh` and `scripts/testnet/deploy-sepolia.sh`
 deploy the pools and update `deployments.json`.
 
+## Deploying for free
+
+The contracts already run on the testnets. Two parts need hosting: the
+**site** (static files) and the **bridge service** (a process that runs
+continuously, holds testnet keys and serves the relayer over HTTPS). Both fit
+in free plans; check each provider's current terms, as free tiers change.
+
+| Part | Where (free) | Why |
+| --- | --- | --- |
+| Site | [Cloudflare Pages](https://pages.cloudflare.com) | Static hosting, unlimited bandwidth, files up to 25 MiB (ours: 14 MB max), serves `.wasm` correctly |
+| Bridge service | [Oracle Cloud Always Free](https://www.oracle.com/cloud/free/) VM | A real Linux VM with no time limit |
+| | or an [AWS](https://aws.amazon.com/free/) / Google Cloud free-tier VM | Fine for the hackathon; AWS's free offer for new accounts is time-limited credits |
+| | or your own machine | Fine for a live demo, as long as it stays on |
+
+Hosts that put free services to sleep do not work for the bridge service:
+while it sleeps, no root is posted and transfers wait.
+
+**1. The bridge service, on an Ubuntu VM** (22.04 or 24.04, x86_64 or arm64)
+
+```sh
+git clone https://github.com/enzoblain/ZKross.git && cd ZKross && git checkout dev
+# from your machine: scp .env <vm>:ZKross/.env
+bash scripts/deploy/server-setup.sh https://zkross.pages.dev
+```
+
+It installs Node.js, the Stellar CLI and Caddy, imports the service's
+Stellar identities from `.env`, starts the service under systemd (restarted
+on failure and at boot), and serves the relayer over HTTPS at
+`https://<public IP>.sslip.io` (no domain needed; pass your own domain as a
+second argument). Open ports 80 and 443 in the cloud firewall (Oracle: the
+VCN security list; AWS: the security group). The server needs only the
+service's keys: the pool admin's Stellar key never has to be on it. Logs:
+`journalctl -u zkross-bridge -f`.
+
+**2. The site, on Cloudflare Pages** (from your machine)
+
+```sh
+VITE_RELAYER_URL=https://<public IP>.sslip.io bash scripts/deploy/site.sh
+```
+
+It stages the prover if needed, builds the site with the relayer's address,
+and uploads it with Cloudflare's `wrangler` (it asks you to log in the first
+time and creates the `zkross` project). If the site's final address differs
+from the one given to `server-setup.sh`, update `ZKROSS_RELAYER_ORIGINS` in the
+server's `.env` and run `sudo systemctl restart zkross-bridge`.
+
 ## Testing
 
 ```sh
@@ -325,7 +372,7 @@ cd apps/frontend && npm test                          # web app: flows with fake
 cd contracts/ethereum && forge test                   # Ethereum pool and bridge
 cd spp && cargo test -p pool-gvk                      # Stellar pool and bridge
 cd spp && cargo test -p circuits --release prove_bridge  # bridge circuits with real proofs
-cd services/bridge && npm test                        # relayer (needs the forge ABIs)
+cd services/bridge && npm test                        # relayer (needs the .env keys)
 ```
 
 **End to end on the live testnets** (the bridge service must be running):

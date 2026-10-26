@@ -2,6 +2,7 @@
 // leaves from events, and the external-data hashes from the pool's own views.
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { type Address, type PublicClient, getAbiItem, parseAbi } from "viem";
 import { type Hex, type Proved, ciphertext } from "./prover.ts";
 
@@ -10,7 +11,12 @@ import { REPO } from "./config.ts";
 export { REPO };
 const OUT = path.join(REPO, "contracts/ethereum/out");
 
-export const poolAbi = JSON.parse(fs.readFileSync(path.join(OUT, "ShieldedPool.sol/ShieldedPool.json"), "utf8")).abi;
+const BUILT_ABI = path.join(OUT, "ShieldedPool.sol/ShieldedPool.json");
+// Without a forge build (on a server, say), the ABI committed for the frontend
+// by scripts/build/export-abi.sh is the same one.
+export const poolAbi = fs.existsSync(BUILT_ABI)
+  ? JSON.parse(fs.readFileSync(BUILT_ABI, "utf8")).abi
+  : (await import(pathToFileURL(path.join(REPO, "apps/frontend/src/lib/abi/shielded-pool.ts")).href)).shieldedPoolAbi;
 export const erc20Abi = parseAbi([
   "function balanceOf(address) view returns (uint256)",
   "function approve(address, uint256) returns (bool)",
