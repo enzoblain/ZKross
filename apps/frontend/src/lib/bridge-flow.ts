@@ -106,12 +106,12 @@ export function createTransfer(input: NewTransfer): Transfer {
 
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
-const salts = (): [Hex, Hex] => [randomField(), randomField()]
+export const salts = (): [Hex, Hex] => [randomField(), randomField()]
 
-const dummy = (): InNote => ({ leaf_index: null, sk: randomField(), amount: '0', blinding: randomField() })
+export const dummy = (): InNote => ({ leaf_index: null, sk: randomField(), amount: '0', blinding: randomField() })
 
 /** Finds pending notes in the pool tree (retrying while RPC catches up) and stores them. */
-async function settleNotes(network: NetworkId, pending: PendingNote[], tries = 6) {
+export async function settleNotes(network: NetworkId, pending: PendingNote[], tries = 6) {
   const wanted = pending.filter((n) => BigInt(n.amount) > 0n)
   for (let attempt = 0; attempt < tries; attempt++) {
     const leaves = await pools[network].noteLeaves()
@@ -126,7 +126,7 @@ async function settleNotes(network: NetworkId, pending: PendingNote[], tries = 6
 }
 
 /** Up to two unspent notes worth at least `amount` (fewest and smallest first). */
-function selectNotes(available: Note[], amount: bigint): Note[] | null {
+export function selectNotes(available: Note[], amount: bigint): Note[] | null {
   const sorted = available.slice().sort((x, y) => {
     const a = BigInt(x.amount)
     const b = BigInt(y.amount)

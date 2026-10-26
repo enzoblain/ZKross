@@ -1,4 +1,5 @@
-// This browser's private records: unspent notes and bridge transfers. They
+// This browser's private records: unspent notes, bridge transfers and
+// standalone deposits and withdrawals of the private balance. They
 // hold note blindings and claim secrets but no spending key (keys.ts derives
 // it from the wallet), so they alone cannot spend or claim anything.
 // TODO(B10): notes are kept only here; the encrypted_output and
@@ -77,9 +78,35 @@ export type Transfer = {
   error?: string
 }
 
+/** A deposit into or a withdrawal from the private balance on one chain, on
+ * its own: no bridge, at any time and for any amount. */
+export type Movement = {
+  id: string
+  kind: 'deposit' | 'withdraw'
+  network: NetworkId
+  createdAt: number
+  /** Note amount on `network` (its own decimals). */
+  amount: string
+  /** The depositing wallet, or the public address that receives the withdrawal. */
+  account: string
+  /** The wallet that derives the note key. */
+  identity: { network: NetworkId; address: string }
+  // Recorded before sending, so a reload can tell from chain state whether the
+  // transaction landed.
+  /** The deposit's new note. */
+  note?: PendingNote
+  /** Commitments of the notes the withdrawal spends. */
+  inputs?: Hex[]
+  changeNotes?: PendingNote[]
+  nullifier?: Hex
+  status: 'created' | 'done'
+  txs: Partial<Record<'approve' | 'transact', string>>
+  error?: string
+}
+
 const KEY = 'zkross:v1'
 
-type Data = { notes: Note[]; transfers: Transfer[] }
+type Data = { notes: Note[]; transfers: Transfer[]; movements?: Movement[] }
 
 function load(): Data {
   try {
@@ -148,6 +175,17 @@ export function putTransfer(t: Transfer) {
   const i = data.transfers.findIndex((x) => x.id === t.id)
   if (i >= 0) data.transfers[i] = t
   else data.transfers.push(t)
+  save(data)
+}
+
+export const movements = () => (load().movements ?? []).slice().sort((a, b) => b.createdAt - a.createdAt)
+
+export function putMovement(m: Movement) {
+  const data = load()
+  const list = (data.movements ??= [])
+  const i = list.findIndex((x) => x.id === m.id)
+  if (i >= 0) list[i] = m
+  else list.push(m)
   save(data)
 }
 

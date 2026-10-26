@@ -1,3 +1,6 @@
+import { StrKey } from '@stellar/stellar-sdk'
+import { isAddress } from 'viem'
+
 export type NetworkId = 'stellar' | 'ethereum'
 
 export type WalletConnection = {
@@ -38,3 +41,9 @@ export const networkMeta: Record<
 
 export const otherNetwork = (network: NetworkId): NetworkId =>
   network === 'ethereum' ? 'stellar' : 'ethereum'
+
+/** A valid public account address on `network`. */
+export function validAddress(network: NetworkId, address: string) {
+  const value = address.trim()
+  return network === 'stellar' ? StrKey.isValidEd25519PublicKey(value) : isAddress(value)
+}

@@ -7,6 +7,7 @@ import {
   ScanEye,
   ShieldCheck,
   Sun,
+  Wallet,
   WalletCards,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
@@ -34,6 +35,7 @@ type NavItem = {
 
 const appNavigation = [
   { id: 'bridge', label: 'Bridge', icon: ArrowLeftRight },
+  { id: 'balance', label: 'Balance', icon: Wallet },
   { id: 'liquidity', label: 'Liquidity', icon: Droplets },
   { id: 'activity', label: 'Activity', icon: Activity },
   { id: 'privacy', label: 'Privacy', icon: ScanEye },

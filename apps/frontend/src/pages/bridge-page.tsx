@@ -1,4 +1,3 @@
-import { StrKey } from '@stellar/stellar-sdk'
 import {
   AlertTriangle,
   ArrowRight,
@@ -16,7 +15,6 @@ import {
   ShieldCheck,
 } from 'lucide-react'
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
-import { isAddress } from 'viem'
 
 import { Spotlight } from '../components/aceternity/spotlight'
 import { NetworkMark, NetworkRouteMark } from '../components/network-logo'
@@ -35,7 +33,7 @@ import { formatMessage, formatNote, parseUnits, toNoteAmount } from '../lib/amou
 import { createProgress, createTransfer, identityOf, runTransfer, type FlowStepId } from '../lib/bridge-flow'
 import { chooseIdentity, identity, type Identity } from '../lib/keys'
 import { chainId, explorer, isDeployed, poolAddress, protocol } from '../lib/config'
-import { networkMeta, otherNetwork, type NetworkId, type TransferProgressStep } from '../lib/networks'
+import { networkMeta, otherNetwork, validAddress, type NetworkId, type TransferProgressStep } from '../lib/networks'
 import { type Via, pools } from '../lib/pools'
 import { RELAYER_URL, relayerHealth } from '../lib/relayer'
 import * as store from '../lib/store'
@@ -47,11 +45,6 @@ type RunStatus = 'idle' | 'running' | 'complete' | 'failed'
 
 const unfinishedTransfer = () =>
   store.transfers().find((item) => !store.isFinished(item))
-
-function validRecipient(network: NetworkId, address: string) {
-  const value = address.trim()
-  return network === 'stellar' ? StrKey.isValidEd25519PublicKey(value) : isAddress(value)
-}
 
 function stepTransactions(transfer: Transfer | null, step: FlowStepId) {
   if (!transfer) return []
@@ -119,7 +112,7 @@ function BridgePage() {
   // The destination wallet is never connected: the user types the address.
   const recipientValue = recipient
   const messageAmount = useMemo(() => parseUnits(amount, 6), [amount])
-  const recipientIsValid = keepPrivate || validRecipient(to, recipientValue)
+  const recipientIsValid = keepPrivate || validAddress(to, recipientValue)
   const deploymentReady = isDeployed(from) && isDeployed(to)
   const readKey = `${from}:${sourceWallet?.address ?? ''}:${to}`
   const publicBalance = liveReads.key === readKey ? liveReads.publicBalance : null
@@ -393,7 +386,7 @@ function BridgePage() {
                   <label htmlFor="recipient" className="block text-[10px] font-medium text-subtle">Your public {networkMeta[to].shortName} withdrawal address</label>
                   <label className="flex items-center gap-1.5 text-[10px] text-muted"><input type="checkbox" checked={keepPrivate} disabled={runStatus === 'running'} onChange={(event) => setKeepPrivate(event.target.checked)} />Keep it private on {networkMeta[to].shortName}</label>
                 </div>
-                {keepPrivate ? <p className="mt-3 text-[10px] leading-4 text-subtle">No withdrawal: the claimed note stays in your {networkMeta[to].shortName} private balance, owned by your note key, ready to bridge back or withdraw later.</p> : <>
+                {keepPrivate ? <p className="mt-3 text-[10px] leading-4 text-subtle">No withdrawal: the claimed note stays in your {networkMeta[to].shortName} private balance, owned by your note key, ready to bridge back, or to withdraw any amount later from the Balance page.</p> : <>
                 <div className="mt-3 flex items-center rounded-xl border border-border bg-surface/60 px-3 focus-within:border-accent/50">
                   <input id="recipient" value={recipientValue} disabled={runStatus === 'running'} onChange={(event) => setRecipient(event.target.value)} aria-invalid={recipientValue.length > 0 && !recipientIsValid} className="min-w-0 flex-1 bg-transparent py-3 font-mono text-xs outline-none placeholder:text-subtle disabled:opacity-60" placeholder={to === 'stellar' ? 'G…' : '0x…'} />
                 </div>

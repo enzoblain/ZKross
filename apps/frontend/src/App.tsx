@@ -4,6 +4,7 @@ import { AppShell } from './components/app-shell'
 import { WalletProvider } from './components/wallet-provider'
 import { ActivityPage } from './pages/activity-page'
 import { AdminPage } from './pages/admin-page'
+import { BalancePage } from './pages/balance-page'
 import { BridgePage } from './pages/bridge-page'
 import { CompliancePage } from './pages/compliance-page'
 import { LandingPage } from './pages/landing-page'
@@ -13,6 +14,7 @@ import { PrivacyPage } from './pages/privacy-page'
 export type PageId =
   | 'landing'
   | 'bridge'
+  | 'balance'
   | 'liquidity'
   | 'activity'
   | 'privacy'
@@ -22,6 +24,7 @@ export type Theme = 'dark' | 'light'
 
 const pages: Record<Exclude<PageId, 'landing'>, () => JSX.Element> = {
   bridge: BridgePage,
+  balance: BalancePage,
   liquidity: LiquidityPage,
   activity: ActivityPage,
   privacy: PrivacyPage,
