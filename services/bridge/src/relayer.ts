@@ -122,7 +122,10 @@ async function relayStellar(r: RelayRequest): Promise<string> {
   const tx = TransactionBuilder.fromXDR(unsigned, STELLAR_PASSPHRASE);
   const sim = await stellar.rpcServer.simulateTransaction(tx);
   if (!rpc.Api.isSimulationSuccess(sim)) throw new Refused(`simulation failed: ${(sim as rpc.Api.SimulateTransactionErrorResponse).error}`);
-  const assembled = rpc.assembleTransaction(tx, sim).build();
+  const builder = rpc.assembleTransaction(tx, sim);
+  // The CLI's build-only transaction has no time bounds: give it two minutes.
+  if (!tx.timeBounds || tx.timeBounds.maxTime === "0") builder.setTimeout(120);
+  const assembled = builder.build();
   if (BigInt(assembled.fee) > MAX_STELLAR_FEE) throw new Refused(`fee ${assembled.fee} stroops is above the cap`);
   assembled.sign(keypair);
   const sent = await stellar.rpcServer.sendTransaction(assembled);
@@ -142,6 +145,21 @@ async function relaySepolia(r: RelayRequest): Promise<string> {
   if (gas > MAX_GAS) throw new Refused(`gas ${gas} is above the cap`);
   const wallet = createWalletClient({ account, chain: sepolia, transport: viemHttp(SEPOLIA_RPC) });
   return wallet.writeContract({ ...call, gas: (gas * 12n) / 10n > MAX_GAS ? MAX_GAS : (gas * 12n) / 10n });
+}
+
+/** The relayer's public addresses (what appears on-chain as the sender). */
+function accounts() {
+  const read = (f: () => string) => {
+    try {
+      return f();
+    } catch {
+      return null;
+    }
+  };
+  return {
+    stellar: read(() => Keypair.fromSecret(need("STELLAR_RELAYER_SECRET")).publicKey()),
+    sepolia: read(() => privateKeyToAccount(need("SEPOLIA_RELAYER_KEY") as `0x${string}`).address),
+  };
 }
 
 export async function relay(r: RelayRequest): Promise<string> {
@@ -230,7 +248,7 @@ export function startRelayer(port = PORT) {
       }
       const m = req.method === "GET" && req.url?.match(/^\/status\/([0-9a-fA-Fx]+)$/);
       if (m) return send(res, 200, await status(m[1]), origin);
-      if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true, fee: FEE.toString() }, origin);
+      if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true, fee: FEE.toString(), accounts: accounts() }, origin);
       return send(res, 404, { error: "not found" }, origin);
     } catch (e) {
       const refused = e instanceof Refused;

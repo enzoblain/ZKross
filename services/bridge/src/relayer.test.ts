@@ -50,7 +50,10 @@ test("CORS allows the site only, and the rate limit applies per IP", async () =>
   const ok = await fetch(`${base}/health`, { headers: { origin: "http://127.0.0.1:5173" } });
   assert.equal(ok.status, 200);
   assert.equal(ok.headers.get("access-control-allow-origin"), "http://127.0.0.1:5173");
-  assert.deepEqual(await ok.json(), { ok: true, fee: "0" });
+  const health = await ok.json();
+  assert.equal(health.fee, "0");
+  assert.match(health.accounts.stellar, /^G[A-Z2-7]{55}$/);
+  assert.match(health.accounts.sepolia, /^0x[0-9a-fA-F]{40}$/);
   const refused = await fetch(`${base}/relay`, { method: "POST", body: JSON.stringify({ chain: "stellar", pool: S, fn: "add_liquidity", args: stellarArgs("0") }) });
   assert.equal(refused.status, 400);
   assert.match((await refused.json()).error, /not relayed/);

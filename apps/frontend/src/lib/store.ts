@@ -58,6 +58,10 @@ export type Transfer = {
   remoteLeafCount?: number
   claimNotes?: PendingNote[]
   withdrawNullifier?: Hex
+  /** Who submits bridge outs, claims and withdrawals (default: the relayer). */
+  via?: 'relayer' | 'wallet'
+  /** The last step failed because the relayer did not answer. */
+  relayerFailed?: boolean
   status: TransferStatus
   txs: Partial<Record<'approve' | 'deposit' | 'bridgeOut' | 'bridgeIn' | 'trustline' | 'withdraw', string>>
   error?: string

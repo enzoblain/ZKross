@@ -3,14 +3,16 @@
 // withdraw to a public address. Formats are SPEC.md's; the circuit inputs and
 // proofs come from zkross-prover in the browser. Every step saves what it
 // creates before sending, so `runTransfer` resumes after a reload.
-// TODO(relayer): claims and withdrawals are sent from the user's own
-// destination wallet, which links it to the claim on-chain; a relayer will
-// submit them instead.
+// Bridge outs, claims and withdrawals go through the relayer by default
+// (t.via), so the user's wallets do not appear on-chain for them; deposits
+// always come from the source wallet. If the relayer does not answer, the
+// step fails with `relayerFailed` and the user can send it themselves.
 import { formatNote, toNoteAmount } from './amounts'
 import { chainId, protocol } from './config'
 import { type NoteKey, noteKey } from './keys'
 import { type NetworkId, type ProgressState, type TransferProgressStep, networkMeta } from './networks'
-import { pools } from './pools'
+import { type Via, pools } from './pools'
+import { RelayerUnavailable } from './relayer'
 import * as stellar from './stellar'
 import * as store from './store'
 import type { Note, PendingNote, Transfer } from './store'
@@ -62,6 +64,7 @@ type NewTransfer = {
   sender: string
   claimer: string
   recipient: string
+  via?: Via
 }
 
 export function createTransfer(input: NewTransfer): Transfer {
@@ -82,6 +85,7 @@ export function createTransfer(input: NewTransfer): Transfer {
     refundBlinding: randomField(),
     status: 'created',
     txs: {},
+    via: input.via ?? 'relayer',
   }
   store.putTransfer(t)
   return t
@@ -146,7 +150,7 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       await f()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      save(t, { error: message })
+      save(t, { error: message, relayerFailed: error instanceof RelayerUnavailable })
       update(id, 'failed', message)
       throw error
     }
@@ -157,6 +161,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
   const src = pools[t.from]
   const dst = pools[t.to]
   const amount = BigInt(t.amount)
+  const via: Via = t.via ?? 'relayer'
+  const by = (wallet: string) => (via === 'relayer' ? 'Sending through the relayer…' : `Confirm in ${wallet}…`)
   const amountFrom = toNoteAmount(t.from, amount)
   const amountTo = toNoteAmount(t.to, amount)
   let derivedKeys: { from: NoteKey; to: NoteKey } | undefined
@@ -262,8 +268,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       changeNotes: change,
     })
     const proof = await prover.prove(built)
-    update('bridgeOut', 'active', `Confirm bridge out in ${networkMeta[t.from].wallet}…`)
-    const sent = await src.bridgeOut(t.sender, proof)
+    update('bridgeOut', 'active', by(networkMeta[t.from].wallet))
+    const sent = await src.bridgeOut(t.sender, proof, via)
     save(t, { txs: { ...t.txs, bridgeOut: sent.hash } })
     store.markSpent(t.from, t.inputs ?? [])
     if (!(await settleNotes(t.from, change))) {
@@ -334,9 +340,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     built.commitments.forEach((c, i) => (claim[i].commitment = c))
     save(t, { claimNotes: claim })
     const proof = await prover.prove(built)
-    update('claim', 'active', `Confirm the claim in ${networkMeta[t.to].wallet}…`)
-    // TODO(relayer): sent from the user's destination wallet for now.
-    const sent = await dst.bridgeIn(t.claimer, proof)
+    update('claim', 'active', by(networkMeta[t.to].wallet))
+    const sent = await dst.bridgeIn(t.claimer, proof, via)
     save(t, { txs: { ...t.txs, bridgeIn: sent.hash } })
     if (!(await settleNotes(t.to, claim))) {
       throw new Error('The claim landed, but its destination note is not indexed yet. Retry shortly.')
@@ -350,8 +355,12 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
       return save(t, { status: 'withdrawn', error: undefined })
     }
     if (t.to === 'stellar' && (await dst.usdcBalance(t.recipient)) === null) {
+      const state = await stellar.accountState(t.recipient)
+      if (state === 'missing') {
+        throw new Error('The Stellar recipient account does not exist yet: fund it (Friendbot on testnet) and add a USDC trustline, then retry.')
+      }
       if (t.recipient !== t.claimer) {
-        throw new Error('The Stellar recipient needs a USDC trustline before it can receive USDC.')
+        throw new Error('The Stellar recipient has no USDC trustline: add one from that account, then retry.')
       }
       update('withdraw', 'active', 'Add the USDC trustline in Freighter…')
       save(t, { txs: { ...t.txs, trustline: await stellar.addUsdcTrustline(t.recipient) } })
@@ -375,9 +384,8 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
     })
     save(t, { withdrawNullifier: built.nullifiers[0] })
     const proof = await prover.prove(built)
-    update('withdraw', 'active', `Confirm the withdrawal in ${networkMeta[t.to].wallet}…`)
-    // TODO(relayer): sent from the user's destination wallet for now.
-    const sent = await dst.transact(t.claimer, proof, t.recipient, -amountTo)
+    update('withdraw', 'active', by(networkMeta[t.to].wallet))
+    const sent = await dst.transact(t.claimer, proof, t.recipient, -amountTo, undefined, via)
     store.markSpent(t.to, [note.commitment])
     save(t, { status: 'withdrawn', txs: { ...t.txs, withdraw: sent.hash }, error: undefined })
   })

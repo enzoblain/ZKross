@@ -4,6 +4,7 @@
 import type { Address } from 'viem'
 
 import * as eth from './eth'
+import { relay } from './relayer'
 import type { NetworkId } from './networks'
 import * as stellar from './stellar'
 import {
@@ -22,6 +23,9 @@ const STATUS: BridgeStatus[] = ['none', 'pending', 'finalized', 'refunded']
 
 type Sent = { hash: string }
 
+/** Who submits a call: the relayer's account, or the user's own wallet. */
+export type Via = 'relayer' | 'wallet'
+
 export type Pool = {
   network: NetworkId
   /** The admin's Global View Key `D`, read from the pool (never from the user). */
@@ -38,9 +42,10 @@ export type Pool = {
   bridgeOutExtHash(): Promise<Hex>
   bridgeInExtHash(): Promise<Hex>
   /** Deposits first approve the pool on Ethereum (`onApprove` gets that hash). */
-  transact(account: string, proof: Proved, recipient: string, extAmount: bigint, onApprove?: (hash: string) => void): Promise<Sent>
-  bridgeOut(account: string, proof: Proved): Promise<Sent>
-  bridgeIn(account: string, proof: Proved): Promise<Sent>
+  /** Deposits (extAmount > 0) always come from the wallet; `via` applies to the rest. */
+  transact(account: string, proof: Proved, recipient: string, extAmount: bigint, onApprove?: (hash: string) => void, via?: Via): Promise<Sent>
+  bridgeOut(account: string, proof: Proved, via?: Via): Promise<Sent>
+  bridgeIn(account: string, proof: Proved, via?: Via): Promise<Sent>
   /** Public USDC of an account, or null without a Stellar trustline. */
   usdcBalance(account: string): Promise<bigint | null>
   poolUsdcBalance(): Promise<bigint>
@@ -85,15 +90,23 @@ const ethereumPool: Pool = {
   transactExtHash: (recipient, extAmount) => eth.readPool<Hex>('hashExtData', [ethTransactExt(recipient, extAmount)]),
   bridgeOutExtHash: () => eth.readPool<Hex>('hashBridgeOutExtData', [ethBridgeOutExt]),
   bridgeInExtHash: () => eth.readPool<Hex>('hashBridgeInExtData', [ethExt]),
-  async transact(account, proof, recipient, extAmount, onApprove) {
+  async transact(account, proof, recipient, extAmount, onApprove, via = 'wallet') {
+    const args = [ethTransactProof(proof), ethTransactExt(recipient, extAmount)] as const
+    if (extAmount <= 0n && via === 'relayer') return relay('ethereum', 'transact', { proof: args[0], extData: args[1] })
     if (extAmount > 0n) {
       const approved = await eth.ensureAllowance(account as Address, extAmount)
       if (approved) onApprove?.(approved)
     }
-    return eth.sendPool(account as Address, 'transact', [ethTransactProof(proof), ethTransactExt(recipient, extAmount)])
+    return eth.sendPool(account as Address, 'transact', args)
   },
-  bridgeOut: (account, proof) => eth.sendPool(account as Address, 'bridgeOut', [ethBridgeOutProof(proof), ethBridgeOutExt]),
-  bridgeIn: (account, proof) => eth.sendPool(account as Address, 'bridgeIn', [ethBridgeInProof(proof), ethExt]),
+  bridgeOut: (account, proof, via = 'wallet') =>
+    via === 'relayer'
+      ? relay('ethereum', 'bridgeOut', { proof: ethBridgeOutProof(proof), extData: ethBridgeOutExt })
+      : eth.sendPool(account as Address, 'bridgeOut', [ethBridgeOutProof(proof), ethBridgeOutExt]),
+  bridgeIn: (account, proof, via = 'wallet') =>
+    via === 'relayer'
+      ? relay('ethereum', 'bridgeIn', { proof: ethBridgeInProof(proof), extData: ethExt })
+      : eth.sendPool(account as Address, 'bridgeIn', [ethBridgeInProof(proof), ethExt]),
   usdcBalance: (account) => eth.usdcBalance(account as Address),
   poolUsdcBalance: eth.poolUsdcBalance,
   liquidityAdded: eth.liquidityAdded,
@@ -134,16 +147,23 @@ const stellarPool: Pool = {
     stellarHash('hash_ext_data', stellarTransactExt(extAmount > 0n ? stellar.poolId() : recipient, extAmount)),
   bridgeOutExtHash: () => stellarHash('hash_bridge_out_ext_data', stellarBridgeOutExt),
   bridgeInExtHash: () => stellarHash('hash_bridge_in_ext_data', stellarExt),
-  transact: (account, proof, recipient, extAmount) =>
-    stellar.sendPool(account, 'transact', {
+  transact: (account, proof, recipient, extAmount, _onApprove, via = 'wallet') => {
+    const args = {
       proof: stellarTransactProof(proof),
       ext_data: stellarTransactExt(extAmount > 0n ? stellar.poolId() : recipient, extAmount),
-      sender: account,
-    }),
-  bridgeOut: (account, proof) =>
-    stellar.sendPool(account, 'bridge_out', { proof: stellarBridgeOutProof(proof), ext_data: stellarBridgeOutExt, sender: account }),
-  bridgeIn: (account, proof) =>
-    stellar.sendPool(account, 'bridge_in', { proof: stellarBridgeInProof(proof), ext_data: stellarExt, sender: account }),
+    }
+    return extAmount <= 0n && via === 'relayer'
+      ? relay('stellar', 'transact', args)
+      : stellar.sendPool(account, 'transact', { ...args, sender: account })
+  },
+  bridgeOut: (account, proof, via = 'wallet') => {
+    const args = { proof: stellarBridgeOutProof(proof), ext_data: stellarBridgeOutExt }
+    return via === 'relayer' ? relay('stellar', 'bridge_out', args) : stellar.sendPool(account, 'bridge_out', { ...args, sender: account })
+  },
+  bridgeIn: (account, proof, via = 'wallet') => {
+    const args = { proof: stellarBridgeInProof(proof), ext_data: stellarExt }
+    return via === 'relayer' ? relay('stellar', 'bridge_in', args) : stellar.sendPool(account, 'bridge_in', { ...args, sender: account })
+  },
   usdcBalance: stellar.usdcBalance,
   poolUsdcBalance: stellar.poolUsdcBalance,
   liquidityAdded: async () => stellar.liquidityAdded(await stellar.poolEvents()),

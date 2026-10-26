@@ -39,7 +39,7 @@ describe('Admin ledger on the live testnets', () => {
 
     const state = JSON.parse(readFileSync(statePath!, 'utf8'))
     // Every bridge message of the end-to-end script is linked to its claim.
-    for (const name of ['bridgeOutStellar0', 'bridgeOutStellar1', 'bridgeOutSepolia0', 'bridgeOutSepolia1']) {
+    for (const name of Object.keys(state.steps).filter((k) => k.startsWith('bridgeOut'))) {
       const msg = state.steps[name].msg
       const row = rows.find((r) => r.tx.bridgeOut?.message === BigInt(msg.c))
       expect(row?.linkedTo, name).toBeDefined()
@@ -47,9 +47,17 @@ describe('Admin ledger on the live testnets', () => {
     }
     // Withdrawals to the fresh addresses carry the exact public amounts.
     const withdrawals = rows.filter((r) => r.tx.kind === 'withdraw')
-    for (const [i, fresh] of (state.freshEth as string[]).entries()) {
-      const w = withdrawals.find((r) => r.tx.counterparty?.toLowerCase() === fresh.toLowerCase())
-      expect(w?.tx.publicAmount, fresh).toBe(i === 0 ? -2000000n : -1000000n)
+    const expected: { to: string; units: string }[] =
+      state.withdrawals ?? (state.freshEth as string[]).map((to, i) => ({ to, units: i === 0 ? '2000000' : '1000000' }))
+    for (const { to, units } of expected) {
+      const w = withdrawals.find((r) => r.tx.counterparty?.toLowerCase() === to.toLowerCase() && r.tx.publicAmount === -BigInt(units))
+      expect(w, `${to} receives ${units}`).toBeDefined()
+    }
+    // Optionally, the relayer sent the relayed transactions.
+    const relayers = (process.env.ZKROSS_RELAYER_ACCOUNTS ?? '').split(',').filter(Boolean).map((a) => a.toLowerCase())
+    if (relayers.length) {
+      const relayed = rows.filter((r) => relayers.includes(r.tx.sender.toLowerCase()))
+      console.log(`${relayed.length} transactions sent by the relayer: ${relayed.map((r) => `${r.tx.network}:${r.tx.kind}`).join(', ')}`)
     }
 
     const poolUsdc = { stellar: await pools.stellar.poolUsdcBalance(), ethereum: await pools.ethereum.poolUsdcBalance() }

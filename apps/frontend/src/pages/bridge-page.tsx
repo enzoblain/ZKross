@@ -35,7 +35,8 @@ import { formatMessage, formatNote, parseUnits } from '../lib/amounts'
 import { createProgress, createTransfer, runTransfer, type FlowStepId } from '../lib/bridge-flow'
 import { chainId, explorer, isDeployed, poolAddress, protocol } from '../lib/config'
 import { networkMeta, otherNetwork, type NetworkId, type TransferProgressStep } from '../lib/networks'
-import { pools } from '../lib/pools'
+import { type Via, pools } from '../lib/pools'
+import { RELAYER_URL, relayerHealth } from '../lib/relayer'
 import * as store from '../lib/store'
 import type { Transfer } from '../lib/store'
 import { cn } from '../lib/utils'
@@ -93,6 +94,8 @@ function BridgePage() {
     destinationCapacity: bigint | null
     error: string
   }>({ key: '', publicBalance: null, destinationCapacity: null, error: '' })
+  const [via, setVia] = useState<Via>(initial?.via ?? 'relayer')
+  const [relayerAccounts, setRelayerAccounts] = useState<Record<NetworkId, string | null> | null | undefined>(undefined)
   const privateBalance = useSyncExternalStore(
     store.subscribe,
     () => store.privateBalance(from),
@@ -144,6 +147,22 @@ function BridgePage() {
     }
   }, [from, readKey, sourceWallet, to])
 
+  useEffect(() => {
+    let cancelled = false
+    relayerHealth().then((h) => {
+      if (!cancelled) setRelayerAccounts(h ? { stellar: h.accounts.stellar, ethereum: h.accounts.sepolia } : null)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const relayerDown = relayerAccounts === null
+  const submitter = (network: NetworkId, wallet: string | undefined) =>
+    via === 'relayer'
+      ? `The relayer${relayerAccounts?.[network] ? ` (${truncateAddress(relayerAccounts[network]!)})` : ''}`
+      : `Your wallet${wallet ? ` (${truncateAddress(wallet)})` : ''}`
+
   const updateProgress = (step: FlowStepId, status: TransferProgressStep['status'], description?: string) => {
     setProgress((current) =>
       current.map((item) =>
@@ -179,6 +198,7 @@ function BridgePage() {
       sender: sourceWallet.address,
       claimer: destinationWallet.address,
       recipient: recipientValue.trim(),
+      via,
     })
     void execute(next)
   }
@@ -272,7 +292,15 @@ function BridgePage() {
                   )
                 })}
               </div>
-              <p className="mt-3 text-[10px] leading-4 text-subtle">The destination wallet currently submits the claim and withdrawal. A relayer will remove that visible fee-payer link later.</p>
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background/40 p-3">
+                <div className="min-w-0"><p className="text-[10px] font-medium text-foreground">Bridge out, claim and withdrawal sent by</p><p className="mt-1 text-[10px] leading-4 text-subtle">{via === 'relayer' ? 'The relayer submits them from its own account, so your wallets do not appear on-chain for these steps. Your wallets only sign the note-key messages.' : 'Your wallets submit and pay for them, so they appear on-chain.'} The deposit is always sent by your source wallet.</p></div>
+                <div role="radiogroup" aria-label="Who sends the transactions" className="flex gap-1 rounded-xl border border-border bg-background p-1">
+                  {([['relayer', 'Relayer'], ['wallet', 'Send myself']] as [Via, string][]).map(([value, label]) => (
+                    <button key={value} type="button" role="radio" aria-checked={via === value} disabled={runStatus === 'running'} onClick={() => setVia(value)} className={cn('focus-ring rounded-lg px-3 py-1.5 text-[10px] font-semibold transition-colors disabled:opacity-50', via === value ? 'bg-surface-raised text-foreground' : 'text-muted hover:text-foreground')}>{label}</button>
+                  ))}
+                </div>
+              </div>
+              {via === 'relayer' && relayerDown && <p role="status" className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-warning"><AlertTriangle aria-hidden="true" className="mt-0.5 size-3 shrink-0" />The relayer at {RELAYER_URL} is not answering. Start it (services/bridge, npm run service) or choose “Send myself”.</p>}
             </div>
 
             <div className="overflow-hidden rounded-[1.75rem] border border-border bg-background/55">
@@ -314,7 +342,17 @@ function BridgePage() {
                   {destinationWallet && <button type="button" className="focus-ring rounded-lg px-2 py-1 text-[10px] font-medium text-accent hover:text-accent-strong" onClick={() => setRecipient(destinationWallet.address)}>Use wallet</button>}
                 </div>
                 {recipientValue.length > 0 && !recipientIsValid && <p className="mt-2 text-[10px] text-danger">Enter a valid {networkMeta[to].shortName} public address.</p>}
-                {destinationWallet && recipientValue === destinationWallet.address && <p className="mt-2 flex items-center gap-1.5 text-[10px] text-success"><CheckCircle2 aria-hidden="true" className="size-3" />Matches the connected destination wallet</p>}
+                {destinationWallet && recipientValue === destinationWallet.address && (via === 'relayer' ? <p className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-warning"><AlertTriangle aria-hidden="true" className="mt-0.5 size-3 shrink-0" />This is your connected wallet: the withdrawal will publicly pay it. A fresh address keeps the relayer from being the only thing between you and the payout.</p> : <p className="mt-2 flex items-center gap-1.5 text-[10px] text-success"><CheckCircle2 aria-hidden="true" className="size-3" />Matches the connected destination wallet</p>)}
+                {to === 'stellar' && <p className="mt-2 text-[10px] leading-4 text-subtle">A Stellar address must exist and hold a USDC trustline before it can receive the withdrawal.</p>}
+              </div>
+
+              <div className="border-t border-border px-5 py-5 sm:px-7">
+                <p className="text-[10px] font-medium text-subtle">Account visible on-chain as the sender</p>
+                <dl className="mt-3 space-y-2 text-[11px]">
+                  <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">Your wallet{sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}</dd></div>
+                  <div className="flex justify-between gap-4"><dt className="text-subtle">Bridge out · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{submitter(from, sourceWallet?.address)}</dd></div>
+                  <div className="flex justify-between gap-4"><dt className="text-subtle">Claim + withdrawal · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{submitter(to, destinationWallet?.address)}</dd></div>
+                </dl>
               </div>
             </div>
 
@@ -342,6 +380,9 @@ function BridgePage() {
             </details>
 
             {currentError && <div role="alert" className="rounded-2xl border border-danger/25 bg-danger/[0.055] p-4 text-[11px] leading-5 text-danger">{currentError}</div>}
+            {transfer?.relayerFailed && latestCanResume && (
+              <Button variant="secondary" size="lg" className="w-full" onClick={() => { const next = { ...transfer, via: 'wallet' as Via, relayerFailed: false }; store.putTransfer(next); setVia('wallet'); void execute(next) }}>Send it myself instead</Button>
+            )}
 
             {latestCanResume && transfer ? (
               <div className="grid gap-2 sm:grid-cols-2">
@@ -398,7 +439,7 @@ function BridgePage() {
           <section className="rounded-3xl border border-warning/20 bg-warning/[0.045] p-5">
             <div className="flex items-start gap-3">
               <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" />
-              <div><p className="text-xs font-medium">What privacy means here</p><p className="mt-1 text-[11px] leading-5 text-muted">Proofs hide the note ownership and direct bridge-out → bridge-in link. Deposit and withdrawal addresses and amounts remain public; timing and unique amounts can still correlate them. Until the relayer exists, the destination wallet also appears as the claim fee payer.</p></div>
+              <div><p className="text-xs font-medium">What privacy means here</p><p className="mt-1 text-[11px] leading-5 text-muted">Proofs hide the note ownership and direct bridge-out → bridge-in link. Deposit and withdrawal addresses and amounts remain public; timing and unique amounts can still correlate them. With the relayer, bridge outs, claims and withdrawals show the relayer’s account as sender; the deposit still shows your source wallet.</p></div>
             </div>
           </section>
         </aside>
@@ -421,7 +462,7 @@ function BridgePage() {
               <div className="flex justify-between gap-4"><dt className="text-subtle">Route</dt><dd>{networkMeta[from].name} → {networkMeta[to].name}</dd></div>
               <div className="flex justify-between gap-4"><dt className="text-subtle">Withdrawal address</dt><dd className="max-w-[230px] truncate font-mono">{recipientValue}</dd></div>
               <div className="flex justify-between gap-4"><dt className="text-subtle">Protocol fee</dt><dd>0 USDC</dd></div>
-              <div className="flex justify-between gap-4"><dt className="text-subtle">Wallet actions</dt><dd>Deposit · bridge out · claim · withdraw</dd></div>
+              <div className="flex justify-between gap-4"><dt className="text-subtle">Wallet transactions</dt><dd>{via === 'relayer' ? 'Deposit only (the relayer sends the rest)' : 'Deposit · bridge out · claim · withdraw'}</dd></div>
               <div className="flex justify-between gap-4"><dt className="text-subtle">ZK link protection</dt><dd className="text-success">Active</dd></div>
             </dl>
           </div>

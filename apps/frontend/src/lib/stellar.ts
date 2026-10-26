@@ -220,3 +220,10 @@ export async function txDetails(hash: string): Promise<TxDetails> {
   )
   return { sender: records[0]?.source_account ?? '', usdc }
 }
+
+/** Whether a Stellar account exists and can receive USDC. */
+export async function accountState(account: string): Promise<'missing' | 'noTrustline' | 'ok'> {
+  const response = await fetch(`${stellarConfig.horizonUrl}/accounts/${account}`)
+  if (response.status === 404) return 'missing'
+  return (await usdcBalance(account)) === null ? 'noTrustline' : 'ok'
+}

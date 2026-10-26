@@ -37,18 +37,30 @@ npx vite preview --host 127.0.0.1     # serve the production build locally
   exists, those transactions come from your own wallet). Proofs are generated
   in the browser (about 10 to 30 s each).
 
-### 2. The root poster (runs continuously)
+### 2. The root poster and the relayer (one service, runs continuously)
 
 ```sh
 M=$(bash scripts/build/sync-e2e.sh | tail -1)    # WSL mirror of services/bridge and scripts/e2e
 cd "$M/services/bridge"
-ZKROSS_REPO=<path to this repo> ZKROSS_POST_INTERVAL=30 npm run root-poster
+ZKROSS_REPO=<path to this repo> ZKROSS_POST_INTERVAL=30 npm run service
+# only one of them: npm run service -- --only=relayer   (or --only=root-poster)
 ```
 
-It copies each pool's outbox root to the other chain; Sepolia roots are read
-at the finalized block, so Ethereum → Stellar waits about 15 minutes. No claim
-can happen while it is stopped. The refund attester (`npm run refund-attester`)
-settles messages after their deadline plus one hour.
+- **Root poster:** copies each pool's outbox root to the other chain; Sepolia
+  roots are read at the finalized block, so Ethereum → Stellar waits about 15
+  minutes. No claim can happen while it is stopped.
+- **Relayer** (`http://127.0.0.1:8788`): `POST /relay` submits a withdrawal,
+  private transfer, bridge out or claim from the relayer's own account, so the
+  user's wallet does not appear on-chain for it; `GET /status/:hash` follows
+  it. It only calls our two pools, never relays deposits, simulates first,
+  caps gas / fees, limits requests per IP and answers only the site's origins
+  (`ZKROSS_RELAYER_ORIGINS`). Fee: 0 on testnet. Its keys are
+  `STELLAR_RELAYER_SECRET` and `SEPOLIA_RELAYER_KEY` in `.env`; the site
+  points at it with `VITE_RELAYER_URL`. Settings: `ZKROSS_RELAYER_PORT`,
+  `ZKROSS_RELAYER_HOST`, `ZKROSS_RELAYER_MAX_GAS`, `ZKROSS_RELAYER_MAX_FEE`,
+  `ZKROSS_RELAYER_RATE`. Tests: `npm test`.
+- The refund attester (`npm run refund-attester`) settles messages after their
+  deadline plus one hour.
 
 ### 3. The end-to-end script
 
@@ -62,7 +74,10 @@ direction (deposit, `bridge_out`, root posting, `bridge_in`, withdrawal to a
 fresh address) and checks the admin's view: every note and bridge message on
 both chains decrypted and each `bridge_out` linked to its `bridge_in`. It
 prints every transaction link and resumes from `deploy-out/e2e-state.json`.
-The root poster must be running.
+The root poster must be running. With `--relayer`, it moves 1 USDC each way
+with bridge outs, claims and withdrawals (0.5 USDC to a fresh address) sent
+through the relayer, and checks on-chain that the relayer, not a user, sent
+them (state in `deploy-out/e2e-relayer-state.json`).
 
 ### Deploying the pools
 
