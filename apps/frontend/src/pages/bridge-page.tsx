@@ -381,17 +381,20 @@ function BridgePage() {
                   <span className="mb-1 rounded-full bg-surface-raised px-3 py-1.5 text-xs font-semibold">USDC</span>
                 </div>
                 {amount && messageAmount === null && <p className="mt-3 text-[10px] text-danger">Use at most 6 decimal places. Bridge amounts are exact and never rounded.</p>}
-                <div className="mt-5 flex items-center justify-between border-t border-border pt-4 text-[11px]"><span className="text-subtle">Received after claim + withdrawal</span><span className="font-mono">{amountLabel} USDC</span></div>
+                <div className="mt-5 flex items-center justify-between border-t border-border pt-4 text-[11px]"><span className="text-subtle">{keepPrivate ? 'Added to your private balance' : 'Received at the address'}</span><span className="font-mono">{amountLabel} USDC</span></div>
                 <div className="mt-2 flex items-center justify-between text-[10px]"><span className="text-subtle">Live destination pool balance</span><span className="font-mono text-muted">{destinationCapacity === null ? 'Unavailable' : `${formatNote(to, destinationCapacity)} USDC`}</span></div>
               </div>
 
               <div className="border-t border-border px-5 py-5 sm:px-7">
-                <div className="flex items-center justify-between gap-3">
-                  <label htmlFor="recipient" className="block text-[10px] font-medium text-subtle">Your public {networkMeta[to].shortName} withdrawal address</label>
-                  <label className="flex items-center gap-1.5 text-[10px] text-muted"><input type="checkbox" checked={keepPrivate} disabled={runStatus === 'running'} onChange={(event) => setKeepPrivate(event.target.checked)} />Keep it private on {networkMeta[to].shortName}</label>
+                <p id="destination-choice" className="text-[10px] font-medium text-subtle">Where the USDC goes on {networkMeta[to].shortName}</p>
+                <div role="radiogroup" aria-labelledby="destination-choice" className="mt-3 grid grid-cols-2 gap-1 rounded-xl border border-border bg-background p-1">
+                  {([[false, 'Send to an address'], [true, 'Keep in my private balance']] as [boolean, string][]).map(([value, label]) => (
+                    <button key={label} type="button" role="radio" aria-checked={keepPrivate === value} disabled={runStatus === 'running'} onClick={() => setKeepPrivate(value)} className={cn('focus-ring rounded-lg px-3 py-1.5 text-[11px] font-semibold transition-colors disabled:opacity-50', keepPrivate === value ? 'bg-surface-raised text-foreground' : 'text-muted hover:text-foreground')}>{label}</button>
+                  ))}
                 </div>
-                {keepPrivate ? <p className="mt-3 text-[10px] leading-4 text-subtle">No withdrawal: the claimed note stays in your {networkMeta[to].shortName} private balance, owned by your note key, ready to bridge back, or to withdraw any amount later from the Balance page.</p> : <>
-                <div className="mt-3 flex items-center rounded-xl border border-border bg-surface/60 px-3 focus-within:border-accent/50">
+                {keepPrivate ? <p className="mt-3 text-[10px] leading-4 text-subtle">The USDC stays private on {networkMeta[to].shortName}: nothing is paid to any address. Withdraw it later, any amount to any address, from the Balance page, or bridge it back.</p> : <>
+                <label htmlFor="recipient" className="mt-3 block text-[10px] text-subtle">Public {networkMeta[to].shortName} address that receives the USDC (the relayer claims and pays it)</label>
+                <div className="mt-2 flex items-center rounded-xl border border-border bg-surface/60 px-3 focus-within:border-accent/50">
                   <input id="recipient" value={recipientValue} disabled={runStatus === 'running'} onChange={(event) => setRecipient(event.target.value)} aria-invalid={recipientValue.length > 0 && !recipientIsValid} className="min-w-0 flex-1 bg-transparent py-3 font-mono text-xs outline-none placeholder:text-subtle disabled:opacity-60" placeholder={to === 'stellar' ? 'G…' : '0x…'} />
                 </div>
                 {recipientValue.length > 0 && !recipientIsValid && <p className="mt-2 text-[10px] text-danger">Enter a valid {networkMeta[to].shortName} public address.</p>}
@@ -405,7 +408,7 @@ function BridgePage() {
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Deposit · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{needsDeposit ? `Your wallet${sourceWallet ? ` (${truncateAddress(sourceWallet.address)})` : ''}` : 'None: private balance'}</dd></div>
                   {Boolean(merges) && <div className="flex justify-between gap-4"><dt className="text-subtle">Note merges first · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{merges} · {relayerName(from)}</dd></div>}
                   <div className="flex justify-between gap-4"><dt className="text-subtle">Bridge out · {networkMeta[from].shortName}</dt><dd className="text-right font-mono">{submitter(from, sourceWallet?.address)}</dd></div>
-                  <div className="flex justify-between gap-4"><dt className="text-subtle">Claim + withdrawal · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{relayerName(to)}</dd></div>
+                  <div className="flex justify-between gap-4"><dt className="text-subtle">{keepPrivate ? 'Claim' : 'Claim + withdrawal'} · {networkMeta[to].shortName}</dt><dd className="text-right font-mono">{relayerName(to)}</dd></div>
                 </dl>
               </div>
             </div>
