@@ -15,6 +15,7 @@ import { formatNote, toNoteAmount } from './amounts'
 import { chainId, poolAddress, protocol } from './config'
 import { type IdentityWallet, type NoteKey, noteKey } from './keys'
 import { sealBridge, sealNote, sealOutputs } from './note-delivery'
+import { findPublishedNote } from './recovery'
 import { type NetworkId, type ProgressState, type TransferProgressStep, networkMeta } from './networks'
 import { pools } from './pools'
 import * as stellar from './stellar'
@@ -452,8 +453,16 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
 
   await step('claim', async () => {
     if (await dst.isClaimed(t.claimNullifier!)) {
-      if (!t.claimNotes?.length) throw new Error('The claim exists on-chain, but this browser has no matching note record.')
-      if (!(await settleNotes(t.to, t.claimNotes))) {
+      if (!t.claimNotes?.length) {
+        // Claimed elsewhere (another tab or browser): its note is published
+        // encrypted to this identity, so take it from the chain.
+        const found = await findPublishedNote(t.to, key, amountTo)
+        if (!found) {
+          throw new Error('This transfer was already claimed elsewhere, and its note is not on-chain for this identity (it predates on-chain note delivery). Finish it in the browser that claimed it, or restore that browser’s Activity backup.')
+        }
+        save(t, { claimNotes: [found] })
+      }
+      if (!(await settleNotes(t.to, t.claimNotes!))) {
         throw new Error('The claim landed, but its destination note is not indexed yet. Retry shortly.')
       }
       return save(t, { status: 'claimed', error: undefined })

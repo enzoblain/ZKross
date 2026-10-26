@@ -10,11 +10,12 @@
 // recovered this way.
 import { toNoteAmount } from './amounts'
 import { chainId, isDeployed, protocol } from './config'
-import { type IdentityWallet, noteKey } from './keys'
+import { type IdentityWallet, type NoteKey, noteKey } from './keys'
 import { type NetworkId, networkMeta, otherNetwork } from './networks'
 import { readBridge, readNote } from './note-delivery'
 import { pools } from './pools'
 import * as store from './store'
+import type { PendingNote } from './store'
 import { prover } from './zk/prover'
 
 export type Recovered = {
@@ -26,6 +27,26 @@ export type Recovered = {
 }
 
 const NETWORKS: NetworkId[] = ['ethereum', 'stellar']
+
+/**
+ * A note of `key` worth exactly `amount` on `network`, published on-chain,
+ * unspent and not already some transfer's claim note: the note of a claim
+ * made elsewhere (another tab or browser). Null if none (or it predates note
+ * delivery).
+ */
+export async function findPublishedNote(network: NetworkId, key: NoteKey, amount: bigint): Promise<PendingNote | null> {
+  const taken = new Set(store.transfers().flatMap((t) => (t.to === network ? (t.claimNotes ?? []).map((n) => BigInt(n.commitment)) : [])))
+  const pool = pools[network]
+  for (const p of [...(await pool.publishedNotes())].reverse()) {
+    if (taken.has(BigInt(p.commitment))) continue
+    const note = readNote(await prover.decryptFrom(key.encSk, p.data))
+    if (!note || note.amount !== amount) continue
+    if (BigInt(await prover.commitment(note.amount, key.pk, note.blinding)) !== BigInt(p.commitment)) continue
+    if (await pool.isSpent(await prover.nullifier(key.sk, p.commitment, p.index))) continue
+    return { network, pk: key.pk, amount: amount.toString(), blinding: note.blinding, commitment: p.commitment }
+  }
+  return null
+}
 
 export async function recoverFromChain(identity: IdentityWallet, update: (message: string) => void = () => {}): Promise<Recovered> {
   const key = await noteKey(identity.network, identity.address)

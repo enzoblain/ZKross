@@ -84,7 +84,7 @@ vi.mock('./pools', async () => {
 })
 
 const { createMovement, runMovement } = await import('./balance-flow')
-const { recoverFromChain } = await import('./recovery')
+const { findPublishedNote, recoverFromChain } = await import('./recovery')
 const { sealBridge, sealNote } = await import('./note-delivery')
 const { prover } = await import('./zk/prover')
 const store = await import('./store')
@@ -164,5 +164,19 @@ describe('recovering from the chain', () => {
     expect(t).toMatchObject({ from: 'ethereum', to: 'stellar', status: 'sent', keepPrivate: true, bridgeMessage: message, claimSecret: secret, refundBlinding, amount: '1000000' })
     // Not twice.
     expect((await recoverFromChain(IDENTITY)).transfers).toBe(0)
+  })
+
+  it('finds the note of a claim made elsewhere: right amount, unspent, not already taken', async () => {
+    await deposit('stellar', 10_000_000n)
+    await deposit('stellar', 20_000_000n)
+    await deposit('stellar', 20_000_000n)
+    const [, second, third] = h.published.stellar.filter((_, i) => i % 2 === 0)
+    // The newest 20 USDC note is already another transfer's claim note.
+    store.putTransfer({ id: 'other', from: 'ethereum', to: 'stellar', createdAt: 0, amount: '2000000', recipient: '', sender: '', deadlineBucket: '0', claimSecret: '0x1', recipientPk: KEY.pk, refundPk: KEY.pk, refundBlinding: '0x1', status: 'claimed', txs: {}, claimNotes: [{ network: 'stellar', pk: KEY.pk, amount: '20000000', blinding: '0x1', commitment: third.commitment }] })
+
+    expect((await findPublishedNote('stellar', KEY, 20_000_000n))?.commitment).toBe(second.commitment)
+    h.spent.add(await prover.nullifier(KEY.sk, second.commitment, second.index))
+    expect(await findPublishedNote('stellar', KEY, 20_000_000n)).toBeNull()
+    expect(await findPublishedNote('stellar', KEY, 5_000_000n)).toBeNull()
   })
 })
