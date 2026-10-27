@@ -447,16 +447,17 @@ export async function runTransfer(t: Transfer, update: FlowUpdate) {
 
   await step('claim', async () => {
     if (await dst.isClaimed(t.claimNullifier!)) {
-      if (!t.claimNotes?.length) {
-        // Claimed elsewhere (another tab or browser): its note is published
-        // encrypted to this identity, so take it from the chain.
-        const found = await findPublishedNote(t.to, key, amountTo)
-        if (!found) {
-          throw new Error('This transfer was already claimed elsewhere, and its note is not on-chain for this identity yet. Retry shortly, or finish it in the browser that claimed it.')
-        }
-        save(t, { claimNotes: [found] })
+      if (t.claimNotes?.length && (await settleNotes(t.to, t.claimNotes))) return save(t, { status: 'claimed', error: undefined })
+      // Claimed elsewhere (another tab or browser), or by an earlier attempt
+      // whose notes a retry overwrote before that attempt landed: the landed
+      // note is published encrypted to this identity, so take it from the chain.
+      const found = await findPublishedNote(t.to, key, amountTo)
+      if (!found) {
+        if (t.claimNotes?.length) throw new Error('The claim landed, but its destination note is not indexed yet. Retry shortly.')
+        throw new Error('This transfer was already claimed elsewhere, and its note is not on-chain for this identity yet. Retry shortly, or finish it in the browser that claimed it.')
       }
-      if (!(await settleNotes(t.to, t.claimNotes!))) {
+      save(t, { claimNotes: [found] })
+      if (!(await settleNotes(t.to, [found]))) {
         throw new Error('The claim landed, but its destination note is not indexed yet. Retry shortly.')
       }
       return save(t, { status: 'claimed', error: undefined })

@@ -25,6 +25,14 @@ const h = vi.hoisted(() => ({
   requests: {} as Record<string, unknown>,
   failRelay: '' as string,
   counter: 0,
+  claimed: false,
+  published: null as null | { commitment: string },
+}))
+
+vi.mock('./recovery', () => ({
+  findPublishedNote: vi.fn(async (network: string, key: { pk: string }, amount: bigint) =>
+    h.published ? { network, pk: key.pk, amount: amount.toString(), blinding: '0xb1', commitment: h.published.commitment } : null,
+  ),
 }))
 
 vi.mock('./keys', () => ({ noteKey: vi.fn(async (_network: string, address: string) => KEYS[address]) }))
@@ -76,7 +84,7 @@ vi.mock('./pools', async () => {
       noteLeaves: async () => h.leaves as Hex[],
       outboxLeaves: async () => ['0xc0de', '0x0'] as Hex[],
       isKnownRemoteRoot: async () => true,
-      isClaimed: async () => false,
+      isClaimed: async () => h.claimed,
       isSpent: async () => false,
       bridgeStatus: async () => status,
       transactExtHash: async () => '0xe1' as Hex,
@@ -111,6 +119,8 @@ beforeEach(() => {
   h.calls = []
   h.requests = {}
   h.failRelay = ''
+  h.claimed = false
+  h.published = null
 })
 
 describe.each([
@@ -222,4 +232,23 @@ it('treats a record from before the identity wallet as finished, and never resum
   await expect(runTransfer(old, () => {})).rejects.toThrow('older version of ZKross')
   expect(noteKey).not.toHaveBeenCalled()
   expect(h.calls).toEqual([])
+})
+
+it('takes the landed claim note from the chain when a retry overwrote the saved one', async () => {
+  // An earlier claim landed late, after a retry had saved other notes that never landed.
+  h.failRelay = 'bridgeIn'
+  const t = createTransfer({ from: 'stellar', to: 'ethereum', amount: 1_000_000n, identity: IDENTITY, sender: WALLET.stellar, recipient: TYPED.ethereum })
+  await expect(runTransfer(t, () => {})).rejects.toThrow('not answering')
+  const stale = t.claimNotes![0].commitment
+  h.leaves = h.leaves.filter((l) => l !== stale)
+  h.leaves.push('0xa11d')
+  h.published = { commitment: '0xa11d' }
+  h.claimed = true
+  h.failRelay = ''
+  h.calls = []
+
+  await runTransfer(t, () => {})
+  expect(t.status).toBe('withdrawn')
+  expect(t.claimNotes!.map((n) => n.commitment)).toEqual(['0xa11d'])
+  expect(h.calls.map((c) => c.fn)).toEqual(['transact'])
 })
