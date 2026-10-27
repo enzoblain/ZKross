@@ -117,7 +117,9 @@ export async function poolEvents(): Promise<PoolEvent[]> {
         time: Date.parse(event.ledgerClosedAt),
       })
     }
-    if (response.events.length < 200) break
+    // The RPC scans a bounded ledger range per request, so a short page is not
+    // the end: stop only once the cursor no longer advances.
+    if (response.events.length < 200 && response.cursor === cursor) break
     cursor = response.cursor
   }
   return all

@@ -51,7 +51,9 @@ export async function events(contract: string, startLedger: number): Promise<Ste
       const topics = e.topic.map((t: xdr.ScVal) => scValToNative(t));
       all.push({ name: String(topics[0]), topics, data: scValToNative(e.value), ledger: e.ledger, txHash: e.txHash });
     }
-    if (res.events.length < 200) break;
+    // The RPC scans a bounded ledger range per request, so a short page is not
+    // the end: stop only once the cursor no longer advances.
+    if (res.events.length < 200 && res.cursor === cursor) break;
     cursor = res.cursor;
   }
   return all;
