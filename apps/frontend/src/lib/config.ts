@@ -37,9 +37,11 @@ export const stellarConfig = {
 export const sepoliaConfig = {
   chainId: BigInt(SEPOLIA_CHAIN_ID),
   chainIdHex: `0x${SEPOLIA_CHAIN_ID.toString(16)}`,
+  // publicnode prunes old logs ("pruned history unavailable"), so the pool's
+  // history from its deploy block is read from Tenderly's public gateway.
   rpcUrl:
     (import.meta.env.VITE_SEPOLIA_RPC_URL as string | undefined) ??
-    'https://ethereum-sepolia-rpc.publicnode.com',
+    'https://sepolia.gateway.tenderly.co',
   pool: sepoliaPool?.pool,
   deployBlock: BigInt(sepoliaPool?.deployBlock ?? 0),
   usdc: {

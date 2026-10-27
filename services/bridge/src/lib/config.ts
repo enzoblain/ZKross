@@ -27,7 +27,8 @@ export const STELLAR_PASSPHRASE = "Test SDF Network ; September 2015";
 export const STELLAR_RPC = deployments.stellarTestnet.rpcUrl as string;
 export const STELLAR_CHAIN_ID = BigInt(deployments.stellarTestnet.chainId);
 export const SEPOLIA_CHAIN_ID = 11155111n;
-export const SEPOLIA_RPC = env.SEPOLIA_RPC_URL ?? "https://ethereum-sepolia-rpc.publicnode.com";
+// Must serve eth_getLogs from the pool's deploy block: publicnode prunes old logs.
+export const SEPOLIA_RPC = env.SEPOLIA_RPC_URL ?? "https://sepolia.gateway.tenderly.co";
 
 if (deployments.stellarTestnet.networkPassphrase !== STELLAR_PASSPHRASE) throw new Error("not Stellar testnet");
 if (BigInt(deployments.sepolia.chainId) !== SEPOLIA_CHAIN_ID) throw new Error("not Sepolia");
